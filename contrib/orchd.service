@@ -1,0 +1,14 @@
+# Optional: run orchd under systemd --user instead of letting `orch` start it on demand.
+#   cp contrib/orchd.service ~/.config/systemd/user/ && systemctl --user enable --now orchd
+# Survives SSH logout only with lingering (loginctl enable-linger murat); without it the
+# on-demand start (setsid) is what keeps panes alive after logout.
+[Unit]
+Description=orchtool daemon (agent panes)
+
+[Service]
+ExecStart=%h/.local/bin/orchd
+KillMode=process
+Restart=on-failure
+
+[Install]
+WantedBy=default.target

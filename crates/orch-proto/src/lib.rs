@@ -1,4 +1,8 @@
-//! Initial orch protocol envelope. This is not the herdr compatibility protocol.
+//! orch protocol: versioned JSON-lines frames over a Unix socket (or `ssh host orch proxy`).
+//! This is not the herdr compatibility protocol (that comes in phase 3).
+
+pub mod api;
+pub mod client;
 
 use serde::{Deserialize, Serialize};
 use std::io;
@@ -43,6 +47,16 @@ impl Frame {
             return Err(invalid("expected one JSON line"));
         }
         let frame: Self = serde_json::from_slice(bytes).map_err(invalid)?;
+        frame.validate()?;
+        Ok(frame)
+    }
+
+    /// Decode a line produced by a line codec (newline already stripped).
+    pub fn from_line(line: &str) -> io::Result<Self> {
+        if line.len() >= MAX_FRAME_BYTES || line.contains('\n') {
+            return Err(invalid("oversized frame or embedded newline"));
+        }
+        let frame: Self = serde_json::from_str(line).map_err(invalid)?;
         frame.validate()?;
         Ok(frame)
     }

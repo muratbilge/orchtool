@@ -1,5 +1,55 @@
 # Status
 
+## 2026-11-02 — Phase 1 GREEN (PTY core) — Claude
+
+Built: orchd (panes in PTYs, vt100 state behind `term.rs`, query replies, scrollback, per-client row-diff
+renderer, controller/observer + takeover, JSON-lines socket 0600 + peer-uid check), `orch` CLI
+(new/ls/attach/send/read/kill/proxy/ping/latency/stop-daemon, `--host H` via `$ORCH_SSH H orch proxy`,
+autostarts orchd with setsid), `scripts/install.sh`, `contrib/orchd.service` (optional, not enabled).
+
+Design notes
+- Socket: `~/.local/state/orchtool/orchd.sock` (not $XDG_RUNTIME_DIR: Linger=no, it vanishes at logout).
+- Sync: renderer keeps what each client has (formatted rows + modes + cursor); a frame rewrites changed rows
+  only, ≤ 25 fps, nothing queued → a slow client jumps to the latest state; frames carry gen/base/rev,
+  client asks `resnapshot` on a gap; resize bumps gen → full redraw. View clipped to the client's size.
+- Size: controller's terminal decides; observers never resize; detached panes keep the last size.
+- Terminal queries answered by orchd (DSR 5/6, DA1, DA2, XTVERSION, DECRQM, OSC 10/11): Codex's TUI starts
+  with no client attached. Kitty keyboard query left unanswered (= unsupported).
+- `orch new` passes the caller's env minus HERDR_*/TMUX*/Claude-session vars (CLAUDECODE,
+  CLAUDE_CODE_CHILD_SESSION, CLAUDE_CODE_MESSAGING_TOKEN, …) — otherwise a pane started from Claude
+  inherits "transcript saving off" and Claude's messaging token.
+- Daemon restart kills panes (accepted for now); SIGHUP is ignored.
+
+Checks run (2026-11-02)
+- `scripts/check.sh` → exit 0 (fmt ok, clippy -D warnings ok; tests: proto 3, orchd unit 6, integration 7,
+  terminal_spike 3 — all passed). Integration suite re-run 5× → 7/7 each time.
+- Unit: render random-diff property test (39 seeds × 60 steps, skipped frames, alt screen, wide chars,
+  insert-line) — client vt100 equals server cell by cell; clipped observer; query replies incl. fragmented;
+  scrollback read order.
+- Integration (real orchd): echo+exit code, send+enter, two clients mirror, observer input ignored,
+  detach/reattach keeps state + frees controller slot, takeover + controller sizing, resize storm under
+  output ends consistent, query reply with no client, kill + name resolution.
+- Live (debug build, test socket): bash, `vim -u NONE` (insert + Esc), `claude` (trust dialog navigated with
+  Down/Enter, typing), `codex` (TUI renders, typing) in orch panes. Full-screen `orch attach` from two herdr
+  panes: mirror OK, observer typing ignored, prefix-t takeover resized codex to the new controller, prefix-d
+  detach restores the terminal, agent keeps running. `kill -HUP orchd` → keeps running.
+- Proxy: `orch --host localhost …` through a stand-in ssh (real `ssh localhost` is refused: DevBox's own key
+  is not in authorized_keys — not changed). new/ls/latency/attach over the proxy OK.
+
+Measurements (debug build, DevBox)
+- orchd RSS with 5 idle panes (bash, vim, cat, claude, codex): 5.9 MB.
+- Full scrollback costs ~13 MB per pane (5000 lines, 80 cols; vt100 cells are big): 59 MB with 9 panes,
+  4 of them full. Default scrollback lowered to 3000 (`--scrollback` / `ORCHD_SCROLLBACK`). A compact
+  scrollback store is a later optimisation if needed.
+- Local: ping 0.2–0.4 ms; attach → first frame 1.8 ms; keystroke → echo frame median 0.8 ms (max 5.2).
+- Via proxy pipe: attach 8.7 ms; keystroke → echo median 1.2 ms. Real network numbers need the laptop.
+
+Open / for Murat
+- SSH-logout survival not tested with a real logout: orchd is setsid'd, parent 1, KillUserProcesses is the
+  Debian default (no) — same situation as herdr's server. Please confirm once: start `orch new -- bash`
+  over SSH, log out, log in, `orch ls`.
+- Laptop test: `ORCH_REMOTE_BIN=~/.local/bin/orch orch --host devbox attach <pane>` after `scripts/install.sh`.
+
 ## 2026-11-02 — Phase 0 GREEN (Claude finished the blocked steps)
 
 Codex's sandbox had no network / home writes, so Claude installed rustup (stable 1.99.1-era cargo, minimal +
