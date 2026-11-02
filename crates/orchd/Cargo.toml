@@ -1,0 +1,12 @@
+[package]
+name = "orchd"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+tokio.workspace = true
+orch-proto.workspace = true
+
+[dev-dependencies]
+vt100.workspace = true
