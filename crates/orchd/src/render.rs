@@ -72,7 +72,21 @@ impl Renderer {
             self.cursor_style = None;
         }
         let mut wrote_rows = false;
-        for (i, row) in screen.rows_formatted(0, w).take(h as usize).enumerate() {
+        let clipped = w < pcols.get();
+        let rows: Vec<String> = screen.rows_formatted(0, w).take(h as usize).collect();
+        for (i, mut row) in rows.into_iter().enumerate() {
+            // A wide glyph starting in the last visible column would spill past the client's
+            // edge (wrap, or scroll on the bottom row): show a blank there instead.
+            if clipped
+                && screen
+                    .cell(i as u16, w - 1)
+                    .is_some_and(|c| c.is_wide() && !c.is_wide_continuation())
+            {
+                row = screen.rows_formatted(0, w - 1).nth(i).unwrap_or_default();
+                // Explicit position: the formatted row may end anywhere (blank runs are
+                // emitted as erase sequences that do not move the cursor).
+                let _ = write!(row, "\x1b[{};{}H\x1b[m ", i + 1, w);
+            }
             if !full && self.rows[i] == row {
                 continue;
             }
@@ -83,7 +97,7 @@ impl Renderer {
             }
             self.rows[i] = row;
         }
-        let modes = screen.input_mode_formatted();
+        let modes = input_modes(screen);
         if modes != self.modes {
             out.push_str(&modes);
             self.modes = modes;
@@ -111,6 +125,45 @@ impl Renderer {
             Some(Frame { full, data: out })
         }
     }
+}
+
+/// The full input-mode state as explicit set *and* reset sequences. (vt100's
+/// `input_mode_formatted` only emits non-default mouse modes, so a mode switched off by the
+/// program would stay on in the client's terminal.)
+fn input_modes(screen: &vt100::Screen) -> String {
+    use vt100::{MouseProtocolEncoding as E, MouseProtocolMode as M};
+    let mut s = String::new();
+    s.push_str(if screen.application_keypad() {
+        "\x1b="
+    } else {
+        "\x1b>"
+    });
+    s.push_str(if screen.application_cursor() {
+        "\x1b[?1h"
+    } else {
+        "\x1b[?1l"
+    });
+    s.push_str(if screen.bracketed_paste() {
+        "\x1b[?2004h"
+    } else {
+        "\x1b[?2004l"
+    });
+    s.push_str("\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l");
+    s.push_str(match screen.mouse_protocol_mode() {
+        M::None => "",
+        M::Press => "\x1b[?9h",
+        M::PressRelease => "\x1b[?1000h",
+        M::ButtonMotion => "\x1b[?1002h",
+        M::AnyMotion => "\x1b[?1003h",
+    });
+    if screen.mouse_protocol_mode() != M::None {
+        s.push_str(match screen.mouse_protocol_encoding() {
+            E::Default => "",
+            E::Utf8 => "\x1b[?1005h",
+            E::Sgr => "\x1b[?1006h",
+        });
+    }
+    s
 }
 
 fn cursor_style_code(style: vt100::CursorStyle) -> u8 {
@@ -244,6 +297,54 @@ mod tests {
     }
 
     #[test]
+    fn random_diffs_reproduce_a_clipped_view() {
+        for seed in 1..30u64 {
+            let mut rng = Rng(seed.wrapping_mul(0xD1B5_4A32_D192_ED03));
+            let (rows, cols) = (10, 36);
+            let (vr, vc) = (6, 21);
+            let mut server = parser(rows, cols);
+            let mut client = parser(vr, vc);
+            let mut r = Renderer::new(vr, vc);
+            for step in 0..60 {
+                server.process(&random_chunk(&mut rng, rows, cols));
+                if step % 4 == 1 {
+                    continue;
+                }
+                let mut last = String::new();
+                if let Some(f) = r.render(server.screen(), 0) {
+                    client.process(f.data.as_bytes());
+                    last = f.data;
+                }
+                // Same cells, except a wide glyph cut by the edge is shown as a blank.
+                for row in 0..vr {
+                    for col in 0..vc {
+                        let a = server.screen().cell(row, col).unwrap();
+                        let b = client.screen().cell(row, col).unwrap();
+                        if col == vc - 1 && a.is_wide() {
+                            assert!(b.contents().trim().is_empty(), "edge blank at {row},{col}");
+                            continue;
+                        }
+                        if a.contents() != b.contents() && std::env::var("RDEBUG").is_ok() {
+                            eprintln!("step {step} server rows:");
+                            for l in server.screen().rows(0, cols) {
+                                eprintln!("|{l}|");
+                            }
+                            eprintln!("client rows:");
+                            for l in client.screen().rows(0, vc) {
+                                eprintln!("|{l}|");
+                            }
+                            eprintln!("last data: {:?}", last);
+                        }
+                        assert_eq!(a.contents(), b.contents(), "seed {seed} cell {row},{col}");
+                        assert_eq!(a.bgcolor(), b.bgcolor(), "seed {seed} bg {row},{col}");
+                    }
+                }
+                assert_eq!(client.screen().scrollback(), 0);
+            }
+        }
+    }
+
+    #[test]
     fn small_observer_view_is_clipped() {
         let mut server = parser(10, 40);
         server.process(b"0123456789012345678901234567890123456789\r\nsecond line\r\n");
@@ -254,6 +355,54 @@ mod tests {
         assert_same(server.screen(), client.screen(), 5, 20);
         // Nothing wrapped into the client's second row.
         assert_eq!(client.screen().rows(0, 20).nth(1).unwrap(), "second line");
+    }
+
+    #[test]
+    fn mouse_modes_are_switched_off_again() {
+        let mut server = parser(5, 20);
+        let mut client = parser(5, 20);
+        let mut r = Renderer::new(5, 20);
+        server.process(b"\x1b[?1002h\x1b[?1006h");
+        client.process(r.render(server.screen(), 0).unwrap().data.as_bytes());
+        assert_eq!(
+            client.screen().mouse_protocol_mode(),
+            vt100::MouseProtocolMode::ButtonMotion
+        );
+        assert_eq!(
+            client.screen().mouse_protocol_encoding(),
+            vt100::MouseProtocolEncoding::Sgr
+        );
+        server.process(b"\x1b[?1002l\x1b[?1006l");
+        client.process(r.render(server.screen(), 0).unwrap().data.as_bytes());
+        assert_eq!(
+            client.screen().mouse_protocol_mode(),
+            vt100::MouseProtocolMode::None
+        );
+        assert_eq!(
+            client.screen().mouse_protocol_encoding(),
+            vt100::MouseProtocolEncoding::Default
+        );
+        // A full snapshot also states the modes explicitly.
+        r.force_full();
+        let f = r.render(server.screen(), 0).unwrap();
+        assert!(f.data.contains("\x1b[?1000l"));
+    }
+
+    #[test]
+    fn wide_glyph_on_the_clip_edge_does_not_spill() {
+        let mut server = parser(6, 40);
+        // 界 starts at column 19 (0-based) of every row, including the bottom one.
+        for row in 1..=6 {
+            server.process(format!("\x1b[{row};1H{}界x", "a".repeat(19)).as_bytes());
+        }
+        let mut client = parser(6, 20);
+        let mut r = Renderer::new(6, 20);
+        client.process(r.render(server.screen(), 0).unwrap().data.as_bytes());
+        for (i, line) in client.screen().rows(0, 20).enumerate() {
+            assert_eq!(line.trim_end(), "a".repeat(19), "row {i}");
+        }
+        // Nothing scrolled: the top row is still row 0 of the pane.
+        assert_eq!(client.screen().scrollback(), 0);
     }
 
     #[test]

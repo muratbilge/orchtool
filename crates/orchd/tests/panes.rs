@@ -423,3 +423,86 @@ async fn kill_removes_pane_and_names_resolve() {
         .await;
     assert!(missing.is_err());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kill_escalates_for_programs_ignoring_hup_and_term() {
+    let d = daemon().await;
+    let mut c = Conn::unix(&d.socket).await.unwrap();
+    let id = new_pane(
+        &mut c,
+        &[
+            "sh",
+            "-c",
+            "trap '' HUP TERM; echo ready; while :; do sleep 1; done",
+        ],
+        10,
+        40,
+    )
+    .await;
+    wait_for_text(&mut c, &id, "ready").await;
+    c.request(&Request::Kill { pane: id.clone() })
+        .await
+        .unwrap();
+    let v = c.request(&Request::ListPanes {}).await.unwrap();
+    assert_eq!(v["panes"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn input_is_bounded_when_the_program_does_not_read() {
+    let d = daemon().await;
+    let mut c = Conn::unix(&d.socket).await.unwrap();
+    // Raw mode: a full PTY input buffer then blocks the writer (in canonical mode Linux
+    // discards input past its line buffer instead, so nothing would pile up).
+    let id = new_pane(
+        &mut c,
+        &["sh", "-c", "stty raw -echo; echo ready; sleep 30"],
+        10,
+        40,
+    )
+    .await;
+    wait_for_text(&mut c, &id, "ready").await;
+    let chunk = "x".repeat(256 * 1024);
+    let mut refused = false;
+    for _ in 0..12 {
+        let r = c
+            .request(&Request::Send(SendPane {
+                pane: id.clone(),
+                text: chunk.clone(),
+                enter: false,
+            }))
+            .await;
+        if let Err(orch_proto::client::ClientError::Remote(e)) = r {
+            assert_eq!(e.code, "input_full");
+            refused = true;
+            break;
+        }
+    }
+    assert!(refused, "3 MB into a non-reading program must be refused");
+    // orchd is still responsive.
+    c.request(&Request::Ping {}).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attached_client_sees_last_output_before_exit() {
+    let d = daemon().await;
+    let mut c = Conn::unix(&d.socket).await.unwrap();
+    let id = new_pane(
+        &mut c,
+        &["sh", "-c", "sleep 0.3; seq 1 3000; echo LAST-LINE"],
+        10,
+        40,
+    )
+    .await;
+    let mut a = Viewer::attach(&d.socket, &id, AttachMode::Auto, 10, 40).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    while a.exited.is_none() {
+        let f = timeout(deadline - tokio::time::Instant::now(), a.reader.next())
+            .await
+            .expect("exit frame")
+            .unwrap()
+            .expect("stream open until exit");
+        a.apply(f.body);
+    }
+    assert!(a.screen.screen().contents().contains("LAST-LINE"));
+    assert_eq!(a.exited, Some(Some(0)));
+}

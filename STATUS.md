@@ -1,5 +1,22 @@
 # Status
 
+## 2026-11-02 — Phase 1 review fixes (Codex review → CODEX-REVIEW-P1-RESULT.md) — Claude
+
+All 8 findings confirmed and fixed, each with a regression test:
+1. Mouse modes now sent as explicit set+reset state (vt100's formatter never reset them); detach also resets ?9.
+2. Wide glyph cut by an observer's right edge → blank at an explicit position (no wrap/scroll). Found a second
+   bug via the new clipped random test: blank runs are erase sequences that don't move the cursor.
+3. Controller watch subscribed before registering + reconciled after the attach reply.
+4. Resize: PTY ioctl, parser size and gen updated together under the terminal lock; `resize_for(client)`
+   re-checks control under the lock.
+5. Kill: SIGHUP → SIGTERM(group) → SIGKILL(group), 1.5 s each; pane kept + `kill_failed` if it survives.
+6. Input budget 1 MiB per pane; `send` returns `input_full`, attach drops keys; never blocks.
+7. Exit published only after the reader hit PTY EOF (max 2 s wait for descendants holding the PTY).
+   Reader/waiter threads hold Weak<Pane>.
+8. Raw-mode guard created right after enabling raw mode.
+Checks: `scripts/check.sh` exit 0 (unit 9, integration 10, proto 3, spike 3); integration ×6 → 10/10 each.
+Live: codex still renders in an orch pane; `orch kill` of a HUP+TERM-ignoring loop → gone in 3.0 s.
+
 ## 2026-11-02 — Phase 1 GREEN (PTY core) — Claude
 
 Built: orchd (panes in PTYs, vt100 state behind `term.rs`, query replies, scrollback, per-client row-diff

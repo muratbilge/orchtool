@@ -85,13 +85,28 @@ impl Daemon {
         Ok(pane)
     }
 
+    /// SIGHUP (like closing a terminal), then SIGTERM, then SIGKILL to the process group.
+    /// The pane is only forgotten once its program is really gone.
     async fn kill(&self, key: &str) -> Result<(), ApiError> {
         let pane = self.find(key)?;
+        let mut exit = pane.subscribe_exit();
+        for step in 0..3 {
+            if pane.exit_code().is_some() {
+                break;
+            }
+            match step {
+                0 => pane.kill(),
+                1 => pane.signal_group(libc::SIGTERM),
+                _ => pane.signal_group(libc::SIGKILL),
+            }
+            let wait = exit.wait_for(|e| e.is_some());
+            let _ = tokio::time::timeout(Duration::from_millis(1500), wait).await;
+        }
         if pane.exit_code().is_none() {
-            pane.kill();
-            let mut exit = pane.subscribe_exit();
-            let _ =
-                tokio::time::timeout(Duration::from_secs(3), exit.wait_for(|e| e.is_some())).await;
+            return Err(err(
+                "kill_failed",
+                format!("{} is still running after SIGKILL", pane.id),
+            ));
         }
         self.panes
             .lock()
@@ -103,6 +118,7 @@ impl Daemon {
     pub fn kill_all(&self) {
         for pane in self.panes.lock().unwrap().values() {
             pane.kill();
+            pane.signal_group(libc::SIGTERM);
         }
     }
 
@@ -135,13 +151,16 @@ impl Daemon {
                 if pane.exit_code().is_some() {
                     return Err(err("exited", "pane has exited"));
                 }
-                if !s.text.is_empty() {
-                    pane.write(s.text.into_bytes());
+                let full = || err("input_full", "the program is not reading its input");
+                if !s.text.is_empty() && !pane.write(s.text.into_bytes()) {
+                    return Err(full());
                 }
                 if s.enter {
                     // A separate, slightly later CR is an Enter key press, not part of a paste.
                     tokio::time::sleep(Duration::from_millis(60)).await;
-                    pane.write(b"\r".to_vec());
+                    if !pane.write(b"\r".to_vec()) {
+                        return Err(full());
+                    }
                 }
                 Ok(json!({ "pane": pane.id }))
             }
@@ -250,6 +269,8 @@ async fn attach(
         AttachMode::Control => Some(true),
         AttachMode::Observe => Some(false),
     };
+    // Subscribe before registering, so no controller change can slip in unnoticed.
+    let mut ctrl_rx = pane.subscribe_controller();
     let (client, mut role) = pane.attach(take);
     let result = attach_loop(
         &pane,
@@ -257,6 +278,7 @@ async fn attach(
         &id,
         client,
         &mut role,
+        &mut ctrl_rx,
         &mut reader,
         &mut writer,
     )
@@ -272,11 +294,12 @@ async fn attach_loop(
     id: &str,
     client: u64,
     role: &mut Role,
+    ctrl_rx: &mut tokio::sync::watch::Receiver<Option<u64>>,
     reader: &mut FrameReader,
     writer: &mut FrameWriter,
 ) -> std::io::Result<()> {
     if *role == Role::Controller {
-        pane.resize(req.rows, req.cols);
+        pane.resize_for(client, req.rows, req.cols);
     }
     writer
         .send_body(
@@ -287,7 +310,18 @@ async fn attach_loop(
     let mut renderer = Renderer::new(req.rows, req.cols);
     let mut rev_rx = pane.subscribe_rev();
     let mut exit_rx = pane.subscribe_exit();
-    let mut ctrl_rx = pane.subscribe_controller();
+    // Reconcile: another client may have taken over while we were replying.
+    let current = if *ctrl_rx.borrow_and_update() == Some(client) {
+        Role::Controller
+    } else {
+        Role::Observer
+    };
+    if current != *role {
+        *role = current;
+        writer
+            .send_body(id, stream_body(&Stream::Role { role: current }))
+            .await?;
+    }
     let mut seq: u64 = 0;
     let mut dirty = true;
     let mut last_sent = Instant::now() - FRAME_INTERVAL;
@@ -308,15 +342,14 @@ async fn attach_loop(
                     Ok(Request::Input { data_b64 }) => {
                         if pane.is_controller(client) {
                             if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(data_b64) {
-                                pane.write(bytes);
+                                // Over budget = the program is not reading; drop the keys.
+                                let _ = pane.write(bytes);
                             }
                         }
                     }
                     Ok(Request::Resize { rows, cols }) => {
                         renderer.set_view(rows, cols);
-                        if pane.is_controller(client) {
-                            pane.resize(rows, cols);
-                        }
+                        pane.resize_for(client, rows, cols);
                         dirty = true;
                     }
                     Ok(Request::Takeover {}) => pane.take_control(client),
@@ -341,7 +374,7 @@ async fn attach_loop(
                     if now == Role::Controller {
                         // The new controller's terminal decides the size.
                         let (rows, cols) = renderer.view();
-                        pane.resize(rows, cols);
+                        pane.resize_for(client, rows, cols);
                     }
                 }
             }

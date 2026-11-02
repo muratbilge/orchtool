@@ -26,10 +26,12 @@ struct RawGuard;
 impl RawGuard {
     fn enter() -> Result<Self> {
         crossterm::terminal::enable_raw_mode()?;
+        // From here on, any failure must still restore the terminal: the guard's Drop does it.
+        let guard = RawGuard;
         let mut out = std::io::stdout();
         out.write_all(b"\x1b[?1049h\x1b[H\x1b[2J")?;
         out.flush()?;
-        Ok(RawGuard)
+        Ok(guard)
     }
 }
 
@@ -38,7 +40,7 @@ impl Drop for RawGuard {
         let mut out = std::io::stdout();
         // Undo every mode a pane may have switched on in our terminal.
         let _ = out.write_all(
-            b"\x1b[m\x1b[?1l\x1b>\x1b[?2004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[0 q\x1b[?25h\x1b[?1049l",
+            b"\x1b[m\x1b[?1l\x1b>\x1b[?2004l\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[0 q\x1b[?25h\x1b[?1049l",
         );
         let _ = out.flush();
         let _ = crossterm::terminal::disable_raw_mode();

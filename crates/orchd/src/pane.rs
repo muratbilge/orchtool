@@ -10,12 +10,16 @@ use orch_proto::api::{NewPane, PaneInfo, PaneState, Role};
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use std::collections::BTreeSet;
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Mutex, Weak};
+use std::time::Duration;
 use tokio::sync::watch;
 
 pub const DEFAULT_ROWS: u16 = 40;
 pub const DEFAULT_COLS: u16 = 120;
+/// Max bytes waiting to be written into one pane (a program that stops reading its input
+/// must not make orchd grow without bound).
+pub const INPUT_BUDGET: usize = 1024 * 1024;
 
 pub struct Pane {
     pub id: String,
@@ -27,6 +31,7 @@ pub struct Pane {
     pub term: Mutex<Term>,
     master: Mutex<Box<dyn MasterPty + Send>>,
     input: mpsc::Sender<Vec<u8>>,
+    queued: Arc<AtomicUsize>,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     /// Bumped on every screen change.
     rev: watch::Sender<u64>,
@@ -83,6 +88,7 @@ impl Pane {
         let mut reader = pair.master.try_clone_reader().context("pty reader")?;
         let mut writer = pair.master.take_writer().context("pty writer")?;
         let (input, input_rx) = mpsc::channel::<Vec<u8>>();
+        let queued = Arc::new(AtomicUsize::new(0));
         let argv = if req.argv.is_empty() {
             vec![std::env::var("SHELL").unwrap_or_else(|_| "sh".into())]
         } else {
@@ -101,6 +107,7 @@ impl Pane {
             term: Mutex::new(Term::new(rows, cols, scrollback)),
             master: Mutex::new(pair.master),
             input,
+            queued: Arc::clone(&queued),
             killer: Mutex::new(child.clone_killer()),
             rev: watch::Sender::new(0),
             gen: AtomicU64::new(0),
@@ -114,56 +121,90 @@ impl Pane {
             .name(format!("{}-in", pane.id))
             .spawn(move || {
                 for bytes in input_rx {
-                    if writer
+                    let ok = writer
                         .write_all(&bytes)
                         .and_then(|_| writer.flush())
-                        .is_err()
-                    {
+                        .is_ok();
+                    queued.fetch_sub(bytes.len(), Ordering::SeqCst);
+                    if !ok {
                         break;
                     }
                 }
             })?;
 
-        let p = Arc::clone(&pane);
+        // Reader and waiter hold only a Weak: a removed pane is freed even if some
+        // descendant keeps the PTY open.
+        let (drained_tx, drained_rx) = mpsc::channel::<()>();
+        let weak: Weak<Pane> = Arc::downgrade(&pane);
         std::thread::Builder::new()
             .name(format!("{}-out", pane.id))
             .spawn(move || {
+                let _drained = drained_tx; // dropped when the reader is done
                 let mut buf = vec![0u8; 64 * 1024];
                 loop {
-                    match reader.read(&mut buf) {
+                    let n = match reader.read(&mut buf) {
                         Ok(0) | Err(_) => break,
-                        Ok(n) => {
-                            let replies = p.term.lock().unwrap().process(&buf[..n]);
-                            if !replies.is_empty() {
-                                let _ = p.input.send(replies);
-                            }
-                            p.rev.send_modify(|r| *r += 1);
-                        }
+                        Ok(n) => n,
+                    };
+                    let Some(p) = weak.upgrade() else { break };
+                    let replies = p.term.lock().unwrap().process(&buf[..n]);
+                    if !replies.is_empty() {
+                        p.write(replies);
                     }
+                    p.rev.send_modify(|r| *r += 1);
                 }
             })?;
 
-        let p = Arc::clone(&pane);
+        let weak: Weak<Pane> = Arc::downgrade(&pane);
         std::thread::Builder::new()
             .name(format!("{}-wait", pane.id))
             .spawn(move || {
                 let code = child.wait().ok().map(|s| s.exit_code());
-                // Let the reader drain the last output before announcing the exit.
-                std::thread::sleep(std::time::Duration::from_millis(50));
-                p.exit.send_replace(Some(code));
-                p.rev.send_modify(|r| *r += 1);
+                // Announce the exit only after the reader parsed the last output (it ends at
+                // PTY EOF). A background descendant may keep the PTY open: then give up
+                // waiting after 2 s.
+                let _ = drained_rx.recv_timeout(Duration::from_secs(2));
+                if let Some(p) = weak.upgrade() {
+                    p.exit.send_replace(Some(code));
+                    p.rev.send_modify(|r| *r += 1);
+                }
             })?;
         Ok(pane)
     }
 
-    pub fn write(&self, bytes: Vec<u8>) {
-        let _ = self.input.send(bytes);
+    /// Queue bytes for the program. `false` = input budget exhausted (the program is not
+    /// reading its input); the bytes are dropped rather than buffered without bound.
+    pub fn write(&self, bytes: Vec<u8>) -> bool {
+        let len = bytes.len();
+        let before = self.queued.fetch_add(len, Ordering::SeqCst);
+        if before + len > INPUT_BUDGET {
+            self.queued.fetch_sub(len, Ordering::SeqCst);
+            return false;
+        }
+        if self.input.send(bytes).is_err() {
+            self.queued.fetch_sub(len, Ordering::SeqCst);
+            return false;
+        }
+        true
     }
 
+    /// Resize PTY and parser together under the terminal lock, so the reader never parses
+    /// output (e.g. the program's SIGWINCH redraw) against the wrong size and concurrent
+    /// resizes cannot leave PTY and parser disagreeing.
     pub fn resize(&self, rows: u16, cols: u16) {
+        self.resize_inner(None, rows, cols);
+    }
+
+    /// Resize only if `client` still controls the pane (checked under the lock).
+    pub fn resize_for(&self, client: u64, rows: u16, cols: u16) {
+        self.resize_inner(Some(client), rows, cols);
+    }
+
+    fn resize_inner(&self, client: Option<u64>, rows: u16, cols: u16) {
         let rows = rows.max(2);
         let cols = cols.max(2);
-        if self.size() == (rows, cols) {
+        let mut term = self.term.lock().unwrap();
+        if client.is_some_and(|c| !self.is_controller(c)) || term.size() == (rows, cols) {
             return;
         }
         let _ = self.master.lock().unwrap().resize(PtySize {
@@ -172,9 +213,19 @@ impl Pane {
             pixel_width: 0,
             pixel_height: 0,
         });
-        self.term.lock().unwrap().set_size(rows, cols);
+        term.set_size(rows, cols);
         self.gen.fetch_add(1, Ordering::SeqCst);
+        drop(term);
         self.rev.send_modify(|r| *r += 1);
+    }
+
+    /// Signal the program's whole process group (it is a session leader in its PTY).
+    pub fn signal_group(&self, sig: i32) {
+        if let Some(pid) = self.pid {
+            unsafe {
+                libc::kill(-(pid as i32), sig);
+            }
+        }
     }
 
     pub fn size(&self) -> (u16, u16) {
