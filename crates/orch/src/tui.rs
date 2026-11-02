@@ -91,6 +91,8 @@ struct App {
     questions: Vec<QuestionRow>,
     messages: VecDeque<MessageRow>,
     ws_id: Option<String>,
+    /// Highest `Session::raised.seq` already followed (raises from before we started are ignored).
+    raise_seq: u64,
     views: HashMap<String, PaneView>,
     mode: Mode,
     prefix_pending: bool,
@@ -211,6 +213,7 @@ pub async fn run(connector: Connector) -> Result<()> {
         questions: Vec::new(),
         messages: VecDeque::new(),
         ws_id: None,
+        raise_seq: 0,
         views: HashMap::new(),
         mode: Mode::Normal,
         prefix_pending: false,
@@ -706,6 +709,7 @@ impl App {
                 self.agents = s.agents;
                 self.questions = s.questions;
                 self.messages = s.messages.into_iter().collect();
+                self.raise_seq = self.session.raised.as_ref().map_or(0, |r| r.seq);
                 self.pick_start_workspace();
             }
             Msg::Event(e) => match *e {
@@ -715,6 +719,15 @@ impl App {
                 Event::Session { session } => {
                     if session.version >= self.session.version {
                         self.session = session;
+                    }
+                    // Raised from the phone / `orch focus`: show that workspace.
+                    if let Some(r) = self.session.raised.clone() {
+                        if r.seq > self.raise_seq {
+                            self.raise_seq = r.seq;
+                            if self.session.workspace(&r.workspace).is_some() {
+                                self.ws_id = Some(r.workspace);
+                            }
+                        }
                     }
                     if self
                         .ws_id

@@ -52,6 +52,15 @@ pub struct Session {
     pub workspaces: Vec<Workspace>,
     #[serde(default)]
     pub next_id: u64,
+    /// The last `Raise`: TUIs switch to this workspace when `seq` grows.
+    #[serde(default)]
+    pub raised: Option<Raised>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Raised {
+    pub seq: u64,
+    pub workspace: String,
 }
 
 /// Plain rectangle in terminal cells.

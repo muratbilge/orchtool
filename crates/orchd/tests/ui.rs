@@ -130,6 +130,14 @@ async fn workspaces_tabs_splits_and_close() {
         s.workspaces[0].active_tab, 0,
         "focusing a pane selects its tab"
     );
+    // Raise (phone / `orch focus`): selects the tab like Focus and records the workspace.
+    let s = session(&op(&d, UiOp::Raise { pane: p3.clone() }).await);
+    assert_eq!(s.workspaces[0].active_tab, 1);
+    let r1 = s.raised.clone().expect("raised");
+    assert_eq!(r1.workspace, ws);
+    let s = session(&op(&d, UiOp::Raise { pane: p1.clone() }).await);
+    assert_eq!(s.workspaces[0].active_tab, 0);
+    assert!(s.raised.unwrap().seq > r1.seq, "every raise counts");
     let s = session(&op(&d, UiOp::ToggleZoom { pane: p1.clone() }).await);
     assert!(s.workspaces[0].tabs[0].zoomed);
     let s = session(

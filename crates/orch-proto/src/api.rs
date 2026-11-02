@@ -178,6 +178,10 @@ pub enum UiOp {
     ToggleZoom {
         pane: String,
     },
+    /// Focus a pane and bring its workspace on screen in every open TUI (phone / CLI).
+    Raise {
+        pane: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

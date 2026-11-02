@@ -205,6 +205,18 @@ impl Daemon {
                 w.tabs[ti].focus = pane.clone();
                 Ok(())
             })?,
+            UiOp::Raise { pane } => self.edit(|s| {
+                let (wi, ti) = s
+                    .locate(&pane)
+                    .ok_or_else(|| err("not_placed", format!("{pane} is not in a workspace")))?;
+                let w = &mut s.workspaces[wi];
+                w.active_tab = ti;
+                w.tabs[ti].focus = pane.clone();
+                let workspace = w.id.clone();
+                let seq = s.raised.as_ref().map_or(0, |r| r.seq) + 1;
+                s.raised = Some(orch_proto::layout::Raised { seq, workspace });
+                Ok(())
+            })?,
             UiOp::SelectTab { workspace, index } => self.edit(|s| {
                 let w = s
                     .workspace_mut(&workspace)

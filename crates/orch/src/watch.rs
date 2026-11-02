@@ -1,0 +1,429 @@
+//! `orch watch --json`: one JSON line per change, for Kabuk (the phone) over an SSH exec channel.
+//!
+//! Events are only hints: after each burst the watcher reads the authoritative state (agents,
+//! panes, layout, open questions, timeline tail) and prints it only when it differs from the last
+//! line. A line is also forced every 60 s so the phone knows the stream is alive. When orchd is
+//! not reachable it prints `{"error": "..."}` and retries every 5 s. Stdin EOF (the phone hung up)
+//! ends it at once.
+
+use anyhow::{Context, Result};
+use orch_proto::api::{AgentRow, MessageRow, PaneInfo, PaneState, QuestionRow, Request, HUMAN};
+use orch_proto::client::Conn;
+use orch_proto::layout::Session;
+use serde_json::{json, Value};
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
+use std::time::{Duration, Instant};
+
+const COALESCE: Duration = Duration::from_millis(150);
+const REFRESH: Duration = Duration::from_secs(15);
+const HEARTBEAT: Duration = Duration::from_secs(60);
+const RETRY: Duration = Duration::from_secs(5);
+/// Agents without a live pane disappear from the phone after this long without a sign of life.
+const STALE_MS: i64 = 6 * 3600 * 1000;
+const TIMELINE: usize = 40;
+const SCREEN_LINES: usize = 60;
+
+pub async fn run(socket: &Path, once: bool) -> Result<()> {
+    if !once {
+        // The phone closing the channel closes our stdin: stop right away.
+        std::thread::spawn(|| {
+            let mut buf = [0u8; 256];
+            loop {
+                match std::io::Read::read(&mut std::io::stdin(), &mut buf) {
+                    Ok(0) | Err(_) => std::process::exit(0),
+                    Ok(_) => {}
+                }
+            }
+        });
+    }
+    let mut last = String::new();
+    loop {
+        match watch(socket, once, &mut last).await {
+            Ok(()) if once => return Ok(()),
+            Ok(()) => {}
+            Err(e) => {
+                if once {
+                    return Err(e);
+                }
+                line(&json!({ "error": format!("{e:#}") }).to_string());
+                last.clear();
+            }
+        }
+        tokio::time::sleep(RETRY).await;
+    }
+}
+
+fn line(s: &str) {
+    use std::io::Write as _;
+    let mut out = std::io::stdout().lock();
+    let _ = writeln!(out, "{s}");
+    let _ = out.flush();
+}
+
+/// One connection's worth of watching; returns (or errs) when the event stream ends.
+async fn watch(socket: &Path, once: bool, last: &mut String) -> Result<()> {
+    let mut req = Conn::unix(socket).await.context("orchd is not running")?;
+    if once {
+        let s = snapshot(&mut req).await?;
+        line(&s);
+        return Ok(());
+    }
+    let (mut events, mut w) = Conn::unix(socket)
+        .await
+        .context("orchd is not running")?
+        .into_parts();
+    w.send_body("w", serde_json::to_value(Request::Subscribe {})?)
+        .await?;
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(1);
+    let reader = tokio::spawn(async move {
+        while let Ok(Some(_)) = events.next().await {
+            let _ = tx.try_send(());
+        }
+    });
+    let mut beat = Instant::now();
+    // Every pass: let a burst settle, read the state, print it if it changed, wait for a hint.
+    let result = loop {
+        tokio::time::sleep(COALESCE).await;
+        while rx.try_recv().is_ok() {}
+        let s = match snapshot(&mut req).await {
+            Ok(s) => s,
+            Err(e) => break Err(e),
+        };
+        if s != *last || beat.elapsed() >= HEARTBEAT {
+            line(&s);
+            *last = s;
+            beat = Instant::now();
+        }
+        tokio::select! {
+            ev = rx.recv() => if ev.is_none() {
+                break Err(anyhow::anyhow!("orchd closed the event stream"));
+            },
+            _ = tokio::time::sleep(REFRESH) => {}
+        }
+    };
+    reader.abort();
+    result
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as i64)
+}
+
+/// The authoritative state as one JSON line.
+async fn snapshot(c: &mut Conn) -> Result<String> {
+    let agents: Vec<AgentRow> =
+        serde_json::from_value(c.request(&Request::ListAgents {}).await?["agents"].clone())?;
+    let panes: Vec<PaneInfo> =
+        serde_json::from_value(c.request(&Request::ListPanes {}).await?["panes"].clone())?;
+    let session: Session = serde_json::from_value(c.request(&Request::UiGet {}).await?)?;
+    let questions: Vec<QuestionRow> = serde_json::from_value(
+        c.request(&Request::ListQuestions { all: false }).await?["questions"].clone(),
+    )?;
+    let timeline: Vec<MessageRow> = serde_json::from_value(
+        c.request(&Request::Log {
+            after: None,
+            limit: Some(TIMELINE),
+            follow: false,
+        })
+        .await?["messages"]
+            .clone(),
+    )?;
+    let herdr_alive = if agents.iter().any(|a| herdr_pane(a).is_some()) {
+        herdr_panes().await
+    } else {
+        None
+    };
+    let mut list = merge(&agents, &panes, &session, herdr_alive.as_ref(), now_ms());
+    // The text of every waiting agent's pane, so the phone can show and answer its dialog.
+    let mut screens = serde_json::Map::new();
+    for a in &list {
+        if a["status"] != "blocked" {
+            continue;
+        }
+        let Some(pane) = a["pane"].as_str() else {
+            continue;
+        };
+        if let Some(text) = read_pane(c, pane, SCREEN_LINES).await {
+            screens.insert(pane.to_string(), Value::String(text));
+        }
+    }
+    list.sort_by_key(|a| {
+        (
+            order(a["status"].as_str().unwrap_or("")),
+            a["workspace_number"].as_u64().unwrap_or(u64::MAX),
+        )
+    });
+    Ok(json!({
+        "v": 1,
+        "human": HUMAN,
+        "agents": list,
+        "questions": questions,
+        "screens": screens,
+        "timeline": timeline,
+    })
+    .to_string())
+}
+
+fn order(s: &str) -> u8 {
+    match s {
+        "blocked" => 0,
+        "working" => 1,
+        "done" => 2,
+        "idle" => 3,
+        _ => 4,
+    }
+}
+
+fn herdr_pane(a: &AgentRow) -> Option<&str> {
+    a.pane.as_deref()?.strip_prefix("herdr:")
+}
+
+/// Bus agents joined with orch panes and the layout, plus agent panes nobody registered.
+fn merge(
+    agents: &[AgentRow],
+    panes: &[PaneInfo],
+    session: &Session,
+    herdr_alive: Option<&HashSet<String>>,
+    now: i64,
+) -> Vec<Value> {
+    let by_id: HashMap<&str, &PaneInfo> = panes.iter().map(|p| (p.id.as_str(), p)).collect();
+    let place = |pane: &str| -> (String, u64, bool) {
+        match session.locate(pane) {
+            Some((wi, ti)) => {
+                let w = &session.workspaces[wi];
+                let focused = session.raised.as_ref().is_some_and(|r| r.workspace == w.id)
+                    && w.active_tab == ti
+                    && w.tabs[ti].focus == pane;
+                (w.label.clone(), wi as u64 + 1, focused)
+            }
+            None => (String::new(), 0, false),
+        }
+    };
+    let mut claimed = HashSet::new();
+    let mut out = Vec::new();
+    for a in agents {
+        let mut status = a.status.clone();
+        let (mut workspace, mut number, mut focused) = (String::new(), 0, false);
+        let mut cwd = a.cwd.clone().unwrap_or_default();
+        let live = match a.pane.as_deref() {
+            Some(p) if p.starts_with("orch:") => {
+                let id = &p["orch:".len()..];
+                match by_id.get(id) {
+                    Some(info) if info.state == PaneState::Running => {
+                        claimed.insert(id.to_string());
+                        (workspace, number, focused) = place(id);
+                        if cwd.is_empty() {
+                            cwd = info.cwd.clone();
+                        }
+                        // The screen knows best about dialogs; the bus about everything else.
+                        match info.agent_status.as_deref() {
+                            Some("blocked") => status = "blocked".into(),
+                            Some(s) if status == "unknown" => status = s.into(),
+                            _ => {}
+                        }
+                        true
+                    }
+                    _ => continue, // its pane is gone
+                }
+            }
+            Some(p) if p.starts_with("herdr:") => match herdr_alive {
+                Some(alive) => {
+                    if !alive.contains(&p["herdr:".len()..]) {
+                        continue;
+                    }
+                    true
+                }
+                None => false,
+            },
+            _ => false,
+        };
+        if !live && now - a.last_seen_ms > STALE_MS {
+            continue;
+        }
+        out.push(json!({
+            "name": a.name,
+            "kind": a.kind,
+            "status": status,
+            "status_text": a.status_text,
+            "pane": a.pane,
+            "cwd": cwd,
+            "workspace": workspace,
+            "workspace_number": number,
+            "focused": focused,
+            "seen_ms": a.last_seen_ms,
+            "registered": true,
+        }));
+    }
+    for p in panes {
+        let Some(kind) = p.agent.as_deref() else {
+            continue;
+        };
+        if p.state != PaneState::Running || claimed.contains(&p.id) {
+            continue;
+        }
+        let (workspace, number, focused) = place(&p.id);
+        out.push(json!({
+            "name": p.name.clone().unwrap_or_else(|| format!("{kind}-{}", p.id)),
+            "kind": kind,
+            "status": p.agent_status.as_deref().unwrap_or("unknown"),
+            "status_text": Value::Null,
+            "pane": format!("orch:{}", p.id),
+            "cwd": p.cwd,
+            "workspace": workspace,
+            "workspace_number": number,
+            "focused": focused,
+            "seen_ms": Value::Null,
+            "registered": false,
+        }));
+    }
+    out
+}
+
+/// herdr's executable: $ORCH_HERDR, else on PATH, else ~/.local/bin/herdr (SSH exec has a short PATH).
+pub(crate) fn herdr_bin() -> String {
+    if let Ok(h) = std::env::var("ORCH_HERDR") {
+        return h;
+    }
+    let on_path = std::env::var_os("PATH")
+        .is_some_and(|path| std::env::split_paths(&path).any(|d| d.join("herdr").is_file()));
+    if on_path {
+        return "herdr".into();
+    }
+    std::env::var("HOME").map_or("herdr".into(), |h| format!("{h}/.local/bin/herdr"))
+}
+
+pub(crate) async fn herdr(args: &[&str]) -> Option<String> {
+    let out = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::process::Command::new(herdr_bin())
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// The ids of herdr's live panes; None when herdr can't be asked.
+async fn herdr_panes() -> Option<HashSet<String>> {
+    let v: Value = serde_json::from_str(herdr(&["pane", "list"]).await?.trim()).ok()?;
+    Some(
+        v["result"]["panes"]
+            .as_array()?
+            .iter()
+            .filter_map(|p| p["pane_id"].as_str().map(String::from))
+            .collect(),
+    )
+}
+
+/// Recent text of a pane given as `orch:pN`, `pN` or `herdr:ID`.
+pub(crate) async fn read_pane(c: &mut Conn, pane: &str, lines: usize) -> Option<String> {
+    if let Some(id) = pane.strip_prefix("herdr:") {
+        let n = lines.to_string();
+        return herdr(&["pane", "read", id, "--source", "recent", "--lines", &n]).await;
+    }
+    let id = pane.strip_prefix("orch:").unwrap_or(pane);
+    let v = c
+        .request(&Request::Read(orch_proto::api::ReadPane {
+            pane: id.into(),
+            lines: Some(lines),
+            source: orch_proto::api::ReadSource::Recent,
+        }))
+        .await
+        .ok()?;
+    v["text"].as_str().map(String::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use orch_proto::layout::{Node, Raised, Tab, Workspace};
+
+    fn pane(id: &str, agent: Option<&str>, status: Option<&str>) -> PaneInfo {
+        PaneInfo {
+            id: id.into(),
+            name: None,
+            argv: vec![],
+            cwd: "/w".into(),
+            pid: None,
+            state: PaneState::Running,
+            exit_code: None,
+            rows: 24,
+            cols: 80,
+            clients: 0,
+            title: String::new(),
+            created_unix: 0,
+            agent: agent.map(String::from),
+            agent_status: status.map(String::from),
+        }
+    }
+
+    fn agent(name: &str, pane: Option<&str>, status: &str, seen: i64) -> AgentRow {
+        AgentRow {
+            name: name.into(),
+            kind: "claude".into(),
+            pane: pane.map(String::from),
+            cwd: None,
+            status: status.into(),
+            status_text: None,
+            last_seen_ms: seen,
+        }
+    }
+
+    #[test]
+    fn merge_joins_layout_screen_and_drops_dead() {
+        let session = Session {
+            version: 1,
+            workspaces: vec![Workspace {
+                id: "w1".into(),
+                label: "proj".into(),
+                cwd: "/w".into(),
+                tabs: vec![Tab {
+                    id: "t1".into(),
+                    label: "1".into(),
+                    root: Node::leaf("p1"),
+                    focus: "p1".into(),
+                    zoomed: false,
+                }],
+                active_tab: 0,
+            }],
+            next_id: 2,
+            raised: Some(Raised {
+                seq: 1,
+                workspace: "w1".into(),
+            }),
+        };
+        let panes = vec![
+            pane("p1", Some("claude"), Some("blocked")),
+            pane("p2", Some("codex"), Some("idle")),
+        ];
+        let now = 10 * STALE_MS;
+        let agents = vec![
+            agent("a", Some("orch:p1"), "working", now),
+            agent("gone", Some("orch:p9"), "idle", now),
+            agent("old-mcp", None, "idle", now - STALE_MS - 1),
+            agent("mcp", None, "idle", now - 1000),
+            agent("h", Some("herdr:w1:p1"), "idle", 0),
+            agent("h-dead", Some("herdr:w9:p1"), "idle", now),
+        ];
+        let alive: HashSet<String> = ["w1:p1".to_string()].into();
+        let out = merge(&agents, &panes, &session, Some(&alive), now);
+        let names: Vec<&str> = out.iter().map(|a| a["name"].as_str().unwrap()).collect();
+        assert_eq!(names, vec!["a", "mcp", "h", "codex-p2"]);
+        assert_eq!(out[0]["status"], "blocked", "the screen's dialog wins");
+        assert_eq!(out[0]["workspace"], "proj");
+        assert_eq!(out[0]["workspace_number"], 1);
+        assert_eq!(out[0]["focused"], true);
+        assert_eq!(out[3]["registered"], false);
+        assert_eq!(out[3]["pane"], "orch:p2");
+    }
+}

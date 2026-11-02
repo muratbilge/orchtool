@@ -3,6 +3,7 @@
 mod attach;
 mod bus;
 mod tui;
+mod watch;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -86,6 +87,17 @@ enum Cmd {
     },
     /// Kill a pane's program (or remove an exited pane)
     Kill { pane: String },
+    /// Focus a pane and show its workspace in every open `orch` TUI
+    Focus { pane: String },
+    /// Stream agents, questions, dialogs and the timeline as JSON lines (for Kabuk)
+    Watch {
+        /// JSON lines (the only format; accepted for clarity)
+        #[arg(long)]
+        json: bool,
+        /// Print one snapshot and exit
+        #[arg(long)]
+        once: bool,
+    },
     /// stdio ⇄ orchd bridge, used by `orch --host H …` via ssh
     Proxy {
         /// Multiplex many orch connections over this one stream (the TUI uses this)
@@ -146,6 +158,9 @@ enum Cmd {
         id: i64,
         #[arg(required = true, num_args = 1..)]
         text: Vec<String>,
+        /// Who answers (shown in the timeline)
+        #[arg(long, default_value = "cli")]
+        by: String,
     },
     /// Ask Murat a question from a script/shell agent and wait for the answer
     Ask {
@@ -198,6 +213,45 @@ async fn run(cli: Cli) -> Result<()> {
     let cli = CliRest { cmd };
     if let Cmd::Proxy { mux } = cli.cmd {
         return proxy(&socket, mux).await;
+    }
+    if let Cmd::Watch { once, .. } = cli.cmd {
+        return watch::run(&socket, once).await;
+    }
+    // herdr panes (as agents on the bus name them) are read and typed into through herdr.
+    match &cli.cmd {
+        Cmd::Read { pane, lines, .. } if pane.starts_with("herdr:") => {
+            let n = lines.to_string();
+            let id = &pane["herdr:".len()..];
+            let text = watch::herdr(&["pane", "read", id, "--source", "recent", "--lines", &n])
+                .await
+                .context("herdr pane read failed")?;
+            print!("{text}");
+            return Ok(());
+        }
+        Cmd::Send {
+            pane,
+            text,
+            enter,
+            keys,
+        } if pane.starts_with("herdr:") => {
+            let id = &pane["herdr:".len()..];
+            if let Some(t) = text {
+                watch::herdr(&["pane", "send-text", id, t])
+                    .await
+                    .context("herdr pane send-text failed")?;
+            }
+            let mut keys: Vec<&str> = keys.iter().map(String::as_str).collect();
+            if *enter {
+                keys.push("Enter");
+            }
+            for k in keys {
+                watch::herdr(&["pane", "send-keys", id, k])
+                    .await
+                    .with_context(|| format!("herdr pane send-keys {k} failed"))?;
+            }
+            return Ok(());
+        }
+        _ => {}
     }
     if let Cmd::Hook { kind } = &cli.cmd {
         bus::hook(&socket, kind).await;
@@ -297,8 +351,12 @@ async fn run(cli: Cli) -> Result<()> {
             for k in &keys {
                 text.push_str(key_bytes(k).with_context(|| format!("unknown key {k:?}"))?);
             }
-            conn.request(&Request::Send(SendPane { pane, text, enter }))
-                .await?;
+            conn.request(&Request::Send(SendPane {
+                pane: strip_orch(pane),
+                text,
+                enter,
+            }))
+            .await?;
         }
         Cmd::Read {
             pane,
@@ -307,7 +365,7 @@ async fn run(cli: Cli) -> Result<()> {
         } => {
             let v = conn
                 .request(&Request::Read(ReadPane {
-                    pane,
+                    pane: strip_orch(pane),
                     lines: Some(lines),
                     source: if visible {
                         ReadSource::Visible
@@ -319,7 +377,16 @@ async fn run(cli: Cli) -> Result<()> {
             println!("{}", v["text"].as_str().unwrap_or_default());
         }
         Cmd::Kill { pane } => {
-            conn.request(&Request::Kill { pane }).await?;
+            conn.request(&Request::Kill {
+                pane: strip_orch(pane),
+            })
+            .await?;
+        }
+        Cmd::Focus { pane } => {
+            conn.request(&Request::Ui(orch_proto::api::UiOp::Raise {
+                pane: strip_orch(pane),
+            }))
+            .await?;
         }
         Cmd::Ping { count } => {
             for _ in 0..count {
@@ -336,13 +403,13 @@ async fn run(cli: Cli) -> Result<()> {
         Cmd::StopDaemon => {
             conn.request(&Request::StopDaemon {}).await?;
         }
-        Cmd::Proxy { .. } | Cmd::Hook { .. } | Cmd::Ui => unreachable!(),
+        Cmd::Proxy { .. } | Cmd::Hook { .. } | Cmd::Ui | Cmd::Watch { .. } => unreachable!(),
         Cmd::Agents { json } => bus::agents(&mut conn, json).await?,
         Cmd::Tail { follow, lines } => bus::tail(conn, follow, lines).await?,
         Cmd::Msg { to, text, from } => bus::msg(&mut conn, &from, &to, &text.join(" ")).await?,
         Cmd::Inbox { name, wait, peek } => bus::inbox(&mut conn, &name, wait, peek).await?,
         Cmd::Questions { all } => bus::questions(&mut conn, all).await?,
-        Cmd::Answer { id, text } => bus::answer(&mut conn, id, &text.join(" ")).await?,
+        Cmd::Answer { id, text, by } => bus::answer(&mut conn, id, &text.join(" "), &by).await?,
         Cmd::Ask {
             text,
             from,
@@ -363,6 +430,14 @@ async fn run(cli: Cli) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Bus agents name orch panes `orch:pN`; the pane API wants `pN`.
+fn strip_orch(pane: String) -> String {
+    match pane.strip_prefix("orch:") {
+        Some(id) => id.to_string(),
+        None => pane,
+    }
 }
 
 /// Variables that describe the *calling* session, not the new pane: another multiplexer, or
