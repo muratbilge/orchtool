@@ -45,6 +45,9 @@ async fn daemon() -> Daemon {
         .arg(&socket)
         .arg("--scrollback")
         .arg("500")
+        .arg("--db")
+        .arg(dir.join("bus.db"))
+        .arg("--no-telegram")
         .spawn()
         .unwrap();
     for _ in 0..100 {
@@ -191,6 +194,7 @@ impl Viewer {
             }
             Stream::Role { role } => self.role = role,
             Stream::Exit { code } => self.exited = Some(code),
+            Stream::Timeline { .. } => {}
         }
     }
 

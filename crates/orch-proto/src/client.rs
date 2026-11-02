@@ -159,3 +159,90 @@ pub fn reply_result(mut body: Value) -> Result<Value, ClientError> {
         .map(Value::take)
         .unwrap_or(Value::Null))
 }
+
+/// Connect to the local orchd, starting it (detached, own session) if it is not running.
+pub async fn connect_or_start(socket: &std::path::Path) -> io::Result<Conn> {
+    match Conn::unix(socket).await {
+        Ok(c) => Ok(c),
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            start_daemon(socket)?;
+            for _ in 0..50 {
+                tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+                if let Ok(c) = Conn::unix(socket).await {
+                    return Ok(c);
+                }
+            }
+            Err(io::Error::other(format!(
+                "orchd did not start; see {}",
+                state_dir().join("orchd.log").display()
+            )))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// `orchd` next to the current executable, else from PATH.
+fn start_daemon(socket: &std::path::Path) -> io::Result<()> {
+    use std::os::unix::process::CommandExt;
+    let exe = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("orchd")))
+        .filter(|p| p.exists())
+        .unwrap_or_else(|| PathBuf::from("orchd"));
+    let dir = state_dir();
+    std::fs::create_dir_all(&dir)?;
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("orchd.log"))?;
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.arg("--socket")
+        .arg(socket)
+        .stdin(std::process::Stdio::null())
+        .stdout(log.try_clone()?)
+        .stderr(log)
+        .env_remove("ORCH_PANE");
+    // SAFETY: setsid is async-signal-safe; detaches orchd from our terminal/session.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    cmd.spawn()
+        .map_err(|e| io::Error::other(format!("starting {}: {e}", exe.display())))?;
+    Ok(())
+}
+
+/// Where the calling program runs: `orch:<pane>` inside an orch pane, `herdr:<pane>` inside a
+/// herdr pane, else `None`.
+pub fn current_pane() -> Option<String> {
+    if let Ok(p) = std::env::var("ORCH_PANE") {
+        if !p.is_empty() {
+            return Some(format!("orch:{p}"));
+        }
+    }
+    if let Ok(p) = std::env::var("HERDR_PANE_ID") {
+        if !p.is_empty() {
+            return Some(format!("herdr:{p}"));
+        }
+    }
+    None
+}
+
+/// Registration request for this process ($ORCH_AGENT overrides the derived name).
+pub fn register_request(kind: &str) -> crate::api::RegisterAgent {
+    crate::api::RegisterAgent {
+        kind: kind.to_string(),
+        pane: current_pane(),
+        cwd: std::env::current_dir()
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned()),
+        name: std::env::var("ORCH_AGENT").ok().filter(|n| !n.is_empty()),
+    }
+}

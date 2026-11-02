@@ -1,5 +1,6 @@
 //! Socket server: one task per connection; request/reply, or an attach stream.
 
+use crate::bus::{Bus, BusEvent};
 use crate::pane::Pane;
 use crate::render::Renderer;
 use base64::Engine as _;
@@ -18,6 +19,7 @@ use tokio::time::Instant;
 pub const FRAME_INTERVAL: Duration = Duration::from_millis(40);
 
 pub struct Daemon {
+    pub bus: Arc<Bus>,
     panes: Mutex<BTreeMap<u64, Arc<Pane>>>,
     next_pane: AtomicU64,
     pub scrollback: usize,
@@ -30,6 +32,10 @@ struct ApiError {
     message: String,
 }
 
+fn bus_err(e: anyhow::Error) -> ApiError {
+    err("bus", format!("{e:#}"))
+}
+
 fn err(code: &'static str, message: impl Into<String>) -> ApiError {
     ApiError {
         code,
@@ -38,8 +44,9 @@ fn err(code: &'static str, message: impl Into<String>) -> ApiError {
 }
 
 impl Daemon {
-    pub fn new(scrollback: usize) -> Arc<Self> {
+    pub fn new(scrollback: usize, bus: Arc<Bus>) -> Arc<Self> {
         Arc::new(Self {
+            bus,
             panes: Mutex::new(BTreeMap::new()),
             next_pane: AtomicU64::new(1),
             scrollback,
@@ -172,6 +179,80 @@ impl Daemon {
                 self.shutdown.notify_one();
                 Ok(json!({ "stopping": true }))
             }
+            Request::RegisterAgent(r) => {
+                let row = self.bus.register(&r).map_err(bus_err)?;
+                Ok(serde_json::to_value(row).unwrap())
+            }
+            Request::SetStatus { name, status, text } => {
+                let row = self
+                    .bus
+                    .set_status(&name, &status, text.as_deref())
+                    .map_err(bus_err)?;
+                Ok(serde_json::to_value(row).unwrap())
+            }
+            Request::ListAgents {} => {
+                let rows = self.bus.agents().map_err(bus_err)?;
+                Ok(json!({ "agents": rows }))
+            }
+            Request::SendMessage(m) => {
+                let row = self
+                    .bus
+                    .send(&m.from, &m.to, "msg", &m.text, m.thread.as_deref(), None)
+                    .map_err(bus_err)?;
+                self.bus.touch(&row.from);
+                Ok(serde_json::to_value(row).unwrap())
+            }
+            Request::Inbox {
+                name,
+                wait_ms,
+                peek,
+            } => {
+                let wait = Duration::from_millis(wait_ms.unwrap_or(0).min(3_600_000));
+                let rows = self
+                    .bus
+                    .inbox_wait(&name, peek, wait)
+                    .await
+                    .map_err(bus_err)?;
+                Ok(json!({ "messages": rows }))
+            }
+            Request::Log { after, limit, .. } => {
+                let rows = self
+                    .bus
+                    .log(after, limit.unwrap_or(50).min(1000))
+                    .map_err(bus_err)?;
+                Ok(json!({ "messages": rows }))
+            }
+            Request::Ask {
+                from,
+                text,
+                options,
+            } => {
+                let q = self.bus.ask(&from, &text, &options).map_err(bus_err)?;
+                let _ = self
+                    .bus
+                    .set_status(&q.from, "blocked", Some("waiting for Murat"));
+                Ok(serde_json::to_value(q).unwrap())
+            }
+            Request::AskWait { id, wait_ms } => {
+                let wait = Duration::from_millis(wait_ms.unwrap_or(0).min(3_600_000));
+                let q = self.bus.ask_wait(id, wait).await.map_err(bus_err)?;
+                Ok(serde_json::to_value(q).unwrap())
+            }
+            Request::Answer { id, answer, by } => {
+                let (won, q) = self.bus.answer(id, &answer, &by).map_err(bus_err)?;
+                if won {
+                    let _ = self.bus.set_status(&q.from, "working", Some("answered"));
+                }
+                Ok(json!({ "won": won, "question": q }))
+            }
+            Request::ListQuestions { all } => {
+                let rows = self.bus.questions(all).map_err(bus_err)?;
+                Ok(json!({ "questions": rows }))
+            }
+            Request::TelegramPair {} => {
+                let code = crate::telegram::new_pair_code(&self.bus).map_err(bus_err)?;
+                Ok(json!({ "code": code }))
+            }
             Request::Attach(_)
             | Request::Input { .. }
             | Request::Resize { .. }
@@ -234,6 +315,14 @@ async fn connection(stream: UnixStream, daemon: Arc<Daemon>) -> std::io::Result<
             };
             return attach(pane, a, frame.id, reader, writer).await;
         }
+        if let Request::Log {
+            after,
+            limit,
+            follow: true,
+        } = req
+        {
+            return follow_log(&daemon, after, limit, frame.id, reader, writer).await;
+        }
         let result = daemon.handle(req).await;
         reply(&mut writer, &frame.id, result).await?;
     }
@@ -250,6 +339,114 @@ async fn reply(
         Err(e) => json!({ "error": { "code": e.code, "message": e.message } }),
     };
     writer.send_body(id, body).await
+}
+
+/// `msg.log` with follow: backlog, then every new timeline row until the client hangs up.
+async fn follow_log(
+    daemon: &Daemon,
+    after: Option<i64>,
+    limit: Option<usize>,
+    id: String,
+    mut reader: FrameReader,
+    mut writer: FrameWriter,
+) -> std::io::Result<()> {
+    let mut rx = daemon.bus.subscribe(); // before the backlog query: nothing slips between
+    let backlog = daemon
+        .bus
+        .log(after, limit.unwrap_or(30).min(1000))
+        .unwrap_or_default();
+    let mut last = after.unwrap_or(0);
+    writer
+        .send_body(&id, json!({ "result": { "following": true } }))
+        .await?;
+    for row in backlog {
+        last = last.max(row.id);
+        writer
+            .send_body(&id, stream_body(&Stream::Timeline { row }))
+            .await?;
+    }
+    loop {
+        tokio::select! {
+            f = reader.next() => if f?.is_none() { return Ok(()) },
+            ev = rx.recv() => match ev {
+                Ok(BusEvent::Message(row)) if row.id > last => {
+                    last = row.id;
+                    writer.send_body(&id, stream_body(&Stream::Timeline { row })).await?;
+                }
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    // Catch up from the store instead of losing rows.
+                    for row in daemon.bus.log(Some(last), 1000).unwrap_or_default() {
+                        last = last.max(row.id);
+                        writer.send_body(&id, stream_body(&Stream::Timeline { row })).await?;
+                    }
+                }
+                Err(_) => return Ok(()),
+            },
+        }
+    }
+}
+
+/// Wake idle agents: when a message or answer arrives for an agent whose status is `idle`
+/// (reported by its hooks / post_status) and whose pane is known, type a one-line notice into
+/// that pane. Never when the status is unknown, working or blocked — a notice typed into a
+/// permission prompt could choose an option.
+pub fn start_nudger(daemon: Arc<Daemon>) {
+    let mut rx = daemon.bus.subscribe();
+    tokio::spawn(async move {
+        loop {
+            let m = match rx.recv().await {
+                Ok(BusEvent::Message(m)) => m,
+                Ok(_) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(_) => return,
+            };
+            if !matches!(m.kind.as_str(), "msg" | "answer") || m.to == orch_proto::api::HUMAN {
+                continue;
+            }
+            let Ok(Some(agent)) = daemon.bus.agent(&m.to) else {
+                continue;
+            };
+            let (true, Some(pane)) = (agent.status == "idle", agent.pane.clone()) else {
+                continue;
+            };
+            let what = if m.kind == "answer" {
+                "answer"
+            } else {
+                "message"
+            };
+            let notice = format!(
+                "[orch] new {what} from {} - call the orch read_inbox tool",
+                m.from
+            );
+            // Mark first, so a burst of messages produces one notice.
+            let _ = daemon
+                .bus
+                .set_status(&agent.name, "working", Some("nudged by orch"));
+            nudge(&daemon, &pane, &notice).await;
+        }
+    });
+}
+
+async fn nudge(daemon: &Daemon, pane: &str, text: &str) {
+    if let Some(id) = pane.strip_prefix("orch:") {
+        if let Ok(p) = daemon.find(id) {
+            p.write(text.as_bytes().to_vec());
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            p.write(b"\r".to_vec());
+        }
+    } else if let Some(id) = pane.strip_prefix("herdr:") {
+        let herdr = std::env::var("ORCH_HERDR").unwrap_or_else(|_| "herdr".into());
+        let _ = tokio::process::Command::new(&herdr)
+            .args(["pane", "send-text", id, text])
+            .output()
+            .await;
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        let _ = tokio::process::Command::new(&herdr)
+            .args(["pane", "send-keys", id, "Enter"])
+            .output()
+            .await;
+    }
 }
 
 fn stream_body(s: &Stream) -> Value {

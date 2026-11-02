@@ -23,6 +23,8 @@ portable-pty.workspace = true
 libc.workspace = true
 anyhow.workspace = true
 base64.workspace = true
+rusqlite.workspace = true
+ureq.workspace = true
 
 [dev-dependencies]
 vt100.workspace = true

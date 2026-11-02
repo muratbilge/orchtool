@@ -1,16 +1,16 @@
 //! orch — CLI for orchd: create, list, attach, drive and read panes; `orch proxy` for SSH.
 
 mod attach;
+mod bus;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use orch_proto::api::{
     AttachMode, NewPane, PaneInfo, PaneState, ReadPane, ReadSource, Request, SendPane,
 };
-use orch_proto::client::{default_socket_path, state_dir, Conn};
-use std::os::unix::process::CommandExt;
+use orch_proto::client::{default_socket_path, Conn};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 #[derive(Parser)]
 #[command(name = "orch", version, about = "orchtool: agent workspace manager")]
@@ -97,6 +97,78 @@ enum Cmd {
     },
     /// Stop orchd (kills all panes)
     StopDaemon,
+
+    // ---- agent bus ----
+    /// List agents on the bus
+    Agents {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show the communication timeline (-f: follow live)
+    Tail {
+        #[arg(short, long)]
+        follow: bool,
+        #[arg(short = 'n', long, default_value_t = 30)]
+        lines: usize,
+    },
+    /// Send a message to an agent ("all" = everyone)
+    Msg {
+        to: String,
+        #[arg(required = true, num_args = 1..)]
+        text: Vec<String>,
+        #[arg(long, default_value = "murat")]
+        from: String,
+    },
+    /// Unread messages for you (or --name AGENT)
+    Inbox {
+        #[arg(long, default_value = "murat")]
+        name: String,
+        #[arg(long, default_value_t = 0)]
+        wait: u64,
+        #[arg(long)]
+        peek: bool,
+    },
+    /// Open questions from agents (--all: also answered ones)
+    Questions {
+        #[arg(long)]
+        all: bool,
+    },
+    /// Answer a question: orch answer <id> <text>  (or the option number)
+    Answer {
+        id: i64,
+        #[arg(required = true, num_args = 1..)]
+        text: Vec<String>,
+    },
+    /// Ask Murat a question from a script/shell agent and wait for the answer
+    Ask {
+        #[arg(required = true, num_args = 1..)]
+        text: Vec<String>,
+        /// Asking agent's name (default: register this shell as kind "shell")
+        #[arg(long)]
+        from: Option<String>,
+        #[arg(long = "option")]
+        options: Vec<String>,
+        /// Seconds to wait (0 = just create it)
+        #[arg(long, default_value_t = 3600)]
+        wait: u64,
+    },
+    /// Set an agent's status: working | idle | blocked | done
+    Status {
+        name: String,
+        status: String,
+        text: Vec<String>,
+    },
+    /// Claude Code hook entry point (reads the hook JSON on stdin; never fails the hook)
+    Hook {
+        /// Agent kind to register as
+        #[arg(long, default_value = "claude")]
+        kind: String,
+    },
+    /// Telegram: `orch telegram pair` prints a one-time code for the bot
+    Telegram {
+        #[arg(value_parser = ["pair"])]
+        action: String,
+    },
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -112,6 +184,10 @@ async fn run(cli: Cli) -> Result<()> {
     let socket = cli.socket.clone().unwrap_or_else(default_socket_path);
     if let Cmd::Proxy = cli.cmd {
         return proxy(&socket).await;
+    }
+    if let Cmd::Hook { kind } = &cli.cmd {
+        bus::hook(&socket, kind).await;
+        return Ok(());
     }
     let mut conn = connect(&socket, cli.host.as_deref()).await?;
     match cli.cmd {
@@ -246,7 +322,31 @@ async fn run(cli: Cli) -> Result<()> {
         Cmd::StopDaemon => {
             conn.request(&Request::StopDaemon {}).await?;
         }
-        Cmd::Proxy => unreachable!(),
+        Cmd::Proxy | Cmd::Hook { .. } => unreachable!(),
+        Cmd::Agents { json } => bus::agents(&mut conn, json).await?,
+        Cmd::Tail { follow, lines } => bus::tail(conn, follow, lines).await?,
+        Cmd::Msg { to, text, from } => bus::msg(&mut conn, &from, &to, &text.join(" ")).await?,
+        Cmd::Inbox { name, wait, peek } => bus::inbox(&mut conn, &name, wait, peek).await?,
+        Cmd::Questions { all } => bus::questions(&mut conn, all).await?,
+        Cmd::Answer { id, text } => bus::answer(&mut conn, id, &text.join(" ")).await?,
+        Cmd::Ask {
+            text,
+            from,
+            options,
+            wait,
+        } => bus::ask(&mut conn, from, &text.join(" "), options, wait).await?,
+        Cmd::Status { name, status, text } => {
+            let text = (!text.is_empty()).then(|| text.join(" "));
+            conn.request(&Request::SetStatus { name, status, text })
+                .await?;
+        }
+        Cmd::Telegram { .. } => {
+            let v = conn.request(&Request::TelegramPair {}).await?;
+            println!(
+                "Send this to your orchtool bot in Telegram (valid 10 min):\n\n  /pair {}",
+                v["code"].as_str().unwrap_or("?")
+            );
+        }
     }
     Ok(())
 }
@@ -329,59 +429,9 @@ async fn connect(socket: &Path, host: Option<&str>) -> Result<Conn> {
         std::mem::forget(child);
         return Ok(Conn::from_parts(Box::new(stdout), Box::new(stdin)));
     }
-    match Conn::unix(socket).await {
-        Ok(c) => Ok(c),
-        Err(e)
-            if matches!(
-                e.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
-            ) =>
-        {
-            start_daemon(socket)?;
-            for _ in 0..50 {
-                tokio::time::sleep(Duration::from_millis(60)).await;
-                if let Ok(c) = Conn::unix(socket).await {
-                    return Ok(c);
-                }
-            }
-            bail!(
-                "orchd did not start; see {}",
-                state_dir().join("orchd.log").display()
-            )
-        }
-        Err(e) => Err(e).with_context(|| format!("connecting to {}", socket.display())),
-    }
-}
-
-/// Start orchd detached from this terminal (own session), logging to the state dir.
-fn start_daemon(socket: &Path) -> Result<()> {
-    let exe = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.join("orchd")))
-        .filter(|p| p.exists())
-        .unwrap_or_else(|| PathBuf::from("orchd"));
-    let dir = state_dir();
-    std::fs::create_dir_all(&dir)?;
-    let log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(dir.join("orchd.log"))?;
-    let mut cmd = std::process::Command::new(&exe);
-    cmd.arg("--socket")
-        .arg(socket)
-        .stdin(std::process::Stdio::null())
-        .stdout(log.try_clone()?)
-        .stderr(log)
-        .env_remove("ORCH_PANE");
-    unsafe {
-        cmd.pre_exec(|| {
-            libc::setsid();
-            Ok(())
-        });
-    }
-    cmd.spawn()
-        .with_context(|| format!("starting {}", exe.display()))?;
-    Ok(())
+    orch_proto::client::connect_or_start(socket)
+        .await
+        .with_context(|| format!("connecting to orchd at {}", socket.display()))
 }
 
 async fn proxy(socket: &Path) -> Result<()> {

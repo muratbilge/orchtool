@@ -1,8 +1,9 @@
 //! orchd — the orchtool daemon. Usually started by `orch` on first use (or by systemd --user).
 //!
-//! Usage: orchd [--socket PATH] [--scrollback LINES]
+//! Usage: orchd [--socket PATH] [--db PATH] [--scrollback LINES] [--no-telegram]
 
-use orchd::server::{serve, Daemon};
+use orchd::bus::Bus;
+use orchd::server::{serve, start_nudger, Daemon};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -11,7 +12,7 @@ use tokio::signal::unix::{signal, SignalKind};
 const DEFAULT_SCROLLBACK: usize = 3000;
 
 fn usage() -> ! {
-    eprintln!("usage: orchd [--socket PATH] [--scrollback LINES]");
+    eprintln!("usage: orchd [--socket PATH] [--db PATH] [--scrollback LINES] [--no-telegram]");
     std::process::exit(2);
 }
 
@@ -22,6 +23,8 @@ async fn main() -> anyhow::Result<()> {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_SCROLLBACK);
+    let mut db = orch_proto::client::state_dir().join("orchtool.db");
+    let mut telegram = true;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -32,6 +35,8 @@ async fn main() -> anyhow::Result<()> {
                     .and_then(|s| s.parse().ok())
                     .unwrap_or_else(|| usage())
             }
+            "--db" => db = PathBuf::from(args.next().unwrap_or_else(|| usage())),
+            "--no-telegram" => telegram = false,
             "--version" => {
                 println!("orchd {}", env!("CARGO_PKG_VERSION"));
                 return Ok(());
@@ -62,7 +67,16 @@ async fn main() -> anyhow::Result<()> {
         socket.display()
     );
 
-    let daemon = Daemon::new(scrollback);
+    let bus = Arc::new(Bus::open(&db)?);
+    let daemon = Daemon::new(scrollback, Arc::clone(&bus));
+    start_nudger(Arc::clone(&daemon));
+    match (telegram, orchd::telegram::TgConfig::load()) {
+        (true, Some(cfg)) => orchd::telegram::start(Arc::clone(&bus), cfg),
+        (true, None) => {
+            eprintln!("orchd: telegram off (no TG_TOKEN in ~/.config/orchtool/telegram.env)")
+        }
+        (false, _) => {}
+    }
     let server = tokio::spawn(serve(listener, Arc::clone(&daemon)));
     let mut term = signal(SignalKind::terminate())?;
     let mut int = signal(SignalKind::interrupt())?;

@@ -38,6 +38,139 @@ pub enum Request {
     Resnapshot {},
     #[serde(rename = "daemon.stop")]
     StopDaemon {},
+
+    // ---- agent bus (phase 2) ----
+    /// Register (or re-identify) an agent; the server picks/returns its name.
+    #[serde(rename = "agent.register")]
+    RegisterAgent(RegisterAgent),
+    #[serde(rename = "agent.status")]
+    SetStatus {
+        name: String,
+        status: String,
+        #[serde(default)]
+        text: Option<String>,
+    },
+    #[serde(rename = "agent.list")]
+    ListAgents {},
+    #[serde(rename = "msg.send")]
+    SendMessage(SendMessage),
+    /// Unread messages for `name` (marks them read unless `peek`); waits up to `wait_ms`.
+    #[serde(rename = "msg.inbox")]
+    Inbox {
+        name: String,
+        #[serde(default)]
+        wait_ms: Option<u64>,
+        #[serde(default)]
+        peek: bool,
+    },
+    /// Timeline rows after `after`; `follow` turns the connection into a stream.
+    #[serde(rename = "msg.log")]
+    Log {
+        #[serde(default)]
+        after: Option<i64>,
+        #[serde(default)]
+        limit: Option<usize>,
+        #[serde(default)]
+        follow: bool,
+    },
+    #[serde(rename = "ask.create")]
+    Ask {
+        from: String,
+        text: String,
+        #[serde(default)]
+        options: Vec<String>,
+    },
+    /// Wait up to `wait_ms` for question `id` to be answered; returns the question either way.
+    #[serde(rename = "ask.wait")]
+    AskWait {
+        id: i64,
+        #[serde(default)]
+        wait_ms: Option<u64>,
+    },
+    /// First answer wins; later answers get `won: false` and the existing answer.
+    #[serde(rename = "ask.answer")]
+    Answer { id: i64, answer: String, by: String },
+    #[serde(rename = "ask.list")]
+    ListQuestions {
+        #[serde(default)]
+        all: bool,
+    },
+    /// Start Telegram pairing: returns a one-time code to send to the bot as `/pair CODE`.
+    #[serde(rename = "telegram.pair")]
+    TelegramPair {},
+}
+
+/// The human's name on the bus ("me" / "human" are accepted as aliases).
+pub const HUMAN: &str = "murat";
+
+pub fn normalize_name(name: &str) -> String {
+    match name.trim() {
+        "me" | "human" | "user" | "Murat" => HUMAN.to_string(),
+        other => other.to_string(),
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RegisterAgent {
+    /// "claude", "codex", "shell", …
+    pub kind: String,
+    /// "orch:p3" or "herdr:w1C:p1"
+    #[serde(default)]
+    pub pane: Option<String>,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    /// Explicit name ($ORCH_AGENT) — otherwise derived from cwd + kind.
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SendMessage {
+    pub from: String,
+    /// Agent name, "murat", or "all".
+    pub to: String,
+    pub text: String,
+    #[serde(default)]
+    pub thread: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MessageRow {
+    pub id: i64,
+    pub ts_ms: i64,
+    pub from: String,
+    pub to: String,
+    /// "msg", "ask", "answer", "status", "event"
+    pub kind: String,
+    pub text: String,
+    pub thread: Option<String>,
+    pub question: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct QuestionRow {
+    pub id: i64,
+    pub ts_ms: i64,
+    pub from: String,
+    pub text: String,
+    pub options: Vec<String>,
+    /// "open" or "answered"
+    pub state: String,
+    pub answer: Option<String>,
+    pub answered_by: Option<String>,
+    pub answered_ts_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentRow {
+    pub name: String,
+    pub kind: String,
+    pub pane: Option<String>,
+    pub cwd: Option<String>,
+    /// "working", "idle", "blocked", "done", "unknown"
+    pub status: String,
+    pub status_text: Option<String>,
+    pub last_seen_ms: i64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -163,6 +296,8 @@ pub enum Stream {
     Role { role: Role },
     /// The pane's process exited; the stream ends.
     Exit { code: Option<u32> },
+    /// `msg.log` with `follow`: one new timeline row.
+    Timeline { row: MessageRow },
 }
 
 /// The pane's id or its name.

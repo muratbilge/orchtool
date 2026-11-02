@@ -1,5 +1,365 @@
-fn main() {
-    // Stdout is reserved for MCP framing, including during stub operation.
-    eprintln!("orch-mcp: stub; MCP service is planned for phase 2");
-    std::process::exit(2);
+//! orch-mcp — MCP server (stdio) that connects an agent (Claude Code, Codex, …) to the orch bus.
+//!
+//! Tools: send_message, read_inbox, ask_human, wait_for_answer, post_status, list_agents.
+//! A small hand-written JSON-RPC loop (newline-delimited, MCP stdio transport) — no SDK churn.
+//! Every tool call runs as its own task, so a long `ask_human` never blocks other calls, and
+//! `notifications/cancelled` aborts it. The agent's identity is (re-)registered on every call:
+//! cheap, and it survives an orchd restart.
+//!
+//! Stdout carries only MCP frames; diagnostics go to stderr.
+
+use orch_proto::api::{MessageRow, QuestionRow, Request, SendMessage};
+use orch_proto::client::{connect_or_start, default_socket_path, register_request, ClientError};
+use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::sync::mpsc;
+
+const PROTOCOL_VERSION: &str = "2025-06-18";
+
+struct State {
+    /// "claude", "codex", … from the client's `clientInfo.name`.
+    kind: Mutex<String>,
+    inflight: Mutex<HashMap<String, tokio::task::AbortHandle>>,
+}
+
+#[tokio::main(flavor = "current_thread")]
+async fn main() {
+    let state = Arc::new(State {
+        kind: Mutex::new("agent".into()),
+        inflight: Mutex::new(HashMap::new()),
+    });
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Value>();
+    let writer = tokio::spawn(async move {
+        let mut stdout = tokio::io::stdout();
+        while let Some(v) = out_rx.recv().await {
+            let mut line = serde_json::to_vec(&v).unwrap();
+            line.push(b'\n');
+            if stdout.write_all(&line).await.is_err() || stdout.flush().await.is_err() {
+                break;
+            }
+        }
+    });
+    let mut lines = BufReader::new(tokio::io::stdin()).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(msg) = serde_json::from_str::<Value>(&line) else {
+            let _ = out_tx.send(rpc_error(Value::Null, -32700, "parse error"));
+            continue;
+        };
+        handle(&state, &out_tx, msg);
+    }
+    // stdin closed: the client is gone. Abort waits; flush what is queued.
+    for (_, h) in state.inflight.lock().unwrap().drain() {
+        h.abort();
+    }
+    drop(out_tx);
+    let _ = writer.await;
+}
+
+fn rpc_result(id: Value, result: Value) -> Value {
+    json!({ "jsonrpc": "2.0", "id": id, "result": result })
+}
+
+fn rpc_error(id: Value, code: i64, message: &str) -> Value {
+    json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
+}
+
+fn handle(state: &Arc<State>, out: &mpsc::UnboundedSender<Value>, msg: Value) {
+    let method = msg["method"].as_str().unwrap_or("").to_string();
+    let id = msg.get("id").cloned();
+    match (method.as_str(), id) {
+        ("initialize", Some(id)) => {
+            let client = msg["params"]["clientInfo"]["name"]
+                .as_str()
+                .unwrap_or("agent")
+                .to_lowercase();
+            let kind = if client.contains("claude") {
+                "claude"
+            } else if client.contains("codex") {
+                "codex"
+            } else {
+                "agent"
+            };
+            *state.kind.lock().unwrap() = kind.to_string();
+            let version = msg["params"]["protocolVersion"]
+                .as_str()
+                .unwrap_or(PROTOCOL_VERSION)
+                .to_string();
+            let _ = out.send(rpc_result(
+                id,
+                json!({
+                    "protocolVersion": version,
+                    "capabilities": { "tools": {} },
+                    "serverInfo": { "name": "orch", "version": env!("CARGO_PKG_VERSION") },
+                    "instructions": INSTRUCTIONS,
+                }),
+            ));
+        }
+        ("ping", Some(id)) => {
+            let _ = out.send(rpc_result(id, json!({})));
+        }
+        ("tools/list", Some(id)) => {
+            let _ = out.send(rpc_result(id, json!({ "tools": tools() })));
+        }
+        ("tools/call", Some(id)) => {
+            let key = id.to_string();
+            let (state2, out2, key2) = (Arc::clone(state), out.clone(), key.clone());
+            let params = msg["params"].clone();
+            let task = tokio::spawn(async move {
+                let name = params["name"].as_str().unwrap_or("").to_string();
+                let args = params.get("arguments").cloned().unwrap_or(json!({}));
+                let kind = state2.kind.lock().unwrap().clone();
+                let result = match call_tool(&kind, &name, &args).await {
+                    Ok(text) => json!({ "content": [{ "type": "text", "text": text }] }),
+                    Err(e) => {
+                        json!({ "content": [{ "type": "text", "text": e }], "isError": true })
+                    }
+                };
+                let _ = out2.send(rpc_result(id, result));
+                state2.inflight.lock().unwrap().remove(&key2);
+            });
+            state
+                .inflight
+                .lock()
+                .unwrap()
+                .insert(key, task.abort_handle());
+        }
+        ("notifications/cancelled", None) => {
+            let key = msg["params"]["requestId"].to_string();
+            if let Some(h) = state.inflight.lock().unwrap().remove(&key) {
+                h.abort();
+            }
+        }
+        (_, Some(id)) => {
+            let _ = out.send(rpc_error(id, -32601, &format!("unknown method {method}")));
+        }
+        (_, None) => {} // other notifications
+    }
+}
+
+const INSTRUCTIONS: &str = "You are connected to orchtool, Murat's agent bus. Other agents (Claude, Codex, …) \
+and Murat himself are reachable here. Use send_message to talk to another agent or to Murat (to: \"murat\"), \
+read_inbox to get messages sent to you, and ask_human when you need Murat's decision — he can answer from his \
+terminal, phone or Telegram. Keep messages short and concrete. When a tool result says a question is not answered \
+yet, call wait_for_answer with that question_id instead of asking again.";
+
+fn tools() -> Value {
+    json!([
+        {
+            "name": "send_message",
+            "description": "Send a short message to another agent (by name, see list_agents), to Murat (\"murat\"), or to everyone (\"all\"). Returns immediately.",
+            "inputSchema": { "type": "object", "properties": {
+                "to": { "type": "string", "description": "Agent name, \"murat\", or \"all\"" },
+                "text": { "type": "string" },
+                "thread": { "type": "string", "description": "Optional topic to group related messages" }
+            }, "required": ["to", "text"] }
+        },
+        {
+            "name": "read_inbox",
+            "description": "Get unread messages sent to you (also Murat's answers). Marks them read. With wait_seconds > 0 it waits for the first message to arrive.",
+            "inputSchema": { "type": "object", "properties": {
+                "wait_seconds": { "type": "integer", "minimum": 0, "description": "Wait up to this long for a message (default 0 = return now)" }
+            } }
+        },
+        {
+            "name": "ask_human",
+            "description": "Ask Murat a question and wait for his answer (he sees it in his terminal, on his phone and in Telegram). Offer options when there are clear choices. If the answer does not arrive within the wait, you get a question_id: call wait_for_answer with it — do not ask again.",
+            "inputSchema": { "type": "object", "properties": {
+                "question": { "type": "string", "description": "Self-contained question with the context Murat needs" },
+                "options": { "type": "array", "items": { "type": "string" }, "description": "Optional short answer choices (max 8)" },
+                "wait_seconds": { "type": "integer", "minimum": 0 }
+            }, "required": ["question"] }
+        },
+        {
+            "name": "wait_for_answer",
+            "description": "Keep waiting for Murat's answer to a question asked earlier with ask_human.",
+            "inputSchema": { "type": "object", "properties": {
+                "question_id": { "type": "integer" },
+                "wait_seconds": { "type": "integer", "minimum": 0 }
+            }, "required": ["question_id"] }
+        },
+        {
+            "name": "post_status",
+            "description": "Tell Murat and the other agents what you are doing: working, idle (waiting for work), blocked, or done — with a one-line text.",
+            "inputSchema": { "type": "object", "properties": {
+                "status": { "type": "string", "enum": ["working", "idle", "blocked", "done"] },
+                "text": { "type": "string" }
+            }, "required": ["status"] }
+        },
+        {
+            "name": "list_agents",
+            "description": "List the agents on the bus (name, kind, status) and your own name.",
+            "inputSchema": { "type": "object", "properties": {} }
+        }
+    ])
+}
+
+/// Default and max wait per client: Codex's MCP tool timeout defaults to 60 s, Claude Code's
+/// is long. Waits are resumable (wait_for_answer), so a short default never loses anything.
+fn wait_ms(kind: &str, args: &Value, default_secs_claude: u64) -> u64 {
+    let (default, max) = if kind == "claude" {
+        (default_secs_claude, 1800)
+    } else {
+        (50.min(default_secs_claude), 55)
+    };
+    let max = std::env::var("ORCH_MCP_MAX_WAIT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(max);
+    args["wait_seconds"].as_u64().unwrap_or(default).min(max) * 1000
+}
+
+async fn request(req: Request) -> Result<Value, String> {
+    let socket = default_socket_path();
+    let mut conn = connect_or_start(&socket)
+        .await
+        .map_err(|e| format!("orchd is not reachable: {e}"))?;
+    conn.request(&req).await.map_err(|e| match e {
+        ClientError::Remote(e) => e.message,
+        ClientError::Io(e) => format!("orchd: {e}"),
+    })
+}
+
+async fn whoami(kind: &str) -> Result<String, String> {
+    let row = request(Request::RegisterAgent(register_request(kind))).await?;
+    Ok(row["name"].as_str().unwrap_or("agent").to_string())
+}
+
+fn fmt_messages(rows: &[MessageRow]) -> String {
+    if rows.is_empty() {
+        return "No new messages.".into();
+    }
+    let mut out = format!("{} new message(s):", rows.len());
+    for m in rows {
+        let what = match (m.kind.as_str(), m.question) {
+            ("answer", Some(q)) => format!("Murat's answer to question #{q}"),
+            ("ask", Some(q)) => format!("question #{q} from {}", m.from),
+            _ => format!("from {}", m.from),
+        };
+        let thread = m
+            .thread
+            .as_deref()
+            .map(|t| format!(" [{t}]"))
+            .unwrap_or_default();
+        out.push_str(&format!("\n- #{} {what}{thread}: {}", m.id, m.text));
+    }
+    out
+}
+
+fn fmt_question(q: &QuestionRow) -> String {
+    if q.state == "answered" {
+        format!(
+            "Murat answered question #{}: {}",
+            q.id,
+            q.answer.as_deref().unwrap_or("")
+        )
+    } else {
+        format!(
+            "Not answered yet (question #{id}). Murat has been notified. Call wait_for_answer with \
+             question_id {id} to keep waiting (do not ask again), or continue with other work and \
+             check read_inbox later — the answer will arrive there too.",
+            id = q.id
+        )
+    }
+}
+
+async fn call_tool(kind: &str, name: &str, args: &Value) -> Result<String, String> {
+    let me = whoami(kind).await?;
+    let str_arg = |k: &str| args[k].as_str().map(str::to_string);
+    match name {
+        "send_message" => {
+            let to = str_arg("to").ok_or("`to` is required")?;
+            let text = str_arg("text").ok_or("`text` is required")?;
+            let row = request(Request::SendMessage(SendMessage {
+                from: me,
+                to: to.clone(),
+                text,
+                thread: str_arg("thread"),
+            }))
+            .await?;
+            Ok(format!("Sent (#{}) to {to}.", row["id"]))
+        }
+        "read_inbox" => {
+            let wait = wait_ms(kind, args, 0);
+            let v = request(Request::Inbox {
+                name: me,
+                wait_ms: Some(wait),
+                peek: false,
+            })
+            .await?;
+            let rows: Vec<MessageRow> =
+                serde_json::from_value(v["messages"].clone()).map_err(|e| e.to_string())?;
+            Ok(fmt_messages(&rows))
+        }
+        "ask_human" => {
+            let question = str_arg("question").ok_or("`question` is required")?;
+            let options: Vec<String> = args["options"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|o| o.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let q = request(Request::Ask {
+                from: me,
+                text: question,
+                options,
+            })
+            .await?;
+            let id = q["id"].as_i64().ok_or("bad reply")?;
+            let v = request(Request::AskWait {
+                id,
+                wait_ms: Some(wait_ms(kind, args, 600)),
+            })
+            .await?;
+            let q: QuestionRow = serde_json::from_value(v).map_err(|e| e.to_string())?;
+            Ok(fmt_question(&q))
+        }
+        "wait_for_answer" => {
+            let id = args["question_id"]
+                .as_i64()
+                .ok_or("`question_id` is required")?;
+            let v = request(Request::AskWait {
+                id,
+                wait_ms: Some(wait_ms(kind, args, 600)),
+            })
+            .await?;
+            let q: QuestionRow = serde_json::from_value(v).map_err(|e| e.to_string())?;
+            Ok(fmt_question(&q))
+        }
+        "post_status" => {
+            let status = str_arg("status").ok_or("`status` is required")?;
+            request(Request::SetStatus {
+                name: me.clone(),
+                status: status.clone(),
+                text: str_arg("text"),
+            })
+            .await?;
+            Ok(format!("Status of {me}: {status}."))
+        }
+        "list_agents" => {
+            let v = request(Request::ListAgents {}).await?;
+            let mut out = format!("You are {me}. Agents:");
+            for a in v["agents"].as_array().cloned().unwrap_or_default() {
+                out.push_str(&format!(
+                    "\n- {} ({}) {}{}",
+                    a["name"].as_str().unwrap_or("?"),
+                    a["kind"].as_str().unwrap_or("?"),
+                    a["status"].as_str().unwrap_or("?"),
+                    a["status_text"]
+                        .as_str()
+                        .map(|t| format!(" — {t}"))
+                        .unwrap_or_default()
+                ));
+            }
+            out.push_str("\nMurat is \"murat\"; \"all\" reaches every agent.");
+            Ok(out)
+        }
+        other => Err(format!("unknown tool {other}")),
+    }
 }
