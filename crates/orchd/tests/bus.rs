@@ -201,6 +201,28 @@ async fn two_agents_talk_and_one_asks_murat() {
     let mut alice = env.mcp("alice", "claude-code");
     let mut bob = env.mcp("bob", "codex-mcp-client");
 
+    // Both joined the bus at initialize, before any tool call.
+    let mut names = Vec::new();
+    for _ in 0..50 {
+        let v = env
+            .conn()
+            .await
+            .request(&Request::ListAgents {})
+            .await
+            .unwrap();
+        names = v["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["name"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        if names.len() == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(40)).await;
+    }
+    assert_eq!(names, vec!["alice", "bob"]);
+
     let tools = alice.call("tools/list", json!({}));
     let names: Vec<&str> = tools["result"]["tools"]
         .as_array()

@@ -1,5 +1,48 @@
 # Status
 
+## 2026-11-02 — Phase 2 GREEN (agent bus, ask_human, Telegram) — Claude
+
+Built
+- orchd bus (crates/orchd/src/bus.rs): SQLite at ~/.local/state/orchtool/orchtool.db (`--db`), agents /
+  messages / per-agent read marks / questions. Persist first, then notify; first answer wins atomically;
+  waits are resumable (ask.wait, msg.inbox with wait); timeline follow stream catches up on lag.
+- Identity: server-side, keyed by pane (`orch:pN`, `herdr:wX:pY`), name `<project>-<kind>`, numbered on
+  collision, `$ORCH_AGENT` overrides. orch-mcp registers at initialize, and again on every call.
+- orch-mcp (hand-written MCP stdio JSON-RPC, no SDK): send_message, read_inbox, ask_human, wait_for_answer,
+  post_status, list_agents; one task per call, notifications/cancelled aborts. Default waits: Claude 600 s
+  (max 1800), Codex 50 s (max 55, its tool timeout is 60 s) — the answer is never lost, the agent calls
+  wait_for_answer or finds it in read_inbox.
+- Delivery: explicit inbox; Claude Stop hook (`orch hook`) hands unread messages over at turn end
+  ({"decision":"block"}); idle-only nudges typed into the agent's pane (never when status is unknown /
+  working / blocked, so nothing is typed into a permission prompt).
+- Telegram (crates/orchd/src/telegram.rs): own bot, paired chat only (`orch telegram pair` → `/pair CODE`
+  from a private chat, or TG_CHAT), option buttons + reply-to-answer, answered-elsewhere edits the message,
+  agent→murat messages forwarded and replies routed back; token scrubbed from errors; no terminal output.
+- CLI: agents, tail [-f], msg, inbox, questions, answer (number = option), ask, status, hook, telegram pair.
+
+Checks
+- `scripts/check.sh` → exit 0: proto 3, orchd unit 14 (5 bus), panes 10, bus e2e 6, spike 3. bus+panes
+  re-run 3× green.
+- e2e (real orchd + orch-mcp + orch binaries): two agents talk, inbox wait wakes, ask_human answered while
+  blocking, second answer refused, timeline order; question survives orch-mcp death + orchd restart and
+  wait_for_answer resumes, answer in inbox exactly once; MCP cancel + unknown method; Stop hook delivers
+  once, silent without orchd; Telegram via mock Bot API: stranger ignored, button answers, message edited,
+  reply routed to the agent; one-time pairing code.
+- Live demo (test daemon): real Claude (`--mcp-config`) asked real Codex (`-c mcp_servers.orch…`)
+  "17*23" → "391" → ask_human to murat → answered via `orch answer 1 1` → second answer refused → Claude
+  reported "yes". Idle nudge: Codex got "[orch] new message from murat…", read inbox, replied PONG.
+
+Found in the live demo and fixed
+- `send --enter`: Codex's paste detection swallowed a CR 60 ms after the text → 250 ms.
+- Agents were only reachable after their first tool call → orch-mcp registers at initialize.
+- Codex starts MCP servers with a clean env → config must forward the pane:
+  `env_vars = ["ORCH_PANE", "HERDR_PANE_ID"]`.
+
+Not done / for Murat
+- Telegram not tried against the real API: needs the bot token (BotFather → ~/.config/orchtool/telegram.env).
+- Claude/Codex MCP + hook config is not installed globally (needs Murat's OK). Codex asks approval per
+  orch tool call unless "Allow for this session"/"Always allow" is chosen.
+
 ## 2026-11-02 — Phase 1 review fixes (Codex review → CODEX-REVIEW-P1-RESULT.md) — Claude
 
 All 8 findings confirmed and fixed, each with a regression test:

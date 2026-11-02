@@ -4,9 +4,9 @@ set -euo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
 [ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
 export CARGO_BUILD_JOBS=2
-flock /tmp/claude-1000/hardio-heavy.lock cargo build --release -p orchd -p orch
+flock /tmp/claude-1000/hardio-heavy.lock cargo build --release -p orchd -p orch -p orch-mcp
 install -d "$HOME/.local/bin"
-for b in orchd orch; do
+for b in orchd orch orch-mcp; do
   install -m 755 "target/release/$b" "$HOME/.local/bin/$b.new"
   mv -f "$HOME/.local/bin/$b.new" "$HOME/.local/bin/$b"
 done

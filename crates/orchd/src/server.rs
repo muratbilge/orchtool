@@ -17,6 +17,8 @@ use tokio::time::Instant;
 
 /// Minimum time between two frames to one client (~25 fps).
 pub const FRAME_INTERVAL: Duration = Duration::from_millis(40);
+/// Pause between typed text and the Enter key in `pane.send` (and nudges).
+pub const ENTER_DELAY_MS: u64 = 250;
 
 pub struct Daemon {
     pub bus: Arc<Bus>,
@@ -163,8 +165,9 @@ impl Daemon {
                     return Err(full());
                 }
                 if s.enter {
-                    // A separate, slightly later CR is an Enter key press, not part of a paste.
-                    tokio::time::sleep(Duration::from_millis(60)).await;
+                    // A separate, later CR is an Enter key press, not part of a paste. Codex's
+                    // paste-burst detection swallowed a CR sent 60 ms after the text.
+                    tokio::time::sleep(Duration::from_millis(ENTER_DELAY_MS)).await;
                     if !pane.write(b"\r".to_vec()) {
                         return Err(full());
                     }
@@ -432,7 +435,7 @@ async fn nudge(daemon: &Daemon, pane: &str, text: &str) {
     if let Some(id) = pane.strip_prefix("orch:") {
         if let Ok(p) = daemon.find(id) {
             p.write(text.as_bytes().to_vec());
-            tokio::time::sleep(Duration::from_millis(120)).await;
+            tokio::time::sleep(Duration::from_millis(ENTER_DELAY_MS)).await;
             p.write(b"\r".to_vec());
         }
     } else if let Some(id) = pane.strip_prefix("herdr:") {
@@ -441,7 +444,7 @@ async fn nudge(daemon: &Daemon, pane: &str, text: &str) {
             .args(["pane", "send-text", id, text])
             .output()
             .await;
-        tokio::time::sleep(Duration::from_millis(120)).await;
+        tokio::time::sleep(Duration::from_millis(ENTER_DELAY_MS)).await;
         let _ = tokio::process::Command::new(&herdr)
             .args(["pane", "send-keys", id, "Enter"])
             .output()

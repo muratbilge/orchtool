@@ -63,7 +63,7 @@ DevBox: 4 cores, 7.8 GB RAM (often ~1.3 GB free), 89 GB disk. Rust builds: `CARG
 `flock /tmp/claude-1000/hardio-heavy.lock` around cargo builds (shared with the gradle builds). Keep orchd lean
 (target < 50 MB RSS with 10 panes).
 
-## Phases (draft 3, 2026-11-02 — reordered after Codex's review, see CODEX-OPINION.md)
+## Phases (draft 4, 2026-11-02 — TUI before Kabuk; Kabuk gets a native orchtool backend)
 Murat's goal (2026-11-02): manage ALL agents in a Rust tool — like herdr but better and faster — let them talk to
 each other, report to him and ask him, with the best interaction and efficiency.
 Decisions (Murat OK'd Codex defaults 2026-11-02): daemon restart may interrupt running agents at first (orchd
@@ -79,10 +79,9 @@ ends GREEN (tests + short demo note in STATUS.md).
 | 0 | rustup, git, cargo workspace, `scripts/check.sh`; **spikes**: inspect Kabuk's real herdr client (framing, fields, events) → notes/kabuk-contract.md; vt100 check with bash/vim/claude/codex | check.sh green, both notes written |
 | 1 | orchd PTY core (slim): spawn/kill panes, vt100 state, bounded scrollback, attach/detach, snapshot + revisioned diffs with resnapshot, controller/observer, `orch new/ls/attach/send/read/kill/proxy` | bash, vim, claude, codex run in orch panes, survive detach + SSH logout, two clients mirror |
 | 2 | **Agent bus + ask_human**: SQLite timeline, orch-mcp (`send_message`, `read_inbox`, `ask_human` resumable, `post_status`), `orch tail/ask/answer`, minimal own Telegram bot (private chat, inline answers). Works for agents in herdr panes **and** orch panes | two agents talk visibly; one asks Murat, he answers via CLI or Telegram, reconnect loses nothing, answer applied once |
-| 3 | Agent awareness + Kabuk compat: status from hooks + screen fallback, events stream, needs-you inbox, the Kabuk contract from phase 0 | Kabuk agents panel + needs-you work on orchd |
-| 4 | Full TUI + remote: workspaces/tabs/splits, Comms view, `orch attach host` over ssh proxy, measured vs herdr | Murat uses it from the laptop instead of herdr for a day, measurably faster |
+| 3 | **Full TUI + agent status** (replaces herdr on DevBox + laptop): workspaces/tabs/splits, keybindings, status bar, agent list with working/idle/blocked/done (hooks + screen fallback), needs-you inbox, Comms view; `orch attach host` over ssh proxy, measured vs herdr | Murat uses `orch` instead of herdr for a day, measurably faster |
+| 4 | **Kabuk: native orchtool backend** (Murat 2026-11-02: "add orchtool option to Kabuk, we have the code"): backend switch herdr/orchtool, agents/panes via `orch … --json` over SSH, answers questions natively, timeline (Comms) tab; released through Kabuk's own in-app updater. No herdr-compat layer needed | phone shows agents, timeline and questions from orchd |
 | 5 | Orchestration: task queues, role flows (build → review → check), limit-reset continue, worktrees; move paperscanner + Hardio | herdr not needed anymore |
-| 6 | Kabuk: Comms tab + native answers (Kabuk's own release flow) | phone shows timeline |
 
 ## For Murat
 - Create the bot: Telegram → @BotFather → `/newbot` (e.g. "Orchtool"), then put the token into

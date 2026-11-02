@@ -85,6 +85,12 @@ fn handle(state: &Arc<State>, out: &mpsc::UnboundedSender<Value>, msg: Value) {
                 "agent"
             };
             *state.kind.lock().unwrap() = kind.to_string();
+            // Join the bus right away, so other agents can reach this one before it makes
+            // its first tool call (best effort; every call registers again anyway).
+            let kind2 = kind.to_string();
+            tokio::spawn(async move {
+                let _ = whoami(&kind2).await;
+            });
             let version = msg["params"]["protocolVersion"]
                 .as_str()
                 .unwrap_or(PROTOCOL_VERSION)
