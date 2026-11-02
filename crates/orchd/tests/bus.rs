@@ -576,7 +576,7 @@ async fn telegram_buttons_and_replies_answer_questions() {
         .unwrap()
         .updates
         .push(json!({ "update_id": 1, "callback_query": {
-        "id": "x", "data": data, "message": { "chat": { "id": 99 } } } }));
+        "id": "x", "data": data, "from": { "id": 99 }, "message": { "chat": { "id": 99 } } } }));
     tokio::time::sleep(Duration::from_millis(400)).await;
     assert_eq!(open_questions(&env).await.len(), 1);
 
@@ -585,7 +585,7 @@ async fn telegram_buttons_and_replies_answer_questions() {
         .unwrap()
         .updates
         .push(json!({ "update_id": 2, "callback_query": {
-        "id": "y", "data": data, "message": { "chat": { "id": 42 } } } }));
+        "id": "y", "data": data, "from": { "id": 42 }, "message": { "chat": { "id": 42 } } } }));
     let lines = a.lines.clone();
     let got = tokio::task::spawn_blocking(move || mcp_recv(&lines, ask_id))
         .await
@@ -614,7 +614,7 @@ async fn telegram_buttons_and_replies_answer_questions() {
         .unwrap()
         .updates
         .push(json!({ "update_id": 3, "message": {
-        "chat": { "id": 42, "type": "private" }, "text": "thanks, publish them",
+        "chat": { "id": 42, "type": "private" }, "from": { "id": 42 }, "text": "thanks, publish them",
         "reply_to_message": { "message_id": mid } } }));
     let mut inbox = String::new();
     for _ in 0..40 {
@@ -636,6 +636,12 @@ async fn telegram_pairing_with_one_time_code() {
     let mut env = Env::new("pair");
     env.start(&[("TG_TOKEN", "testtoken".into()), ("TG_API", api)], true)
         .await;
+    // A question asked before pairing must still reach Murat once paired.
+    let mut early = env.mcp("early", "codex-mcp-client");
+    early.tool(
+        "ask_human",
+        json!({ "question": "Asked before pairing?", "wait_seconds": 0 }),
+    );
     let code = env
         .conn()
         .await
@@ -650,16 +656,25 @@ async fn telegram_pairing_with_one_time_code() {
         .unwrap()
         .updates
         .push(json!({ "update_id": 1, "message": {
-        "chat": { "id": 7, "type": "private" }, "text": "/pair 000000x" } }));
+        "chat": { "id": 7, "type": "private" }, "from": { "id": 7 }, "text": "/pair 000000x" } }));
     tg.lock()
         .unwrap()
         .updates
         .push(json!({ "update_id": 2, "message": {
-        "chat": { "id": 7, "type": "private" }, "text": format!("/pair {code}") } }));
+        "chat": { "id": 7, "type": "private" }, "from": { "id": 7 }, "text": format!("/pair {code}") } }));
     wait_call(&tg, |m, b| {
         m == "sendMessage"
             && b["chat_id"] == 7
             && b["text"].as_str().unwrap_or("").contains("Paired")
+    })
+    .await;
+    wait_call(&tg, |m, b| {
+        m == "sendMessage"
+            && b["chat_id"] == 7
+            && b["text"]
+                .as_str()
+                .unwrap_or("")
+                .contains("Asked before pairing?")
     })
     .await;
     // Now questions go to chat 7.
@@ -674,4 +689,197 @@ async fn telegram_pairing_with_one_time_code() {
             && b["text"].as_str().unwrap_or("").contains("Paired test?")
     })
     .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_reads_and_retried_asks_lose_and_duplicate_nothing() {
+    let mut env = Env::new("cancel2");
+    env.start(&[], false).await;
+    let mut a = env.mcp("reader", "claude-code");
+    let mut b = env.mcp("writer", "claude-code");
+    b.tool("list_agents", json!({}));
+    // A read_inbox wait is cancelled; a message arriving afterwards is not consumed by it.
+    let id = a.send(
+        "tools/call",
+        json!({ "name": "read_inbox", "arguments": { "wait_seconds": 30 } }),
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    a.notify("notifications/cancelled", json!({ "requestId": id }));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    b.tool(
+        "send_message",
+        json!({ "to": "reader", "text": "arrived after cancel" }),
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let inbox = a.tool("read_inbox", json!({}));
+    assert!(inbox.contains("arrived after cancel"), "{inbox}");
+
+    // ask_human cancelled before it returned; asking again does not duplicate the question.
+    let id = a.send("tools/call", json!({ "name": "ask_human", "arguments": { "question": "Retry me?", "wait_seconds": 30 } }));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    a.notify("notifications/cancelled", json!({ "requestId": id }));
+    let r = a.tool(
+        "ask_human",
+        json!({ "question": "Retry me?", "wait_seconds": 0 }),
+    );
+    assert!(r.contains("Not answered yet"), "{r}");
+    assert_eq!(open_questions(&env).await.len(), 1, "no duplicate question");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn telegram_group_or_other_users_cannot_answer() {
+    let (api, tg) = mock_telegram().await;
+    let mut env = Env::new("tgauth");
+    env.start(
+        &[
+            ("TG_TOKEN", "testtoken".into()),
+            ("TG_API", api),
+            ("TG_CHAT", "42".into()),
+        ],
+        true,
+    )
+    .await;
+    let mut a = env.mcp("asker", "codex-mcp-client");
+    a.tool(
+        "ask_human",
+        json!({ "question": "Who may answer?", "options": ["me"], "wait_seconds": 0 }),
+    );
+    let (mid, body) = wait_call(&tg, |m, b| {
+        m == "sendMessage" && b["text"].as_str().unwrap_or("").contains("Who may answer?")
+    })
+    .await;
+    let data = body["reply_markup"]["inline_keyboard"][0][0]["callback_data"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    {
+        let mut s = tg.lock().unwrap();
+        // Right chat id, wrong sender (a group member).
+        s.updates.push(
+            json!({ "update_id": 1, "callback_query": { "id": "a", "data": data,
+            "from": { "id": 77 }, "message": { "chat": { "id": 42, "type": "group" } } } }),
+        );
+        // Reply from a group chat that happens to use the paired id.
+        s.updates.push(json!({ "update_id": 2, "message": { "chat": { "id": 42, "type": "group" },
+            "from": { "id": 77 }, "text": "group says yes", "reply_to_message": { "message_id": mid } } }));
+    }
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(
+        open_questions(&env).await.len(),
+        1,
+        "nobody but Murat can answer"
+    );
+}
+
+async fn register_in_pane(env: &Env, name: &str, kind: &str, pane: &str) {
+    env.conn()
+        .await
+        .request(&Request::RegisterAgent(orch_proto::api::RegisterAgent {
+            kind: kind.into(),
+            pane: Some(format!("orch:{pane}")),
+            cwd: Some("/tmp".into()),
+            name: Some(name.into()),
+            instance: None,
+        }))
+        .await
+        .unwrap();
+}
+
+async fn new_pane(env: &Env, argv: &[&str]) -> String {
+    let v = env
+        .conn()
+        .await
+        .request(&Request::NewPane(orch_proto::api::NewPane {
+            argv: argv.iter().map(|s| s.to_string()).collect(),
+            cwd: Some("/tmp".into()),
+            rows: Some(20),
+            cols: Some(100),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    v["id"].as_str().unwrap().to_string()
+}
+
+async fn pane_text(env: &Env, pane: &str) -> String {
+    let v = env
+        .conn()
+        .await
+        .request(&Request::Read(orch_proto::api::ReadPane {
+            pane: pane.into(),
+            lines: Some(100),
+            source: orch_proto::api::ReadSource::Recent,
+        }))
+        .await
+        .unwrap();
+    v["text"].as_str().unwrap().to_string()
+}
+
+async fn msg(env: &Env, to: &str, text: &str) {
+    env.conn()
+        .await
+        .request(&Request::SendMessage(orch_proto::api::SendMessage {
+            from: "murat".into(),
+            to: to.into(),
+            text: text.into(),
+            thread: None,
+        }))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nudges_only_reach_idle_panes() {
+    let mut env = Env::new("nudge");
+    env.start(&[], false).await;
+    // An "agent" pane that just echoes what is typed (cat), seen as idle on screen.
+    let idle = new_pane(&env, &["cat"]).await;
+    register_in_pane(&env, "idler", "codex", &idle).await;
+    msg(&env, "idler", "wake up").await;
+    let mut ok = false;
+    for _ in 0..40 {
+        if pane_text(&env, &idle)
+            .await
+            .contains("[orch] new message from murat")
+        {
+            ok = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(ok, "idle agent got the notice");
+
+    // A pane showing an approval dialog is never typed into.
+    let blocked = new_pane(
+        &env,
+        &["sh", "-c", "printf 'Allow the orch MCP server to run tool?\\n  enter to submit | esc to cancel\\n'; exec cat"],
+    )
+    .await;
+    register_in_pane(&env, "asker", "codex", &blocked).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    msg(&env, "asker", "do not type into my dialog").await;
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert!(
+        !pane_text(&env, &blocked).await.contains("[orch]"),
+        "nothing typed into a dialog"
+    );
+
+    // An agent whose bus status says working is not nudged either.
+    let busy = new_pane(&env, &["cat"]).await;
+    register_in_pane(&env, "busy", "codex", &busy).await;
+    env.conn()
+        .await
+        .request(&Request::SetStatus {
+            name: "busy".into(),
+            status: "working".into(),
+            text: None,
+        })
+        .await
+        .unwrap();
+    msg(&env, "busy", "later").await;
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert!(
+        !pane_text(&env, &busy).await.contains("[orch]"),
+        "working status respected"
+    );
 }

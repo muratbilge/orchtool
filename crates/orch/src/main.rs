@@ -2,6 +2,7 @@
 
 mod attach;
 mod bus;
+mod tui;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -21,12 +22,15 @@ struct Cli {
     /// Talk to orchd on another machine through `ssh HOST orch proxy` (or $ORCH_HOST)
     #[arg(long, global = true, env = "ORCH_HOST")]
     host: Option<String>,
+    /// Without a command: open the workspace TUI.
     #[command(subcommand)]
-    cmd: Cmd,
+    cmd: Option<Cmd>,
 }
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Open the workspace TUI (same as plain `orch`)
+    Ui,
     /// Start a program in a new pane (default: your login shell)
     New {
         #[arg(long)]
@@ -83,7 +87,11 @@ enum Cmd {
     /// Kill a pane's program (or remove an exited pane)
     Kill { pane: String },
     /// stdio ⇄ orchd bridge, used by `orch --host H …` via ssh
-    Proxy,
+    Proxy {
+        /// Multiplex many orch connections over this one stream (the TUI uses this)
+        #[arg(long)]
+        mux: bool,
+    },
     /// Round-trip time to orchd
     Ping {
         #[arg(long, default_value_t = 1)]
@@ -182,14 +190,20 @@ async fn main() {
 
 async fn run(cli: Cli) -> Result<()> {
     let socket = cli.socket.clone().unwrap_or_else(default_socket_path);
-    if let Cmd::Proxy = cli.cmd {
-        return proxy(&socket).await;
+    let connector = Connector::new(socket.clone(), cli.host.clone());
+    let cmd = match cli.cmd {
+        None | Some(Cmd::Ui) => return tui::run(connector).await,
+        Some(cmd) => cmd,
+    };
+    let cli = CliRest { cmd };
+    if let Cmd::Proxy { mux } = cli.cmd {
+        return proxy(&socket, mux).await;
     }
     if let Cmd::Hook { kind } = &cli.cmd {
         bus::hook(&socket, kind).await;
         return Ok(());
     }
-    let mut conn = connect(&socket, cli.host.as_deref()).await?;
+    let mut conn = connector.connect().await?;
     match cli.cmd {
         Cmd::New {
             name,
@@ -322,7 +336,7 @@ async fn run(cli: Cli) -> Result<()> {
         Cmd::StopDaemon => {
             conn.request(&Request::StopDaemon {}).await?;
         }
-        Cmd::Proxy | Cmd::Hook { .. } => unreachable!(),
+        Cmd::Proxy { .. } | Cmd::Hook { .. } | Cmd::Ui => unreachable!(),
         Cmd::Agents { json } => bus::agents(&mut conn, json).await?,
         Cmd::Tail { follow, lines } => bus::tail(conn, follow, lines).await?,
         Cmd::Msg { to, text, from } => bus::msg(&mut conn, &from, &to, &text.join(" ")).await?,
@@ -370,7 +384,7 @@ const SESSION_VARS: &[&str] = &[
 ];
 
 /// This shell's environment minus variables that belong to the calling session.
-fn client_env(extra: &[String]) -> Result<Vec<(String, String)>> {
+pub(crate) fn client_env(extra: &[String]) -> Result<Vec<(String, String)>> {
     let mut env: Vec<(String, String)> = std::env::vars()
         .filter(|(k, _)| {
             !(k.starts_with("HERDR_")
@@ -409,6 +423,69 @@ fn key_bytes(name: &str) -> Option<&'static str> {
     })
 }
 
+struct CliRest {
+    cmd: Cmd,
+}
+
+/// Opens connections to orchd: the local socket (starting orchd if needed) or `ssh host orch
+/// proxy`. The TUI opens several (events, one per visible pane, requests).
+/// Remote: ONE `ssh host orch proxy --mux`, shared by all connections of this process.
+#[derive(Clone)]
+pub(crate) struct Connector {
+    socket: PathBuf,
+    host: Option<String>,
+    mux: std::sync::Arc<tokio::sync::OnceCell<orch_proto::mux::MuxClient>>,
+}
+
+impl Connector {
+    fn new(socket: PathBuf, host: Option<String>) -> Self {
+        Self {
+            socket,
+            host,
+            mux: Default::default(),
+        }
+    }
+
+    pub(crate) async fn connect(&self) -> Result<Conn> {
+        let Some(host) = self.host.as_deref() else {
+            return connect(&self.socket, None).await;
+        };
+        let mux = self
+            .mux
+            .get_or_try_init(|| async {
+                let (r, w) = ssh_stdio(host, &["proxy", "--mux"])?;
+                Ok::<_, anyhow::Error>(orch_proto::mux::MuxClient::new(r, w))
+            })
+            .await?;
+        Ok(mux.open()?)
+    }
+}
+
+/// `$ORCH_SSH host $ORCH_REMOTE_BIN <args>` with piped stdio.
+fn ssh_stdio(
+    host: &str,
+    args: &[&str],
+) -> Result<(tokio::process::ChildStdout, tokio::process::ChildStdin)> {
+    let remote_bin = std::env::var("ORCH_REMOTE_BIN").unwrap_or_else(|_| "orch".into());
+    // $ORCH_SSH = ssh command with options, e.g. "ssh -p 2222" (default "ssh").
+    let ssh = std::env::var("ORCH_SSH").unwrap_or_else(|_| "ssh".into());
+    let mut ssh = ssh.split_whitespace();
+    let mut child = tokio::process::Command::new(ssh.next().unwrap_or("ssh"))
+        .args(ssh)
+        .args(["-T", "-o", "BatchMode=yes", host, &remote_bin])
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .context("starting ssh")?;
+    let stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    // The child is reaped when this process exits.
+    std::mem::forget(child);
+    Ok((stdout, stdin))
+}
+
 async fn connect(socket: &Path, host: Option<&str>) -> Result<Conn> {
     if let Some(host) = host {
         let remote_bin = std::env::var("ORCH_REMOTE_BIN").unwrap_or_else(|_| "orch".into());
@@ -434,9 +511,18 @@ async fn connect(socket: &Path, host: Option<&str>) -> Result<Conn> {
         .with_context(|| format!("connecting to orchd at {}", socket.display()))
 }
 
-async fn proxy(socket: &Path) -> Result<()> {
+async fn proxy(socket: &Path, mux: bool) -> Result<()> {
     let conn = connect(socket, None).await;
     drop(conn); // make sure orchd runs; then use a raw byte pipe
+    if mux {
+        let socket = socket.to_path_buf();
+        orch_proto::mux::serve(tokio::io::stdin(), tokio::io::stdout(), move || {
+            let s = socket.clone();
+            async move { tokio::net::UnixStream::connect(s).await }
+        })
+        .await?;
+        return Ok(());
+    }
     let stream = tokio::net::UnixStream::connect(socket).await?;
     let (mut sr, mut sw) = stream.into_split();
     let mut stdin = tokio::io::stdin();

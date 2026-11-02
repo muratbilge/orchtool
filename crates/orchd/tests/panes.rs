@@ -194,7 +194,7 @@ impl Viewer {
             }
             Stream::Role { role } => self.role = role,
             Stream::Exit { code } => self.exited = Some(code),
-            Stream::Timeline { .. } => {}
+            Stream::Timeline { .. } | Stream::Snapshot { .. } | Stream::Event { .. } => {}
         }
     }
 

@@ -106,7 +106,7 @@ pub async fn run(conn: Conn, pane: &str, mode: AttachMode) -> Result<()> {
                     }
                     Stream::Role { role: r } => role = r,
                     Stream::Exit { code } => break Outcome::Exited(code),
-                    Stream::Timeline { .. } => {}
+                    Stream::Timeline { .. } | Stream::Snapshot { .. } | Stream::Event { .. } => {}
                 }
             }
             keys = key_rx.recv() => {

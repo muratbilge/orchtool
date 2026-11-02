@@ -4,6 +4,7 @@
 //! through one queue so keystrokes and replies never interleave mid-sequence) and a waiter
 //! (exit status). The terminal lock is only held while parsing a chunk or rendering a frame.
 
+use crate::detect::{self, Detected};
 use crate::term::Term;
 use anyhow::{Context, Result};
 use orch_proto::api::{NewPane, PaneInfo, PaneState, Role};
@@ -43,6 +44,8 @@ pub struct Pane {
     controller: watch::Sender<Option<u64>>,
     clients: Mutex<BTreeSet<u64>>,
     next_client: AtomicU64,
+    /// Agent kind: from argv, or learned when an agent registers from inside this pane.
+    kind: Mutex<Option<String>>,
 }
 
 impl Pane {
@@ -115,7 +118,9 @@ impl Pane {
             controller: watch::Sender::new(None),
             clients: Mutex::new(BTreeSet::new()),
             next_client: AtomicU64::new(1),
+            kind: Mutex::new(None),
         });
+        *pane.kind.lock().unwrap() = detect::agent_kind(&pane.argv).map(str::to_string);
 
         std::thread::Builder::new()
             .name(format!("{}-in", pane.id))
@@ -305,6 +310,24 @@ impl Pane {
         });
     }
 
+    pub fn set_kind(&self, kind: &str) {
+        *self.kind.lock().unwrap() = Some(kind.to_string());
+    }
+
+    pub fn kind(&self) -> Option<String> {
+        self.kind.lock().unwrap().clone()
+    }
+
+    /// Agent status from the screen right now.
+    pub fn detect(&self) -> Detected {
+        if self.exit_code().is_some() {
+            return Detected::Done;
+        }
+        let kind = self.kind();
+        let text = self.term.lock().unwrap().visible_text();
+        detect::detect(&text, kind.as_deref())
+    }
+
     pub fn info(&self) -> PaneInfo {
         let (rows, cols, title) = {
             let t = self.term.lock().unwrap();
@@ -329,6 +352,17 @@ impl Pane {
             clients: self.clients.lock().unwrap().len(),
             title,
             created_unix: self.created_unix,
+            agent: self.kind(),
+            agent_status: match self.detect() {
+                Detected::None => None,
+                d => Some(
+                    serde_json::to_value(d)
+                        .unwrap()
+                        .as_str()
+                        .unwrap_or("")
+                        .to_string(),
+                ),
+            },
         }
     }
 }

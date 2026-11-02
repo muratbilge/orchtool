@@ -3,6 +3,8 @@
 
 pub mod api;
 pub mod client;
+pub mod layout;
+pub mod mux;
 
 use serde::{Deserialize, Serialize};
 use std::io;

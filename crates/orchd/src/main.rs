@@ -70,6 +70,7 @@ async fn main() -> anyhow::Result<()> {
     let bus = Arc::new(Bus::open(&db)?);
     let daemon = Daemon::new(scrollback, Arc::clone(&bus));
     start_nudger(Arc::clone(&daemon));
+    orchd::ui::start_detector(Arc::clone(&daemon));
     match (telegram, orchd::telegram::TgConfig::load()) {
         (true, Some(cfg)) => orchd::telegram::start(Arc::clone(&bus), cfg),
         (true, None) => {

@@ -244,5 +244,14 @@ pub fn register_request(kind: &str) -> crate::api::RegisterAgent {
             .ok()
             .map(|p| p.to_string_lossy().into_owned()),
         name: std::env::var("ORCH_AGENT").ok().filter(|n| !n.is_empty()),
+        instance: None,
     }
+}
+
+/// A random hex id (for agent instance ids).
+pub fn random_id() -> String {
+    use std::io::Read as _;
+    let mut b = [0u8; 8];
+    let _ = std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut b));
+    b.iter().map(|x| format!("{x:02x}")).collect()
 }

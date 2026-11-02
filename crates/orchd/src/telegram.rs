@@ -9,7 +9,7 @@
 //! Config: ~/.config/orchtool/telegram.env with TG_TOKEN=… and optionally TG_CHAT=…;
 //! the environment overrides it; TG_API overrides the API base (tests).
 
-use crate::bus::{now_ms, Bus, BusEvent};
+use crate::bus::{now_ms, Bus};
 use anyhow::{anyhow, Result};
 use orch_proto::api::{QuestionRow, HUMAN};
 use serde_json::{json, Value};
@@ -148,7 +148,8 @@ fn question_keyboard(q: &QuestionRow) -> Value {
     json!({ "inline_keyboard": rows })
 }
 
-/// Start the bridge: one task forwards bus events, one blocking thread long-polls updates.
+/// Start the bridge: a sync loop (store → Telegram, retried until it succeeds) and a
+/// long-poll thread (Telegram → store).
 pub fn start(bus: Arc<Bus>, cfg: TgConfig) {
     let api = Arc::new(Api::new(cfg.clone()));
     eprintln!(
@@ -159,8 +160,15 @@ pub fn start(bus: Arc<Bus>, cfg: TgConfig) {
             "not paired yet: run `orch telegram pair`"
         }
     );
+    // Messages to Murat from before the bridge's first start are history, not news.
+    if bus.kv_get("tg_msg_cursor").ok().flatten().is_none() {
+        let max = bus.max_message_id().unwrap_or(0);
+        let _ = bus.kv_set("tg_msg_cursor", &max.to_string());
+    }
 
-    // Outgoing: bus → Telegram.
+    // Outgoing: driven by the store, not by transient events. Every bus event (or a 10 s
+    // tick) triggers one sync pass that sends whatever is still unsent; failures are retried
+    // on the next pass, so outages, restarts and late pairing lose nothing.
     {
         let bus = Arc::clone(&bus);
         let api = Arc::clone(&api);
@@ -168,23 +176,22 @@ pub fn start(bus: Arc<Bus>, cfg: TgConfig) {
         let mut rx = bus.subscribe();
         tokio::spawn(async move {
             loop {
-                let ev = match rx.recv().await {
-                    Ok(ev) => ev,
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(_) => return,
-                };
-                let (bus, api, cfg) = (Arc::clone(&bus), Arc::clone(&api), cfg.clone());
+                let (bus2, api2, cfg2) = (Arc::clone(&bus), Arc::clone(&api), cfg.clone());
                 let _ = tokio::task::spawn_blocking(move || {
-                    if let Err(e) = forward(&bus, &api, &cfg, ev) {
-                        eprintln!("orchd: telegram send: {e}");
+                    if let Err(e) = sync(&bus2, &api2, &cfg2) {
+                        eprintln!("orchd: telegram sync: {e}");
                     }
                 })
                 .await;
+                // Wait for the next hint; drain bursts so one pass covers them.
+                let _ = tokio::time::timeout(Duration::from_secs(10), rx.recv()).await;
+                while rx.try_recv().is_ok() {}
             }
         });
     }
 
-    // Incoming: long-poll getUpdates.
+    // Incoming: long-poll getUpdates. The offset is saved only after an update was applied;
+    // a crash in between re-delivers it, and the per-update dedup key makes that harmless.
     std::thread::Builder::new()
         .name("telegram-poll".into())
         .spawn(move || {
@@ -201,11 +208,20 @@ pub fn start(bus: Arc<Bus>, cfg: TgConfig) {
                 ) {
                     Ok(updates) => {
                         for u in updates.as_array().cloned().unwrap_or_default() {
-                            offset = offset.max(u["update_id"].as_i64().unwrap_or(0) + 1);
-                            let _ = bus.kv_set("tg_offset", &offset.to_string());
-                            if let Err(e) = handle_update(&bus, &api, &cfg, &u) {
-                                eprintln!("orchd: telegram update: {e}");
+                            let uid = u["update_id"].as_i64().unwrap_or(0);
+                            // Retry a failing update a few times; a permanently broken one
+                            // must not block every later update forever.
+                            for attempt in 1..=3 {
+                                match handle_update(&bus, &api, &cfg, &u) {
+                                    Ok(()) => break,
+                                    Err(e) => {
+                                        eprintln!("orchd: telegram update {uid} (try {attempt}): {e}");
+                                        std::thread::sleep(Duration::from_secs(2));
+                                    }
+                                }
                             }
+                            offset = offset.max(uid + 1);
+                            let _ = bus.kv_set("tg_offset", &offset.to_string());
                         }
                     }
                     Err(e) => {
@@ -218,12 +234,14 @@ pub fn start(bus: Arc<Bus>, cfg: TgConfig) {
         .expect("telegram thread");
 }
 
-fn forward(bus: &Bus, api: &Api, cfg: &TgConfig, ev: BusEvent) -> Result<()> {
+/// One pass: open questions not yet shown, answered questions not yet marked, and new
+/// messages to Murat. Stops at the first failure (retried next pass).
+fn sync(bus: &Bus, api: &Api, cfg: &TgConfig) -> Result<()> {
     let Some(chat) = chat_id(bus, cfg) else {
         return Ok(());
     };
-    match ev {
-        BusEvent::Question(q) if q.state == "open" => {
+    for q in bus.questions(false)? {
+        if bus.tg_msgs_for_question(q.id)?.is_empty() {
             let sent = api.call(
                 "sendMessage",
                 json!({ "chat_id": chat, "text": question_text(&q),
@@ -233,27 +251,45 @@ fn forward(bus: &Bus, api: &Api, cfg: &TgConfig, ev: BusEvent) -> Result<()> {
                 bus.tg_map_set(mid, Some(q.id), Some(&q.from))?;
             }
         }
-        BusEvent::Question(q) => {
-            // Answered (from anywhere): update every Telegram copy of the question.
-            for mid in bus.tg_msgs_for_question(q.id)? {
-                let _ = api.call(
+    }
+    for q in bus.questions(true)? {
+        if q.state == "open" {
+            continue;
+        }
+        for (mid, edited) in bus.tg_msgs_for_question(q.id)? {
+            if !edited {
+                api.call(
                     "editMessageText",
                     json!({ "chat_id": chat, "message_id": mid, "text": question_text(&q),
                             "reply_markup": question_keyboard(&q) }),
+                )?;
+                bus.tg_mark_edited(mid)?;
+            }
+        }
+    }
+    let mut cursor: i64 = bus
+        .kv_get("tg_msg_cursor")?
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    loop {
+        let rows = bus.log(Some(cursor), 100)?;
+        if rows.is_empty() {
+            break;
+        }
+        for m in rows {
+            if m.to == HUMAN && m.kind == "msg" {
+                let text = format!(
+                    "💬 {}:\n{}\n\n↩️ Reply to answer {}.",
+                    m.from, m.text, m.from
                 );
+                let sent = api.call("sendMessage", json!({ "chat_id": chat, "text": text }))?;
+                if let Some(mid) = sent["message_id"].as_i64() {
+                    bus.tg_map_set(mid, None, Some(&m.from))?;
+                }
             }
+            cursor = m.id;
+            bus.kv_set("tg_msg_cursor", &cursor.to_string())?;
         }
-        BusEvent::Message(m) if m.to == HUMAN && m.kind == "msg" => {
-            let text = format!(
-                "💬 {}:\n{}\n\n↩️ Reply to answer {}.",
-                m.from, m.text, m.from
-            );
-            let sent = api.call("sendMessage", json!({ "chat_id": chat, "text": text }))?;
-            if let Some(mid) = sent["message_id"].as_i64() {
-                bus.tg_map_set(mid, None, Some(&m.from))?;
-            }
-        }
-        _ => {}
     }
     Ok(())
 }
@@ -262,17 +298,28 @@ fn reply(api: &Api, chat: i64, text: &str) {
     let _ = api.call("sendMessage", json!({ "chat_id": chat, "text": text }));
 }
 
+/// Only Murat may answer: a private chat whose id is the paired one, and the sender is that
+/// same user (in a private chat the chat id equals the user id). Groups never qualify, even
+/// when TG_CHAT is configured.
+fn authorized(paired: Option<i64>, chat: &Value, from: &Value) -> bool {
+    let Some(paired) = paired else { return false };
+    chat["id"].as_i64() == Some(paired)
+        && from["id"].as_i64() == Some(paired)
+        && chat["type"].as_str().is_none_or(|t| t == "private")
+}
+
 fn handle_update(bus: &Bus, api: &Api, cfg: &TgConfig, u: &Value) -> Result<()> {
     let paired = chat_id(bus, cfg);
+    let uid = u["update_id"].as_i64().unwrap_or(0);
     if let Some(cb) = u.get("callback_query") {
-        let chat = cb["message"]["chat"]["id"].as_i64();
         let _ = api.call(
             "answerCallbackQuery",
             json!({ "callback_query_id": cb["id"] }),
         );
-        if chat.is_none() || chat != paired {
+        if !authorized(paired, &cb["message"]["chat"], &cb["from"]) {
             return Ok(());
         }
+        let chat = paired.unwrap();
         let data = cb["data"].as_str().unwrap_or("");
         let mut parts = data.split(':');
         if let (Some("a"), Some(q), Some(i)) = (parts.next(), parts.next(), parts.next()) {
@@ -283,11 +330,12 @@ fn handle_update(bus: &Bus, api: &Api, cfg: &TgConfig, u: &Value) -> Result<()> 
                 .get(i)
                 .cloned()
                 .ok_or_else(|| anyhow!("no option {i}"))?;
+            // Idempotent: a re-delivered update finds the question answered already.
             let (won, q) = bus.answer(q, &answer, "telegram")?;
-            if !won {
+            if !won && q.answer.as_deref() != Some(answer.as_str()) {
                 reply(
                     api,
-                    chat.unwrap(),
+                    chat,
                     &format!(
                         "#{} was already answered: {}",
                         q.id,
@@ -301,7 +349,8 @@ fn handle_update(bus: &Bus, api: &Api, cfg: &TgConfig, u: &Value) -> Result<()> 
     let Some(msg) = u.get("message") else {
         return Ok(());
     };
-    let chat = msg["chat"]["id"].as_i64().unwrap_or(0);
+    let chat_v = &msg["chat"];
+    let chat = chat_v["id"].as_i64().unwrap_or(0);
     let text = msg["text"].as_str().unwrap_or("").trim().to_string();
     if let Some(code) = text.strip_prefix("/pair") {
         let ok = bus.kv_get("tg_pair_code")?.as_deref() == Some(code.trim())
@@ -309,15 +358,17 @@ fn handle_update(bus: &Bus, api: &Api, cfg: &TgConfig, u: &Value) -> Result<()> 
                 .kv_get("tg_pair_expires")?
                 .and_then(|v| v.parse::<i64>().ok())
                 .is_some_and(|exp| now_ms() < exp)
-            && msg["chat"]["type"].as_str() == Some("private");
+            && chat_v["type"].as_str() == Some("private")
+            && msg["from"]["id"].as_i64() == Some(chat);
         if ok {
             bus.kv_set("tg_chat", &chat.to_string())?;
             bus.kv_del("tg_pair_code")?;
             reply(api, chat, "✅ Paired. Agents' questions will arrive here.");
+            bus.poke(); // send what was waiting for pairing right away
         }
         return Ok(());
     }
-    if Some(chat) != paired {
+    if !authorized(paired, chat_v, &msg["from"]) {
         return Ok(()); // strangers get no answer at all
     }
     if text == "/open" || text == "/start" {
@@ -340,7 +391,7 @@ fn handle_update(bus: &Bus, api: &Api, cfg: &TgConfig, u: &Value) -> Result<()> 
     match replied.map(|id| bus.tg_map_get(id)).transpose()?.flatten() {
         Some((Some(q), _)) => {
             let (won, q) = bus.answer(q, &text, "telegram")?;
-            if !won {
+            if !won && q.answer.as_deref() != Some(text.as_str()) {
                 reply(
                     api,
                     chat,
@@ -353,8 +404,14 @@ fn handle_update(bus: &Bus, api: &Api, cfg: &TgConfig, u: &Value) -> Result<()> 
             }
         }
         Some((None, Some(agent))) => {
-            bus.send(HUMAN, &agent, "msg", &text, None, None)?;
-            reply(api, chat, &format!("→ sent to {agent}"));
+            // At most once per Telegram update, atomically with the message itself.
+            let key = format!("tg:{uid}");
+            if bus
+                .send_dedup(Some(&key), HUMAN, &agent, "msg", &text, None, None)?
+                .is_some()
+            {
+                reply(api, chat, &format!("→ sent to {agent}"));
+            }
         }
         _ => reply(
             api,

@@ -22,6 +22,8 @@ pub const ENTER_DELAY_MS: u64 = 250;
 
 pub struct Daemon {
     pub bus: Arc<Bus>,
+    pub(crate) session: Mutex<orch_proto::layout::Session>,
+    pub(crate) ui_events: tokio::sync::broadcast::Sender<crate::ui::UiEvent>,
     panes: Mutex<BTreeMap<u64, Arc<Pane>>>,
     next_pane: AtomicU64,
     pub scrollback: usize,
@@ -29,16 +31,16 @@ pub struct Daemon {
 }
 
 #[derive(Debug)]
-struct ApiError {
-    code: &'static str,
-    message: String,
+pub struct ApiError {
+    pub code: &'static str,
+    pub message: String,
 }
 
 fn bus_err(e: anyhow::Error) -> ApiError {
     err("bus", format!("{e:#}"))
 }
 
-fn err(code: &'static str, message: impl Into<String>) -> ApiError {
+pub(crate) fn err(code: &'static str, message: impl Into<String>) -> ApiError {
     ApiError {
         code,
         message: message.into(),
@@ -49,6 +51,8 @@ impl Daemon {
     pub fn new(scrollback: usize, bus: Arc<Bus>) -> Arc<Self> {
         Arc::new(Self {
             bus,
+            session: Mutex::new(orch_proto::layout::Session::default()),
+            ui_events: tokio::sync::broadcast::channel(256).0,
             panes: Mutex::new(BTreeMap::new()),
             next_pane: AtomicU64::new(1),
             scrollback,
@@ -56,7 +60,11 @@ impl Daemon {
         })
     }
 
-    fn find(&self, key: &str) -> Result<Arc<Pane>, ApiError> {
+    pub(crate) fn all_panes(&self) -> Vec<Arc<Pane>> {
+        self.panes.lock().unwrap().values().cloned().collect()
+    }
+
+    pub(crate) fn find(&self, key: &str) -> Result<Arc<Pane>, ApiError> {
         let panes = self.panes.lock().unwrap();
         panes
             .values()
@@ -66,7 +74,7 @@ impl Daemon {
             .ok_or_else(|| err("no_pane", format!("no pane {key:?}")))
     }
 
-    fn new_pane(&self, req: NewPane) -> Result<Arc<Pane>, ApiError> {
+    pub(crate) fn new_pane(&self, req: NewPane) -> Result<Arc<Pane>, ApiError> {
         if let Some(name) = &req.name {
             if name.is_empty() || name.starts_with('p') && name[1..].parse::<u64>().is_ok() {
                 return Err(err(
@@ -87,7 +95,12 @@ impl Daemon {
                 ));
             }
         }
-        let n = self.next_pane.fetch_add(1, Ordering::SeqCst);
+        // Pane ids never repeat, not even across orchd restarts: agent identities and
+        // nudges are keyed by pane, so a reused id would hand an old identity to a new program.
+        let n = self
+            .bus
+            .next_counter("next_pane")
+            .unwrap_or_else(|_| self.next_pane.fetch_add(1, Ordering::SeqCst) + 1_000_000);
         let pane = Pane::spawn(format!("p{n}"), req, self.scrollback)
             .map_err(|e| err("spawn_failed", format!("{e:#}")))?;
         self.panes.lock().unwrap().insert(n, Arc::clone(&pane));
@@ -96,7 +109,7 @@ impl Daemon {
 
     /// SIGHUP (like closing a terminal), then SIGTERM, then SIGKILL to the process group.
     /// The pane is only forgotten once its program is really gone.
-    async fn kill(&self, key: &str) -> Result<(), ApiError> {
+    pub(crate) async fn kill(&self, key: &str) -> Result<(), ApiError> {
         let pane = self.find(key)?;
         let mut exit = pane.subscribe_exit();
         for step in 0..3 {
@@ -135,7 +148,14 @@ impl Daemon {
         match req {
             Request::Ping {} => Ok(json!({"pong": true, "version": orch_proto::VERSION,
                 "pid": std::process::id()})),
-            Request::NewPane(req) => Ok(serde_json::to_value(self.new_pane(req)?.info()).unwrap()),
+            Request::NewPane(req) => {
+                let info = self.new_pane(req)?.info();
+                self.place_new_pane(&info)?;
+                let _ = self.ui_events.send(crate::ui::UiEvent::Panes);
+                Ok(serde_json::to_value(info).unwrap())
+            }
+            Request::UiGet {} => Ok(serde_json::to_value(self.session()).unwrap()),
+            Request::Ui(op) => self.ui_op(op).await,
             Request::ListPanes {} => {
                 let panes: Vec<_> = self
                     .panes
@@ -175,14 +195,21 @@ impl Daemon {
                 Ok(json!({ "pane": pane.id }))
             }
             Request::Kill { pane } => {
-                self.kill(&pane).await?;
-                Ok(json!({ "pane": pane }))
+                let id = self.find(&pane)?.id.clone();
+                self.kill(&id).await?;
+                self.unplace(&id);
+                Ok(json!({ "pane": id }))
             }
             Request::StopDaemon {} => {
                 self.shutdown.notify_one();
                 Ok(json!({ "stopping": true }))
             }
             Request::RegisterAgent(r) => {
+                if let Some(id) = r.pane.as_deref().and_then(|p| p.strip_prefix("orch:")) {
+                    if let Ok(p) = self.find(id) {
+                        p.set_kind(&r.kind);
+                    }
+                }
                 let row = self.bus.register(&r).map_err(bus_err)?;
                 Ok(serde_json::to_value(row).unwrap())
             }
@@ -205,18 +232,14 @@ impl Daemon {
                 self.bus.touch(&row.from);
                 Ok(serde_json::to_value(row).unwrap())
             }
-            Request::Inbox {
-                name,
-                wait_ms,
-                peek,
-            } => {
+            Request::Inbox { name, wait_ms } => {
                 let wait = Duration::from_millis(wait_ms.unwrap_or(0).min(3_600_000));
-                let rows = self
-                    .bus
-                    .inbox_wait(&name, peek, wait)
-                    .await
-                    .map_err(bus_err)?;
+                let rows = self.bus.inbox_wait(&name, wait).await.map_err(bus_err)?;
                 Ok(json!({ "messages": rows }))
+            }
+            Request::Ack { name, ids } => {
+                let n = self.bus.ack(&name, &ids).map_err(bus_err)?;
+                Ok(json!({ "acked": n }))
             }
             Request::Log { after, limit, .. } => {
                 let rows = self
@@ -256,7 +279,8 @@ impl Daemon {
                 let code = crate::telegram::new_pair_code(&self.bus).map_err(bus_err)?;
                 Ok(json!({ "code": code }))
             }
-            Request::Attach(_)
+            Request::Subscribe {}
+            | Request::Attach(_)
             | Request::Input { .. }
             | Request::Resize { .. }
             | Request::Takeover {}
@@ -318,6 +342,9 @@ async fn connection(stream: UnixStream, daemon: Arc<Daemon>) -> std::io::Result<
             };
             return attach(pane, a, frame.id, reader, writer).await;
         }
+        if let Request::Subscribe {} = req {
+            return crate::ui::subscribe(&daemon, frame.id, reader, writer).await;
+        }
         if let Request::Log {
             after,
             limit,
@@ -326,7 +353,14 @@ async fn connection(stream: UnixStream, daemon: Arc<Daemon>) -> std::io::Result<
         {
             return follow_log(&daemon, after, limit, frame.id, reader, writer).await;
         }
-        let result = daemon.handle(req).await;
+        // A long request (inbox/ask wait) ends when the client goes away.
+        let result = tokio::select! {
+            r = daemon.handle(req) => r,
+            next = reader.next() => match next {
+                Ok(None) | Err(_) => return Ok(()),
+                Ok(Some(_)) => Err(err("busy", "one request at a time per connection")),
+            },
+        };
         reply(&mut writer, &frame.id, result).await?;
     }
     Ok(())
@@ -372,28 +406,31 @@ async fn follow_log(
         tokio::select! {
             f = reader.next() => if f?.is_none() { return Ok(()) },
             ev = rx.recv() => match ev {
-                Ok(BusEvent::Message(row)) if row.id > last => {
-                    last = row.id;
-                    writer.send_body(&id, stream_body(&Stream::Timeline { row })).await?;
-                }
-                Ok(_) => {}
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                    // Catch up from the store instead of losing rows.
+                // Events are only hints: always send the ordered rows after the last one sent,
+                // so a commit that is published late is never skipped.
+                Ok(BusEvent::Message(_)) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                     for row in daemon.bus.log(Some(last), 1000).unwrap_or_default() {
                         last = last.max(row.id);
                         writer.send_body(&id, stream_body(&Stream::Timeline { row })).await?;
                     }
                 }
+                Ok(_) => {}
                 Err(_) => return Ok(()),
             },
         }
     }
 }
 
-/// Wake idle agents: when a message or answer arrives for an agent whose status is `idle`
-/// (reported by its hooks / post_status) and whose pane is known, type a one-line notice into
-/// that pane. Never when the status is unknown, working or blocked — a notice typed into a
-/// permission prompt could choose an option.
+/// Wake idle agents: when a message or answer arrives for an agent, type a one-line notice
+/// into its pane — but only when it is provably safe (phase-2 review):
+/// 1. its bus status is idle or unknown, and is atomically switched to working (a newer
+///    working/blocked status is never overwritten),
+/// 2. the pane itself says idle right before typing (orch pane: screen detection; herdr pane:
+///    herdr's own agent_status), so nothing is typed into a permission prompt or a shell,
+/// 3. Enter is pressed only if the text got in AND the pane still is not blocked.
+///
+/// Claude agents also get their messages via the Stop hook; Codex has no hooks, so this is
+/// its delivery path while idle.
 pub fn start_nudger(daemon: Arc<Daemon>) {
     let mut rx = daemon.bus.subscribe();
     tokio::spawn(async move {
@@ -410,7 +447,7 @@ pub fn start_nudger(daemon: Arc<Daemon>) {
             let Ok(Some(agent)) = daemon.bus.agent(&m.to) else {
                 continue;
             };
-            let (true, Some(pane)) = (agent.status == "idle", agent.pane.clone()) else {
+            let Some(pane) = agent.pane.clone() else {
                 continue;
             };
             let what = if m.kind == "answer" {
@@ -422,34 +459,91 @@ pub fn start_nudger(daemon: Arc<Daemon>) {
                 "[orch] new {what} from {} - call the orch read_inbox tool",
                 m.from
             );
-            // Mark first, so a burst of messages produces one notice.
-            let _ = daemon
-                .bus
-                .set_status(&agent.name, "working", Some("nudged by orch"));
-            nudge(&daemon, &pane, &notice).await;
+            let d = Arc::clone(&daemon);
+            tokio::spawn(async move { nudge(&d, &agent.name, &pane, &notice).await });
         }
     });
 }
 
-async fn nudge(daemon: &Daemon, pane: &str, text: &str) {
+/// Pane-side readiness: `Some(true)` idle, `Some(false)` busy/blocked/gone, `None` unknown.
+async fn pane_idle(daemon: &Daemon, pane: &str) -> Option<bool> {
     if let Some(id) = pane.strip_prefix("orch:") {
-        if let Ok(p) = daemon.find(id) {
-            p.write(text.as_bytes().to_vec());
-            tokio::time::sleep(Duration::from_millis(ENTER_DELAY_MS)).await;
-            p.write(b"\r".to_vec());
+        let p = daemon.find(id).ok()?;
+        return Some(p.detect() == crate::detect::Detected::Idle);
+    }
+    if let Some(id) = pane.strip_prefix("herdr:") {
+        let herdr = std::env::var("ORCH_HERDR").unwrap_or_else(|_| "herdr".into());
+        let out = tokio::process::Command::new(&herdr)
+            .args(["agent", "get", id])
+            .output()
+            .await
+            .ok()?;
+        let v: Value = serde_json::from_slice(&out.stdout).ok()?;
+        let status = v["result"]["agent"]["agent_status"].as_str()?;
+        return Some(status == "idle");
+    }
+    None
+}
+
+async fn nudge(daemon: &Daemon, agent: &str, pane: &str, text: &str) {
+    if pane_idle(daemon, pane).await != Some(true) {
+        return;
+    }
+    let claimed = daemon.bus.set_status_if(
+        agent,
+        Some(&["idle", "unknown"]),
+        "working",
+        Some("nudged by orch"),
+    );
+    if !matches!(claimed, Ok(Some(_))) {
+        return;
+    }
+    if let Some(id) = pane.strip_prefix("orch:") {
+        let Ok(p) = daemon.find(id) else { return };
+        if !p.write(text.as_bytes().to_vec()) {
+            return;
         }
+        tokio::time::sleep(Duration::from_millis(ENTER_DELAY_MS)).await;
+        if p.detect() == crate::detect::Detected::Blocked {
+            return;
+        }
+        p.write(b"\r".to_vec());
     } else if let Some(id) = pane.strip_prefix("herdr:") {
         let herdr = std::env::var("ORCH_HERDR").unwrap_or_else(|_| "herdr".into());
-        let _ = tokio::process::Command::new(&herdr)
+        let typed = tokio::process::Command::new(&herdr)
             .args(["pane", "send-text", id, text])
             .output()
-            .await;
+            .await
+            .is_ok_and(|o| o.status.success());
+        if !typed {
+            return;
+        }
         tokio::time::sleep(Duration::from_millis(ENTER_DELAY_MS)).await;
+        if pane_idle(daemon, pane).await == Some(false) {
+            // herdr now reports working/blocked: maybe our text started something, maybe a
+            // dialog popped up. Don't press Enter into it.
+            let blocked = herdr_status(&herdr, id).await.as_deref() == Some("blocked");
+            if blocked {
+                return;
+            }
+        }
         let _ = tokio::process::Command::new(&herdr)
             .args(["pane", "send-keys", id, "Enter"])
             .output()
             .await;
     }
+}
+
+async fn herdr_status(herdr: &str, id: &str) -> Option<String> {
+    let out = tokio::process::Command::new(herdr)
+        .args(["agent", "get", id])
+        .output()
+        .await
+        .ok()?;
+    let v: Value = serde_json::from_slice(&out.stdout).ok()?;
+    v["result"]["agent"]["agent_status"]
+        .as_str()
+        .map(str::to_string)
 }
 
 fn stream_body(s: &Stream) -> Value {

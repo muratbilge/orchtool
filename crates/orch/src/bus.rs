@@ -8,7 +8,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Local "HH:MM:SS" for a unix-ms timestamp.
-fn clock(ts_ms: i64) -> String {
+pub(crate) fn clock(ts_ms: i64) -> String {
     let t = (ts_ms / 1000) as libc::time_t;
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     unsafe {
@@ -120,15 +120,21 @@ pub async fn inbox(conn: &mut Conn, name: &str, wait: u64, peek: bool) -> Result
         .request(&Request::Inbox {
             name: name.into(),
             wait_ms: Some(wait * 1000),
-            peek,
         })
         .await?;
     let rows: Vec<MessageRow> = serde_json::from_value(v["messages"].clone())?;
     if rows.is_empty() {
         println!("no new messages");
     }
-    for r in rows {
-        println!("{}", row_line(&r));
+    for r in &rows {
+        println!("{}", row_line(r));
+    }
+    if !peek && !rows.is_empty() {
+        conn.request(&Request::Ack {
+            name: name.into(),
+            ids: rows.iter().map(|r| r.id).collect(),
+        })
+        .await?;
     }
     Ok(())
 }
@@ -249,10 +255,12 @@ pub async fn hook(socket: &Path, kind: &str) {
     let run = async {
         // Do not start orchd from a hook: if it is not running there is nothing to report.
         let mut conn = Conn::unix(socket).await.ok()?;
-        let me = conn
-            .request(&Request::RegisterAgent(register_request(kind)))
-            .await
-            .ok()?;
+        let mut reg = register_request(kind);
+        // Claude's session id: a stable identity when there is no pane.
+        reg.instance = ev["session_id"]
+            .as_str()
+            .map(|s| format!("{kind}-session:{s}"));
+        let me = conn.request(&Request::RegisterAgent(reg)).await.ok()?;
         let me = me["name"].as_str()?.to_string();
         let status = |s: &str, t: Option<String>| Request::SetStatus {
             name: me.clone(),
@@ -282,7 +290,6 @@ pub async fn hook(socket: &Path, kind: &str) {
                     .request(&Request::Inbox {
                         name: me.clone(),
                         wait_ms: Some(0),
-                        peek: false,
                     })
                     .await
                     .ok()?;
@@ -296,13 +303,24 @@ pub async fn hook(socket: &Path, kind: &str) {
                     reason.push_str(&format!("\n- from {} ({}): {}", m.from, m.kind, m.text));
                 }
                 reason.push_str("\nHandle them (reply with the orch send_message tool if needed).");
-                conn.request(&status("working", Some("handling bus messages".into())))
-                    .await
-                    .ok()?;
-                println!(
-                    "{}",
-                    serde_json::json!({ "decision": "block", "reason": reason })
-                );
+                // Hand over first, consume after: if anything below fails, the messages
+                // stay unread and come again at the next Stop (at-least-once).
+                {
+                    use std::io::Write as _;
+                    let mut out = std::io::stdout();
+                    let line = serde_json::json!({ "decision": "block", "reason": reason });
+                    writeln!(out, "{line}").ok()?;
+                    out.flush().ok()?;
+                }
+                conn.request(&Request::Ack {
+                    name: me.clone(),
+                    ids: rows.iter().map(|r| r.id).collect(),
+                })
+                .await
+                .ok()?;
+                let _ = conn
+                    .request(&status("working", Some("handling bus messages".into())))
+                    .await;
             }
             _ => {}
         }

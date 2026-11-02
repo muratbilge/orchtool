@@ -230,8 +230,17 @@ async fn request(req: Request) -> Result<Value, String> {
     })
 }
 
+/// This orch-mcp process's identity, used when the agent has no pane.
+static INSTANCE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
 async fn whoami(kind: &str) -> Result<String, String> {
-    let row = request(Request::RegisterAgent(register_request(kind))).await?;
+    let mut reg = register_request(kind);
+    reg.instance = Some(
+        INSTANCE
+            .get_or_init(|| format!("mcp:{}", orch_proto::client::random_id()))
+            .clone(),
+    );
+    let row = request(Request::RegisterAgent(reg)).await?;
     Ok(row["name"].as_str().unwrap_or("agent").to_string())
 }
 
@@ -292,13 +301,21 @@ async fn call_tool(kind: &str, name: &str, args: &Value) -> Result<String, Strin
         "read_inbox" => {
             let wait = wait_ms(kind, args, 0);
             let v = request(Request::Inbox {
-                name: me,
+                name: me.clone(),
                 wait_ms: Some(wait),
-                peek: false,
             })
             .await?;
             let rows: Vec<MessageRow> =
                 serde_json::from_value(v["messages"].clone()).map_err(|e| e.to_string())?;
+            // Consume only what we are about to return. If this task is cancelled before
+            // here, nothing was consumed and the next read_inbox returns the same messages.
+            if !rows.is_empty() {
+                request(Request::Ack {
+                    name: me,
+                    ids: rows.iter().map(|r| r.id).collect(),
+                })
+                .await?;
+            }
             Ok(fmt_messages(&rows))
         }
         "ask_human" => {

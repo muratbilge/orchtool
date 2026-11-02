@@ -54,15 +54,16 @@ pub enum Request {
     ListAgents {},
     #[serde(rename = "msg.send")]
     SendMessage(SendMessage),
-    /// Unread messages for `name` (marks them read unless `peek`); waits up to `wait_ms`.
+    /// Unread messages for `name`, waiting up to `wait_ms`. Does NOT consume them: send
+    /// `msg.ack` with the ids you actually delivered (a dropped reply then loses nothing).
     #[serde(rename = "msg.inbox")]
     Inbox {
         name: String,
         #[serde(default)]
         wait_ms: Option<u64>,
-        #[serde(default)]
-        peek: bool,
     },
+    #[serde(rename = "msg.ack")]
+    Ack { name: String, ids: Vec<i64> },
     /// Timeline rows after `after`; `follow` turns the connection into a stream.
     #[serde(rename = "msg.log")]
     Log {
@@ -98,6 +99,115 @@ pub enum Request {
     /// Start Telegram pairing: returns a one-time code to send to the bot as `/pair CODE`.
     #[serde(rename = "telegram.pair")]
     TelegramPair {},
+
+    // ---- workspaces / TUI (phase 3) ----
+    /// The layout: workspaces → tabs → split tree.
+    #[serde(rename = "ui.get")]
+    UiGet {},
+    /// Change the layout (atomic on the server); replies `{session, pane?}`.
+    #[serde(rename = "ui.op")]
+    Ui(UiOp),
+    /// Turns the connection into an event stream: first a `snapshot`, then `event`s.
+    #[serde(rename = "events.subscribe")]
+    Subscribe {},
+}
+
+/// How to start a program in a new pane.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Spawn {
+    /// Empty = login shell.
+    #[serde(default)]
+    pub argv: Vec<String>,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub env: Option<Vec<(String, String)>>,
+    #[serde(default)]
+    pub rows: Option<u16>,
+    #[serde(default)]
+    pub cols: Option<u16>,
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum UiOp {
+    NewWorkspace {
+        #[serde(default)]
+        label: Option<String>,
+        #[serde(default)]
+        spawn: Spawn,
+    },
+    NewTab {
+        workspace: String,
+        #[serde(default)]
+        spawn: Spawn,
+    },
+    Split {
+        pane: String,
+        dir: crate::layout::Dir,
+        #[serde(default)]
+        spawn: Spawn,
+    },
+    /// Kill the pane's program (if still running) and remove it from the layout.
+    ClosePane {
+        pane: String,
+    },
+    Focus {
+        pane: String,
+    },
+    SelectTab {
+        workspace: String,
+        index: usize,
+    },
+    RenameWorkspace {
+        workspace: String,
+        label: String,
+    },
+    RenameTab {
+        workspace: String,
+        index: usize,
+        label: String,
+    },
+    Resize {
+        pane: String,
+        dir: crate::layout::Dir,
+        delta: f32,
+    },
+    ToggleZoom {
+        pane: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum Event {
+    /// Panes were created, exited, changed status or title: the full list is cheap.
+    Panes {
+        panes: Vec<PaneInfo>,
+    },
+    Session {
+        session: crate::layout::Session,
+    },
+    Agent {
+        agent: AgentRow,
+    },
+    Question {
+        question: QuestionRow,
+    },
+    Message {
+        message: MessageRow,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Snapshot {
+    pub session: crate::layout::Session,
+    pub panes: Vec<PaneInfo>,
+    pub agents: Vec<AgentRow>,
+    pub questions: Vec<QuestionRow>,
+    pub messages: Vec<MessageRow>,
 }
 
 /// The human's name on the bus ("me" / "human" are accepted as aliases).
@@ -122,6 +232,9 @@ pub struct RegisterAgent {
     /// Explicit name ($ORCH_AGENT) — otherwise derived from cwd + kind.
     #[serde(default)]
     pub name: Option<String>,
+    /// Stable id of this agent process/session (used when there is no pane).
+    #[serde(default)]
+    pub instance: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -262,6 +375,12 @@ pub struct PaneInfo {
     pub clients: usize,
     pub title: String,
     pub created_unix: u64,
+    /// "claude" / "codex" when the pane runs a known agent.
+    #[serde(default)]
+    pub agent: Option<String>,
+    /// From the screen: "working", "blocked", "idle", "done" (agents only).
+    #[serde(default)]
+    pub agent_status: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -298,6 +417,10 @@ pub enum Stream {
     Exit { code: Option<u32> },
     /// `msg.log` with `follow`: one new timeline row.
     Timeline { row: MessageRow },
+    /// `events.subscribe`: initial state.
+    Snapshot { snapshot: Box<Snapshot> },
+    /// `events.subscribe`: a change.
+    Event { event: Box<Event> },
 }
 
 /// The pane's id or its name.
