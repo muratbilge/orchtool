@@ -504,7 +504,8 @@ async fn nudge(daemon: &Daemon, agent: &str, pane: &str, text: &str) {
             return;
         }
         tokio::time::sleep(Duration::from_millis(ENTER_DELAY_MS)).await;
-        if p.detect() == crate::detect::Detected::Blocked {
+        // Fail closed: Enter only while the agent still shows its idle prompt.
+        if p.detect() != crate::detect::Detected::Idle {
             return;
         }
         p.write(b"\r".to_vec());
@@ -519,31 +520,15 @@ async fn nudge(daemon: &Daemon, agent: &str, pane: &str, text: &str) {
             return;
         }
         tokio::time::sleep(Duration::from_millis(ENTER_DELAY_MS)).await;
-        if pane_idle(daemon, pane).await == Some(false) {
-            // herdr now reports working/blocked: maybe our text started something, maybe a
-            // dialog popped up. Don't press Enter into it.
-            let blocked = herdr_status(&herdr, id).await.as_deref() == Some("blocked");
-            if blocked {
-                return;
-            }
+        // Fail closed: Enter only if herdr still reports the agent idle.
+        if pane_idle(daemon, pane).await != Some(true) {
+            return;
         }
         let _ = tokio::process::Command::new(&herdr)
             .args(["pane", "send-keys", id, "Enter"])
             .output()
             .await;
     }
-}
-
-async fn herdr_status(herdr: &str, id: &str) -> Option<String> {
-    let out = tokio::process::Command::new(herdr)
-        .args(["agent", "get", id])
-        .output()
-        .await
-        .ok()?;
-    let v: Value = serde_json::from_slice(&out.stdout).ok()?;
-    v["result"]["agent"]["agent_status"]
-        .as_str()
-        .map(str::to_string)
 }
 
 fn stream_body(s: &Stream) -> Value {

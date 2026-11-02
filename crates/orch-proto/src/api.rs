@@ -190,11 +190,12 @@ pub enum Event {
     Session {
         session: crate::layout::Session,
     },
-    Agent {
-        agent: AgentRow,
+    /// The complete current lists (authoritative; never applied as deltas).
+    Agents {
+        agents: Vec<AgentRow>,
     },
-    Question {
-        question: QuestionRow,
+    Questions {
+        questions: Vec<QuestionRow>,
     },
     Message {
         message: MessageRow,

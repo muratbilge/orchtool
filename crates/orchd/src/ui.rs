@@ -141,7 +141,10 @@ impl Daemon {
         match op {
             UiOp::NewWorkspace { label, spawn } => {
                 let info = self.spawn(spawn, None)?;
-                self.add_workspace(label, &info)?;
+                if let Err(e) = self.add_workspace(label, &info) {
+                    let _ = self.kill(&info.id).await;
+                    return Err(e);
+                }
                 created = Some(info);
             }
             UiOp::NewTab { workspace, spawn } => {
@@ -150,7 +153,11 @@ impl Daemon {
                     return Err(err("no_workspace", format!("no workspace {workspace:?}")));
                 }
                 let info = self.spawn(spawn, cwd)?;
-                self.add_tab(&workspace, &info)?;
+                if let Err(e) = self.add_tab(&workspace, &info) {
+                    // The workspace vanished meanwhile: don't leave an unplaced pane behind.
+                    let _ = self.kill(&info.id).await;
+                    return Err(e);
+                }
                 created = Some(info);
             }
             UiOp::Split { pane, dir, spawn } => {
@@ -161,7 +168,7 @@ impl Daemon {
                 }
                 let info = self.spawn(spawn, Some(pane_cwd(&at.info())))?;
                 let new_id = info.id.clone();
-                self.edit(|s| {
+                let placed = self.edit(|s| {
                     let (wi, ti) = s
                         .locate(&id)
                         .ok_or_else(|| err("not_placed", "pane vanished"))?;
@@ -170,7 +177,11 @@ impl Daemon {
                     tab.focus = new_id.clone();
                     tab.zoomed = false;
                     Ok(())
-                })?;
+                });
+                if let Err(e) = placed {
+                    let _ = self.kill(&new_id).await;
+                    return Err(e);
+                }
                 created = Some(info);
             }
             UiOp::ClosePane { pane } => {
@@ -330,9 +341,27 @@ pub async fn subscribe(
             },
             ev = bus_rx.recv() => {
                 match ev {
-                    Ok(BusEvent::Agent(agent)) => writer.send_body(&id, send(Event::Agent { agent })).await?,
-                    Ok(BusEvent::Question(question)) => writer.send_body(&id, send(Event::Question { question })).await?,
-                    Ok(BusEvent::Message(_)) | Ok(BusEvent::Changed) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    // Events are hints: always send the current lists / ordered rows read from
+                    // the store, so a late or dropped event can never leave stale state.
+                    Ok(BusEvent::Agent(_)) => {
+                        let agents = daemon.bus.agents().unwrap_or_default();
+                        writer.send_body(&id, send(Event::Agents { agents })).await?
+                    }
+                    Ok(BusEvent::Question(_)) => {
+                        let questions = daemon.bus.questions(false).unwrap_or_default();
+                        writer.send_body(&id, send(Event::Questions { questions })).await?
+                    }
+                    Ok(BusEvent::Message(_)) | Ok(BusEvent::Changed) => {
+                        for message in daemon.bus.log(Some(last_msg), 500).unwrap_or_default() {
+                            last_msg = last_msg.max(message.id);
+                            writer.send_body(&id, send(Event::Message { message })).await?;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        let agents = daemon.bus.agents().unwrap_or_default();
+                        writer.send_body(&id, send(Event::Agents { agents })).await?;
+                        let questions = daemon.bus.questions(false).unwrap_or_default();
+                        writer.send_body(&id, send(Event::Questions { questions })).await?;
                         for message in daemon.bus.log(Some(last_msg), 500).unwrap_or_default() {
                             last_msg = last_msg.max(message.id);
                             writer.send_body(&id, send(Event::Message { message })).await?;

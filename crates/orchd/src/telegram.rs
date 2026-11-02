@@ -207,18 +207,27 @@ pub fn start(bus: Arc<Bus>, cfg: TgConfig) {
                     json!({ "offset": offset, "timeout": 25, "allowed_updates": ["message", "callback_query"] }),
                 ) {
                     Ok(updates) => {
-                        for u in updates.as_array().cloned().unwrap_or_default() {
+                        'batch: for u in updates.as_array().cloned().unwrap_or_default() {
                             let uid = u["update_id"].as_i64().unwrap_or(0);
-                            // Retry a failing update a few times; a permanently broken one
-                            // must not block every later update forever.
+                            // handle_update only fails on store errors (invalid or foreign
+                            // updates are ignored with Ok). Never skip a valid update: stop the
+                            // batch without advancing the offset; Telegram re-delivers it.
+                            let mut applied = false;
                             for attempt in 1..=3 {
                                 match handle_update(&bus, &api, &cfg, &u) {
-                                    Ok(()) => break,
+                                    Ok(()) => {
+                                        applied = true;
+                                        break;
+                                    }
                                     Err(e) => {
                                         eprintln!("orchd: telegram update {uid} (try {attempt}): {e}");
                                         std::thread::sleep(Duration::from_secs(2));
                                     }
                                 }
+                            }
+                            if !applied {
+                                std::thread::sleep(Duration::from_secs(10));
+                                break 'batch;
                             }
                             offset = offset.max(uid + 1);
                             let _ = bus.kv_set("tg_offset", &offset.to_string());
@@ -323,13 +332,16 @@ fn handle_update(bus: &Bus, api: &Api, cfg: &TgConfig, u: &Value) -> Result<()> 
         let data = cb["data"].as_str().unwrap_or("");
         let mut parts = data.split(':');
         if let (Some("a"), Some(q), Some(i)) = (parts.next(), parts.next(), parts.next()) {
-            let (q, i): (i64, usize) = (q.parse()?, i.parse()?);
-            let question = bus.question(q)?.ok_or_else(|| anyhow!("no question {q}"))?;
-            let answer = question
-                .options
-                .get(i)
-                .cloned()
-                .ok_or_else(|| anyhow!("no option {i}"))?;
+            // Malformed or stale buttons are ignored (Ok), only store errors propagate.
+            let (Ok(q), Ok(i)) = (q.parse::<i64>(), i.parse::<usize>()) else {
+                return Ok(());
+            };
+            let Some(question) = bus.question(q)? else {
+                return Ok(());
+            };
+            let Some(answer) = question.options.get(i).cloned() else {
+                return Ok(());
+            };
             // Idempotent: a re-delivered update finds the question answered already.
             let (won, q) = bus.answer(q, &answer, "telegram")?;
             if !won && q.answer.as_deref() != Some(answer.as_str()) {

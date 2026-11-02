@@ -314,6 +314,10 @@ impl Session {
                 if ws.tabs.is_empty() {
                     self.workspaces.remove(wi);
                 } else {
+                    // Keep the same tab selected when an earlier one disappears.
+                    if ti < ws.active_tab {
+                        ws.active_tab -= 1;
+                    }
                     ws.active_tab = ws.active_tab.min(ws.tabs.len() - 1);
                 }
             }
@@ -412,6 +416,11 @@ mod tests {
             active_tab: 1,
         });
         assert_eq!(s.locate("p2"), Some((0, 1)));
+        // Removing the tab BEFORE the active one keeps the active tab selected.
+        let mut s2 = s.clone();
+        assert!(s2.remove_pane("p1"));
+        assert_eq!(s2.workspaces[0].active_tab, 0);
+        assert_eq!(s2.workspaces[0].tabs[0].focus, "p2");
         assert!(s.remove_pane("p2"));
         assert_eq!(s.workspaces[0].tabs.len(), 1);
         assert_eq!(s.workspaces[0].active_tab, 0);

@@ -53,9 +53,21 @@ fn encode(ty: u8, chan: u32, payload: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Frames queued for the transport (each ≤ 32 KiB of data): bounded, so a stalled link
+/// pushes back on the channel readers, and from there on orchd — whose screen sync then skips
+/// to the latest state instead of piling up frames.
+const OUT_QUEUE: usize = 128;
+/// Chunks queued per channel towards its local side.
+const CHAN_QUEUE: usize = 64;
+/// A channel whose local side does not drain for this long is closed (it will reconnect and
+/// resnapshot) instead of stalling every other channel.
+const STALL: std::time::Duration = std::time::Duration::from_secs(5);
+
+type Chans = Arc<Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>>;
+
 /// One writer task owns the stream; everything else sends encoded frames to it.
-fn spawn_writer(mut w: impl AsyncWrite + Unpin + Send + 'static) -> mpsc::UnboundedSender<Vec<u8>> {
-    let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+fn spawn_writer(mut w: impl AsyncWrite + Unpin + Send + 'static) -> mpsc::Sender<Vec<u8>> {
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(OUT_QUEUE);
     tokio::spawn(async move {
         while let Some(buf) = rx.recv().await {
             if w.write_all(&buf).await.is_err() {
@@ -75,13 +87,23 @@ fn spawn_writer(mut w: impl AsyncWrite + Unpin + Send + 'static) -> mpsc::Unboun
     tx
 }
 
+/// Hand incoming DATA to its channel; a channel that stays full for STALL is closed.
+async fn deliver(chans: &Chans, out: &mpsc::Sender<Vec<u8>>, chan: u32, payload: Vec<u8>) {
+    let tx = chans.lock().unwrap().get(&chan).cloned();
+    let Some(tx) = tx else { return };
+    if tx.send_timeout(payload, STALL).await.is_err() {
+        chans.lock().unwrap().remove(&chan);
+        let _ = out.send(encode(CLOSE, chan, &[])).await;
+    }
+}
+
 /// Bridge one channel to a local byte stream: its reads become DATA frames, incoming DATA
 /// is written to it, EOF on either side becomes CLOSE.
 fn bridge(
     chan: u32,
     stream: impl AsyncRead + AsyncWrite + Unpin + Send + 'static,
-    out: mpsc::UnboundedSender<Vec<u8>>,
-    mut incoming: mpsc::UnboundedReceiver<Vec<u8>>,
+    out: mpsc::Sender<Vec<u8>>,
+    mut incoming: mpsc::Receiver<Vec<u8>>,
     on_done: impl FnOnce() + Send + 'static,
 ) {
     let (mut r, mut w) = tokio::io::split(stream);
@@ -92,24 +114,26 @@ fn bridge(
             match r.read(&mut buf).await {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    if out2.send(encode(DATA, chan, &buf[..n])).is_err() {
+                    // Awaiting here is the backpressure: we stop reading orchd.
+                    if out2.send(encode(DATA, chan, &buf[..n])).await.is_err() {
                         break;
                     }
                 }
             }
         }
-        let _ = out2.send(encode(CLOSE, chan, &[]));
+        let _ = out2.send(encode(CLOSE, chan, &[])).await;
     });
     tokio::spawn(async move {
+        // Ends when the remote side closes the channel or the whole transport goes away
+        // (every sender is dropped on teardown).
         while let Some(data) = incoming.recv().await {
             if w.write_all(&data).await.is_err() || w.flush().await.is_err() {
                 break;
             }
         }
         let _ = w.shutdown().await;
-        // Remote side closed: stop reading too.
         reader.abort();
-        let _ = out.send(encode(CLOSE, chan, &[]));
+        let _ = out.try_send(encode(CLOSE, chan, &[]));
         on_done();
     });
 }
@@ -126,12 +150,18 @@ where
 {
     let mut input = input;
     let out = spawn_writer(output);
-    let chans: Arc<Mutex<HashMap<u32, mpsc::UnboundedSender<Vec<u8>>>>> = Arc::default();
+    let chans: Chans = Arc::default();
     let connect = Arc::new(connect);
-    while let Some((ty, chan, payload)) = read_frame(&mut input).await? {
+    let result = loop {
+        let frame = match read_frame(&mut input).await {
+            Ok(Some(f)) => f,
+            Ok(None) => break Ok(()),
+            Err(e) => break Err(e),
+        };
+        let (ty, chan, payload) = frame;
         match ty {
             OPEN => {
-                let (tx, rx) = mpsc::unbounded_channel();
+                let (tx, rx) = mpsc::channel(CHAN_QUEUE);
                 chans.lock().unwrap().insert(chan, tx);
                 let (out, chans, connect) = (out.clone(), Arc::clone(&chans), Arc::clone(&connect));
                 tokio::spawn(async move {
@@ -144,30 +174,29 @@ where
                         }
                         Err(_) => {
                             chans.lock().unwrap().remove(&chan);
-                            let _ = out.send(encode(CLOSE, chan, &[]));
+                            let _ = out.send(encode(CLOSE, chan, &[])).await;
                         }
                     }
                 });
             }
-            DATA => {
-                if let Some(tx) = chans.lock().unwrap().get(&chan) {
-                    let _ = tx.send(payload);
-                }
-            }
+            DATA => deliver(&chans, &out, chan, payload).await,
             CLOSE => {
                 chans.lock().unwrap().remove(&chan);
             }
             _ => {}
         }
-    }
-    Ok(())
+    };
+    // Transport gone (EOF or error): close every channel, so every orchd connection ends
+    // and releases what it holds (e.g. pane control).
+    chans.lock().unwrap().clear();
+    result
 }
 
 /// Client side: open channels over one stream (e.g. an ssh child's stdio).
 #[derive(Clone)]
 pub struct MuxClient {
-    out: mpsc::UnboundedSender<Vec<u8>>,
-    chans: Arc<Mutex<HashMap<u32, mpsc::UnboundedSender<Vec<u8>>>>>,
+    out: mpsc::Sender<Vec<u8>>,
+    chans: Chans,
     next: Arc<AtomicU32>,
 }
 
@@ -177,17 +206,13 @@ impl MuxClient {
         output: impl AsyncWrite + Unpin + Send + 'static,
     ) -> Self {
         let out = spawn_writer(output);
-        let chans: Arc<Mutex<HashMap<u32, mpsc::UnboundedSender<Vec<u8>>>>> = Arc::default();
-        let chans2 = Arc::clone(&chans);
+        let chans: Chans = Arc::default();
+        let (chans2, out2) = (Arc::clone(&chans), out.clone());
         tokio::spawn(async move {
             let mut input = input;
             while let Ok(Some((ty, chan, payload))) = read_frame(&mut input).await {
                 match ty {
-                    DATA => {
-                        if let Some(tx) = chans2.lock().unwrap().get(&chan) {
-                            let _ = tx.send(payload);
-                        }
-                    }
+                    DATA => deliver(&chans2, &out2, chan, payload).await,
                     CLOSE => {
                         chans2.lock().unwrap().remove(&chan);
                     }
@@ -207,11 +232,11 @@ impl MuxClient {
     /// A new orch connection over the shared stream.
     pub fn open(&self) -> io::Result<Conn> {
         let chan = self.next.fetch_add(1, Ordering::SeqCst);
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(CHAN_QUEUE);
         self.chans.lock().unwrap().insert(chan, tx);
-        self.out
-            .send(encode(OPEN, chan, &[]))
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "connection to host lost"))?;
+        self.out.try_send(encode(OPEN, chan, &[])).map_err(|_| {
+            io::Error::new(io::ErrorKind::BrokenPipe, "connection to host lost or busy")
+        })?;
         let (app, mux_side) = tokio::io::duplex(256 * 1024);
         let chans = Arc::clone(&self.chans);
         bridge(chan, mux_side, self.out.clone(), rx, move || {
@@ -283,6 +308,63 @@ mod tests {
         drop(conns.remove(0));
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(conns[0].request(&Request::Ping {}).await.is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn transport_eof_closes_every_channel_on_both_sides() {
+        let dir = std::env::temp_dir().join(format!("orch-mux-eof-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("s.sock");
+        // An orchd stand-in that reports when its connections close.
+        let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+        let (closed_tx, mut closed_rx) = mpsc::unbounded_channel::<()>();
+        tokio::spawn(async move {
+            loop {
+                let (mut s, _) = listener.accept().await.unwrap();
+                let closed_tx = closed_tx.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 64];
+                    while let Ok(n) = s.read(&mut buf).await {
+                        if n == 0 {
+                            break;
+                        }
+                    }
+                    let _ = closed_tx.send(());
+                });
+            }
+        });
+        // Raw transport: we play the client by hand, so we can cut the link while two
+        // channels are still open.
+        let (mut raw_w, p_in) = tokio::io::duplex(64 * 1024);
+        let (p_out, mut sink) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(async move {
+            let mut buf = [0u8; 1024];
+            while let Ok(n) = sink.read(&mut buf).await {
+                if n == 0 {
+                    break;
+                }
+            }
+        });
+        let sock2 = sock.clone();
+        let proxy = tokio::spawn(async move {
+            serve(p_in, p_out, move || {
+                let s = sock2.clone();
+                async move { tokio::net::UnixStream::connect(s).await }
+            })
+            .await
+        });
+        raw_w.write_all(&encode(OPEN, 1, &[])).await.unwrap();
+        raw_w.write_all(&encode(OPEN, 2, &[])).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        drop(raw_w); // the ssh link dies
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), proxy).await;
+        for _ in 0..2 {
+            tokio::time::timeout(std::time::Duration::from_secs(2), closed_rx.recv())
+                .await
+                .expect("orchd-side connection closed");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

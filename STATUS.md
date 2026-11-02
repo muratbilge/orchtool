@@ -1,5 +1,23 @@
 # Status
 
+## 2026-11-02 — Phase 3 review fixes (CODEX-REVIEW-P3-RESULT.md, 13 findings) — Claude
+
+All fixed: (1) orch-mcp acks inbox rows only after the result was written+flushed to the client;
+(2) Telegram: invalid updates ignored, store errors never advance the offset; (3) ask retry returns
+the original question until the asker has read its answer; (4) nudges fail closed — Idle needs a
+positive prompt-footer match ("for shortcuts", "⏵⏵", "shift+tab to cycle"), Enter only while still
+Idle / herdr still idle; (5) spawn+place rolls back (kills the pane) on failure; (6) removing an
+earlier tab keeps the active tab; (7) event stream sends authoritative agent/question lists, full
+resync on lag; (8) mux: bounded queues with backpressure to orchd, stalled channel closed after 5 s;
+(9) mux: transport EOF tears down every channel; (10) TUI: focus/tab switches applied locally at
+once, keys after split/new tab held until the new pane's view exists; (11) dead attach streams are
+reported and reattached; (12) bracketed paste is one token (overlay: text, never submit);
+(13) streaming key decoder (split CSI/UTF-8/paste kept across reads, 40 ms Escape timeout).
+Checks: `scripts/check.sh` exit 0 — proto 10, orch 2, orchd unit 18, panes 10, ui 3, bus 9, spike 3.
+Live: keys typed in the same chunk as `prefix s` land in the new pane.
+Known limit (documented, accepted): nudges still read the screen; Claude's primary delivery is the
+Stop hook, nudges are a best-effort wake-up for idle agents without hooks (Codex).
+
 ## 2026-11-02 — Phase 3 (TUI + agent status) — code done, awaiting Codex review + Murat's day of use — Claude
 
 Phase-2 review (CODEX-REVIEW-P2-RESULT.md): all 9 findings fixed in 741d00a, each with a test

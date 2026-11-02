@@ -45,6 +45,8 @@ enum Msg {
         error: String,
     },
     Keys(Vec<u8>),
+    /// Escape-timeout: treat a lone pending ESC as the Escape key.
+    KeysFlush,
     Reply {
         what: String,
         result: Result<Value, String>,
@@ -99,6 +101,12 @@ struct App {
     quit: bool,
     started_ws: bool,
     outer_modes: String,
+    /// Bytes of an incomplete key / paste carried over to the next read.
+    pending: Vec<u8>,
+    /// After a split / new tab: keys are held until the op replied and the new pane's view
+    /// is attached (≤ 3 s). (started, op replied)
+    hold_input: Option<(Instant, bool)>,
+    held: Vec<u8>,
 }
 
 fn prefix_byte() -> u8 {
@@ -213,6 +221,9 @@ pub async fn run(connector: Connector) -> Result<()> {
         quit: false,
         started_ws: false,
         outer_modes: String::new(),
+        pending: Vec::new(),
+        hold_input: None,
+        held: Vec::new(),
     };
     let mut winch = signal(SignalKind::window_change())?;
     let mut tick = tokio::time::interval(Duration::from_secs(1));
@@ -222,6 +233,7 @@ pub async fn run(connector: Connector) -> Result<()> {
     let result: Result<()> = loop {
         if dirty && last_draw.elapsed() >= frame {
             app.sync_views();
+            app.try_release_input();
             if let Err(e) = term.draw(|f| app.draw(f)) {
                 break Err(e.into());
             }
@@ -556,12 +568,15 @@ impl App {
                                 }
                             }
                         }
-                        _ => return,
+                        // Closed without an Exit: report it, the view reconnects with a
+                        // fresh snapshot on the next frame.
+                        Ok(None) => return fail("stream closed".into()),
+                        Err(e) => return fail(e.to_string()),
                     },
                     req = req_rx.recv() => match req {
                         Some(req) => {
-                            if w.send_body("a", serde_json::to_value(&req).unwrap()).await.is_err() {
-                                return;
+                            if let Err(e) = w.send_body("a", serde_json::to_value(&req).unwrap()).await {
+                                return fail(e.to_string());
                             }
                         }
                         None => return, // view dropped: detach
@@ -572,6 +587,10 @@ impl App {
     }
 
     fn send_input(&mut self, bytes: Vec<u8>) {
+        if self.hold_input.is_some() {
+            self.held.extend_from_slice(&bytes);
+            return;
+        }
         let Some(pane) = self.focused() else { return };
         if let Some(v) = self.views.get(&pane) {
             if v.role == Role::Observer {
@@ -580,6 +599,65 @@ impl App {
             let data_b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
             let _ = v.tx.send(Request::Input { data_b64 });
         }
+    }
+
+    /// The new pane exists (or the op failed): deliver what was typed meanwhile to the
+    /// pane that is focused now.
+    fn release_input(&mut self) {
+        // The op replied; the keys go out as soon as the focused pane's view is attached
+        // (see try_release_input, called after every view sync).
+        if let Some((t, _)) = self.hold_input {
+            self.hold_input = Some((t, true));
+        }
+        self.try_release_input();
+    }
+
+    /// Deliver held keys once the op replied and the focused pane has a view (or give up
+    /// waiting after 3 s).
+    fn try_release_input(&mut self) {
+        let Some((since, op_done)) = self.hold_input else {
+            return;
+        };
+        let ready = self.focused().is_some_and(|p| self.views.contains_key(&p));
+        if (op_done && ready) || since.elapsed() > Duration::from_secs(3) {
+            self.hold_input = None;
+            let held = std::mem::take(&mut self.held);
+            if !held.is_empty() {
+                self.send_input(held);
+            }
+        }
+    }
+
+    /// Focus / tab changes take effect locally at once, so keys typed right after them go to
+    /// the new target; orchd's next session event confirms the same state.
+    fn focus_local(&mut self, pane: &str) {
+        if let Some((wi, ti)) = self.session.locate(pane) {
+            let w = &mut self.session.workspaces[wi];
+            w.active_tab = ti;
+            w.tabs[ti].focus = pane.to_string();
+            self.ws_id = Some(w.id.clone());
+        }
+        self.ui(
+            "focus",
+            UiOp::Focus {
+                pane: pane.to_string(),
+            },
+        );
+    }
+
+    fn select_tab_local(&mut self, ws: &str, index: usize) {
+        if let Some(w) = self.session.workspace_mut(ws) {
+            if index < w.tabs.len() {
+                w.active_tab = index;
+            }
+        }
+        self.ui(
+            "tab",
+            UiOp::SelectTab {
+                workspace: ws.to_string(),
+                index,
+            },
+        );
     }
 
     /// Mirror the focused pane's input modes on the real terminal (arrow keys in vim/less,
@@ -649,17 +727,18 @@ impl App {
                         self.ws_id = self.session.workspaces.first().map(|w| w.id.clone());
                     }
                 }
-                Event::Agent { agent } => {
-                    match self.agents.iter_mut().find(|a| a.name == agent.name) {
-                        Some(a) => *a = agent,
-                        None => self.agents.push(agent),
-                    }
-                }
-                Event::Question { question } => {
-                    self.questions.retain(|q| q.id != question.id);
-                    if question.state == "open" {
-                        self.questions.push(question);
-                        self.flash("⚑ an agent asks you something — prefix a");
+                // Complete lists from the store: replace, never patch.
+                Event::Agents { agents } => self.agents = agents,
+                Event::Questions { questions } => {
+                    let new = questions
+                        .iter()
+                        .any(|q| !self.questions.iter().any(|o| o.id == q.id));
+                    self.questions = questions;
+                    if new {
+                        self.flash(format!(
+                            "⚑ an agent asks you something — {} a",
+                            prefix_name(self.prefix)
+                        ));
                     }
                 }
                 Event::Message { message } => {
@@ -702,31 +781,45 @@ impl App {
                 self.flash(format!("{pane}: {error}"));
             }
             Msg::Keys(bytes) => self.keys(bytes),
-            Msg::Reply { what, result } => match result {
-                Ok(v) => {
-                    if let Ok(s) = serde_json::from_value::<Session>(v["session"].clone()) {
-                        if s.version >= self.session.version {
-                            self.session = s;
-                        }
-                    }
-                    // A new pane: follow it.
-                    if let Some(id) = v["pane"]["id"].as_str() {
-                        if let Some((wi, _)) = self.session.locate(id) {
-                            self.ws_id = Some(self.session.workspaces[wi].id.clone());
-                        }
-                    }
-                    if what == "answer" {
-                        if v["won"] == false {
-                            self.flash("already answered elsewhere");
-                        } else {
-                            self.flash("answered ✓");
-                        }
-                    }
+            Msg::KeysFlush => self.flush_pending_keys(),
+            Msg::Reply { what, result } => {
+                let creates = matches!(
+                    what.as_str(),
+                    "split" | "new tab" | "new agent" | "new workspace"
+                );
+                self.reply(&what, result);
+                if creates {
+                    self.release_input();
                 }
-                Err(e) => self.flash(format!("{what}: {e}")),
-            },
+            }
         }
         Ok(())
+    }
+
+    fn reply(&mut self, what: &str, result: Result<Value, String>) {
+        match result {
+            Ok(v) => {
+                if let Ok(s) = serde_json::from_value::<Session>(v["session"].clone()) {
+                    if s.version >= self.session.version {
+                        self.session = s;
+                    }
+                }
+                // A new pane: follow it.
+                if let Some(id) = v["pane"]["id"].as_str() {
+                    if let Some((wi, _)) = self.session.locate(id) {
+                        self.ws_id = Some(self.session.workspaces[wi].id.clone());
+                    }
+                }
+                if what == "answer" {
+                    if v["won"] == false {
+                        self.flash("already answered elsewhere");
+                    } else {
+                        self.flash("answered ✓");
+                    }
+                }
+            }
+            Err(e) => self.flash(format!("{what}: {e}")),
+        }
     }
 
     fn pick_start_workspace(&mut self) {
@@ -751,23 +844,62 @@ impl App {
 
     // ---------- keys ----------
 
+    /// Keys arrive in arbitrary chunks: an incomplete escape sequence, UTF-8 character or
+    /// bracketed paste is kept until the rest arrives (a lone ESC becomes the Escape key after
+    /// a short timeout).
     fn keys(&mut self, bytes: Vec<u8>) {
+        let mut data = std::mem::take(&mut self.pending);
+        data.extend_from_slice(&bytes);
         let mut i = 0;
+        let mut tokens: Vec<Token> = Vec::new();
+        while i < data.len() {
+            match next_token(&data[i..]) {
+                Some((t, n)) => {
+                    tokens.push(t);
+                    i += n;
+                }
+                None => {
+                    self.pending = data[i..].to_vec();
+                    if self.pending == [0x1b] {
+                        let tx = self.tx.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(Duration::from_millis(40)).await;
+                            let _ = tx.send(Msg::KeysFlush);
+                        });
+                    }
+                    break;
+                }
+            }
+        }
+        self.dispatch(tokens);
+    }
+
+    fn flush_pending_keys(&mut self) {
+        if self.pending == [0x1b] {
+            self.pending.clear();
+            self.dispatch(vec![Token::Key(vec![0x1b])]);
+        }
+    }
+
+    fn dispatch(&mut self, tokens: Vec<Token>) {
         let mut forward: Vec<u8> = Vec::new();
-        while i < bytes.len() {
-            // Escape sequences travel as one key.
-            let key_len = key_len(&bytes[i..]);
-            let key = &bytes[i..i + key_len];
-            i += key_len;
-            match self.mode {
-                Mode::Normal if !self.prefix_pending => {
+        for t in tokens {
+            match (t, &self.mode) {
+                // A paste goes to the pane as-is (with its markers, which the pane asked for).
+                (Token::Paste(raw, _), Mode::Normal) => {
+                    self.prefix_pending = false;
+                    forward.extend_from_slice(&raw);
+                }
+                // In an overlay a paste is text for the input line — never a submit.
+                (Token::Paste(_, text), _) => self.overlay_paste(&text),
+                (Token::Key(key), Mode::Normal) if !self.prefix_pending => {
                     if key == [self.prefix] {
                         self.prefix_pending = true;
                     } else {
-                        forward.extend_from_slice(key);
+                        forward.extend_from_slice(&key);
                     }
                 }
-                Mode::Normal => {
+                (Token::Key(key), Mode::Normal) => {
                     self.prefix_pending = false;
                     if !forward.is_empty() {
                         self.send_input(std::mem::take(&mut forward));
@@ -775,14 +907,27 @@ impl App {
                     if key == [self.prefix] {
                         forward.push(self.prefix);
                     } else {
-                        self.command(key);
+                        self.command(&key);
                     }
                 }
-                _ => self.overlay_key(key),
+                (Token::Key(key), _) => {
+                    if !forward.is_empty() {
+                        self.send_input(std::mem::take(&mut forward));
+                    }
+                    self.overlay_key(&key);
+                }
             }
         }
         if !forward.is_empty() {
             self.send_input(forward);
+        }
+    }
+
+    fn overlay_paste(&mut self, text: &str) {
+        let flat = text.replace(['\r', '\n'], " ");
+        match &mut self.mode {
+            Mode::Comms(input) | Mode::Prompt(_, input) => input.push_str(&flat),
+            _ => {}
         }
     }
 
@@ -805,7 +950,7 @@ impl App {
                 .map(|(p, r)| (p, to_lrect(r)))
                 .collect();
             if let Some(n) = focused.as_deref().and_then(|f| neighbor(&rects, f, t)) {
-                self.ui("focus", UiOp::Focus { pane: n });
+                self.focus_local(&n);
             }
             return;
         }
@@ -813,6 +958,7 @@ impl App {
             b"c" => {
                 if let Some((ws, _, _)) = ws {
                     let spawn = self.spawn_here(Vec::new());
+                    self.hold_input = Some((Instant::now(), false));
                     self.ui(
                         "new tab",
                         UiOp::NewTab {
@@ -860,26 +1006,14 @@ impl App {
                         } else {
                             (active + n - 1) % n
                         };
-                        self.ui(
-                            "tab",
-                            UiOp::SelectTab {
-                                workspace: ws,
-                                index,
-                            },
-                        );
+                        self.select_tab_local(&ws, index);
                     }
                 }
             }
             [d @ b'1'..=b'9'] => {
                 if let Some((ws, _, _)) = ws {
                     let index = (d - b'1') as usize;
-                    self.ui(
-                        "tab",
-                        UiOp::SelectTab {
-                            workspace: ws,
-                            index,
-                        },
-                    );
+                    self.select_tab_local(&ws, index);
                 }
             }
             b"(" | b")" => {
@@ -940,6 +1074,7 @@ impl App {
 
     fn split(&mut self, dir: Dir, argv: Vec<String>) {
         if let Some(p) = self.focused() {
+            self.hold_input = Some((Instant::now(), false));
             let spawn = self.spawn_here(argv);
             self.ui(
                 "split",
@@ -1129,6 +1264,7 @@ impl App {
                         return;
                     }
                     let spawn = self.spawn_here(argv);
+                    self.hold_input = Some((Instant::now(), false));
                     self.ui(
                         "new agent",
                         UiOp::NewTab {
@@ -1716,26 +1852,61 @@ fn edit_line(input: &mut String, key: &[u8]) {
     }
 }
 
-/// Length of the key starting at `b`: an escape sequence (CSI / SS3 / Alt-key), a UTF-8
-/// character, or one byte.
-pub fn key_len(b: &[u8]) -> usize {
-    if b.is_empty() {
-        return 0;
-    }
-    if b[0] == 0x1b && b.len() > 1 {
-        match b[1] {
-            b'[' => {
-                // CSI: parameters/intermediates then a final byte 0x40..=0x7e.
-                for (i, &c) in b.iter().enumerate().skip(2) {
-                    if (0x40..=0x7e).contains(&c) {
-                        return i + 1;
-                    }
-                }
-                return b.len();
+pub enum Token {
+    Key(Vec<u8>),
+    /// (raw bytes incl. markers, pasted text)
+    Paste(Vec<u8>, String),
+}
+
+const PASTE_START: &[u8] = b"\x1b[200~";
+const PASTE_END: &[u8] = b"\x1b[201~";
+const MAX_PASTE: usize = 4 << 20;
+
+/// The next complete token at the start of `b`, or `None` if `b` is an incomplete prefix
+/// (wait for more input).
+pub fn next_token(b: &[u8]) -> Option<(Token, usize)> {
+    if b.starts_with(PASTE_START) {
+        let body = &b[PASTE_START.len()..];
+        return match body.windows(PASTE_END.len()).position(|w| w == PASTE_END) {
+            Some(end) => {
+                let n = PASTE_START.len() + end + PASTE_END.len();
+                let text = String::from_utf8_lossy(&body[..end]).into_owned();
+                Some((Token::Paste(b[..n].to_vec(), text), n))
             }
-            b'O' if b.len() > 2 => return 3,
-            _ => return 2,
+            // A runaway paste (no end marker) is delivered as it is rather than buffered forever.
+            None if b.len() > MAX_PASTE => Some((
+                Token::Paste(b.to_vec(), String::from_utf8_lossy(body).into_owned()),
+                b.len(),
+            )),
+            None => None,
+        };
+    }
+    if PASTE_START.starts_with(b) && b.len() > 2 {
+        return None; // maybe the start of a paste marker
+    }
+    let n = complete_key_len(b)?;
+    Some((Token::Key(b[..n].to_vec()), n))
+}
+
+/// Length of a complete key at the start of `b`; `None` if it is cut off.
+fn complete_key_len(b: &[u8]) -> Option<usize> {
+    if b.is_empty() {
+        return None;
+    }
+    if b[0] == 0x1b {
+        if b.len() == 1 {
+            return None; // ESC alone: Escape key or start of a sequence — wait briefly
         }
+        return match b[1] {
+            b'[' => b
+                .iter()
+                .enumerate()
+                .skip(2)
+                .find(|(_, c)| (0x40..=0x7e).contains(*c))
+                .map(|(i, _)| i + 1),
+            b'O' => (b.len() > 2).then_some(3),
+            _ => Some(2),
+        };
     }
     let n = match b[0] {
         0xc0..=0xdf => 2,
@@ -1743,7 +1914,7 @@ pub fn key_len(b: &[u8]) -> usize {
         0xf0..=0xf7 => 4,
         _ => 1,
     };
-    n.min(b.len())
+    (b.len() >= n).then_some(n)
 }
 
 #[cfg(test)]
@@ -1751,14 +1922,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn keys_split_into_sequences() {
-        assert_eq!(key_len(b"\x1b[A rest"), 3);
-        assert_eq!(key_len(b"\x1b[1;5C"), 6);
-        assert_eq!(key_len(b"\x1bOA"), 3);
-        assert_eq!(key_len(b"\x1bx"), 2);
-        assert_eq!(key_len(b"\x1b"), 1);
-        assert_eq!(key_len("界x".as_bytes()), 3);
-        assert_eq!(key_len(b"ab"), 1);
+    fn decoder_waits_for_split_sequences_and_pastes() {
+        assert!(next_token(b"\x1b").is_none());
+        assert!(next_token(b"\x1b[").is_none());
+        assert!(next_token(b"\x1b[1;5").is_none());
+        assert!(next_token(&"界".as_bytes()[..2]).is_none());
+        assert!(next_token(b"\x1b[20").is_none(), "could be a paste start");
+        let Some((Token::Key(k), 3)) = next_token(b"\x1b[Ax") else {
+            panic!()
+        };
+        assert_eq!(k, b"\x1b[A");
+        assert!(
+            next_token(b"\x1b[200~line1\nline").is_none(),
+            "paste not finished"
+        );
+        let Some((Token::Paste(raw, text), n)) = next_token(b"\x1b[200~a\nb\x1b[201~rest") else {
+            panic!()
+        };
+        assert_eq!(text, "a\nb");
+        assert_eq!(n, raw.len());
+        assert!(raw.ends_with(b"\x1b[201~"));
     }
 
     #[test]

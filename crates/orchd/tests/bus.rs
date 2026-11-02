@@ -832,8 +832,12 @@ async fn msg(env: &Env, to: &str, text: &str) {
 async fn nudges_only_reach_idle_panes() {
     let mut env = Env::new("nudge");
     env.start(&[], false).await;
-    // An "agent" pane that just echoes what is typed (cat), seen as idle on screen.
-    let idle = new_pane(&env, &["cat"]).await;
+    // An "agent" pane showing an agent's idle prompt footer, then echoing input (cat).
+    let idle = new_pane(
+        &env,
+        &["sh", "-c", "printf '› \\n  ? for shortcuts\\n'; exec cat"],
+    )
+    .await;
     register_in_pane(&env, "idler", "codex", &idle).await;
     msg(&env, "idler", "wake up").await;
     let mut ok = false;
@@ -865,7 +869,11 @@ async fn nudges_only_reach_idle_panes() {
     );
 
     // An agent whose bus status says working is not nudged either.
-    let busy = new_pane(&env, &["cat"]).await;
+    let busy = new_pane(
+        &env,
+        &["sh", "-c", "printf '› \\n  ? for shortcuts\\n'; exec cat"],
+    )
+    .await;
     register_in_pane(&env, "busy", "codex", &busy).await;
     env.conn()
         .await

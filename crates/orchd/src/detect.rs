@@ -11,7 +11,10 @@ pub enum Detected {
     Working,
     /// Waiting for a decision: permission / approval / trust dialog, y/n prompt.
     Blocked,
+    /// The agent's own input prompt is on screen (positive match), nothing else going on.
     Idle,
+    /// An agent, but the screen matches neither working, blocked nor its idle prompt.
+    Unknown,
     /// The program has exited.
     Done,
 }
@@ -69,8 +72,20 @@ pub fn detect(screen: &str, kind: Option<&str>) -> Detected {
     if tail.contains("esc to interrupt") || tail.contains("ctrl+c to interrupt") {
         return Detected::Working;
     }
-    Detected::Idle
+    // Idle only on a positive sign of the agent's own prompt footer — never "by elimination"
+    // (an unrecognised dialog or a shell after the agent exited must not count as idle).
+    if IDLE.iter().any(|p| tail.contains(p)) {
+        return Detected::Idle;
+    }
+    Detected::Unknown
 }
+
+/// Footers both agents show only while waiting at their input prompt.
+const IDLE: &[&str] = &[
+    "for shortcuts",      // Claude "? for shortcuts", Codex "? for shortcuts"
+    "shift+tab to cycle", // Claude mode line
+    "⏵⏵",                 // Claude mode indicator
+];
 
 #[cfg(test)]
 mod tests {
@@ -95,6 +110,15 @@ mod tests {
             "● Done.\n✻ Baked for 1m 27s\n────\n❯ \n────\n  ⏵⏵ auto mode on (shift+tab to cycle)";
         assert_eq!(detect(claude_idle, Some("claude")), Detected::Idle);
         assert_eq!(detect("$ ls\nfoo", None), Detected::None);
+        // An agent pane showing something unrecognised is NOT idle.
+        assert_eq!(detect("murat@devbox:~$ ", Some("codex")), Detected::Unknown);
+        assert_eq!(
+            detect(
+                "Some new kind of dialog\n[ OK ]  [ Cancel ]",
+                Some("claude")
+            ),
+            Detected::Unknown
+        );
     }
 
     #[test]

@@ -30,14 +30,19 @@ async fn main() {
         kind: Mutex::new("agent".into()),
         inflight: Mutex::new(HashMap::new()),
     });
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Value>();
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Out>();
     let writer = tokio::spawn(async move {
         let mut stdout = tokio::io::stdout();
-        while let Some(v) = out_rx.recv().await {
+        while let Some((v, after)) = out_rx.recv().await {
             let mut line = serde_json::to_vec(&v).unwrap();
             line.push(b'\n');
             if stdout.write_all(&line).await.is_err() || stdout.flush().await.is_err() {
-                break;
+                break; // not delivered: its messages are NOT acknowledged
+            }
+            // Delivered to the client: now consume what it contained (inbox acks). If we
+            // die right here, the messages come again next time (at-least-once).
+            if let Some(req) = after {
+                let _ = request(req).await;
             }
         }
     });
@@ -47,7 +52,7 @@ async fn main() {
             continue;
         }
         let Ok(msg) = serde_json::from_str::<Value>(&line) else {
-            let _ = out_tx.send(rpc_error(Value::Null, -32700, "parse error"));
+            let _ = out_tx.send((rpc_error(Value::Null, -32700, "parse error"), None));
             continue;
         };
         handle(&state, &out_tx, msg);
@@ -68,7 +73,10 @@ fn rpc_error(id: Value, code: i64, message: &str) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
 }
 
-fn handle(state: &Arc<State>, out: &mpsc::UnboundedSender<Value>, msg: Value) {
+/// A JSON-RPC message for stdout, and a request to run once it has been written.
+type Out = (Value, Option<Request>);
+
+fn handle(state: &Arc<State>, out: &mpsc::UnboundedSender<Out>, msg: Value) {
     let method = msg["method"].as_str().unwrap_or("").to_string();
     let id = msg.get("id").cloned();
     match (method.as_str(), id) {
@@ -95,21 +103,24 @@ fn handle(state: &Arc<State>, out: &mpsc::UnboundedSender<Value>, msg: Value) {
                 .as_str()
                 .unwrap_or(PROTOCOL_VERSION)
                 .to_string();
-            let _ = out.send(rpc_result(
-                id,
-                json!({
-                    "protocolVersion": version,
-                    "capabilities": { "tools": {} },
-                    "serverInfo": { "name": "orch", "version": env!("CARGO_PKG_VERSION") },
-                    "instructions": INSTRUCTIONS,
-                }),
+            let _ = out.send((
+                rpc_result(
+                    id,
+                    json!({
+                        "protocolVersion": version,
+                        "capabilities": { "tools": {} },
+                        "serverInfo": { "name": "orch", "version": env!("CARGO_PKG_VERSION") },
+                        "instructions": INSTRUCTIONS,
+                    }),
+                ),
+                None,
             ));
         }
         ("ping", Some(id)) => {
-            let _ = out.send(rpc_result(id, json!({})));
+            let _ = out.send((rpc_result(id, json!({})), None));
         }
         ("tools/list", Some(id)) => {
-            let _ = out.send(rpc_result(id, json!({ "tools": tools() })));
+            let _ = out.send((rpc_result(id, json!({ "tools": tools() })), None));
         }
         ("tools/call", Some(id)) => {
             let key = id.to_string();
@@ -119,13 +130,17 @@ fn handle(state: &Arc<State>, out: &mpsc::UnboundedSender<Value>, msg: Value) {
                 let name = params["name"].as_str().unwrap_or("").to_string();
                 let args = params.get("arguments").cloned().unwrap_or(json!({}));
                 let kind = state2.kind.lock().unwrap().clone();
-                let result = match call_tool(&kind, &name, &args).await {
-                    Ok(text) => json!({ "content": [{ "type": "text", "text": text }] }),
-                    Err(e) => {
-                        json!({ "content": [{ "type": "text", "text": e }], "isError": true })
-                    }
+                let (result, after) = match call_tool(&kind, &name, &args).await {
+                    Ok((text, after)) => (
+                        json!({ "content": [{ "type": "text", "text": text }] }),
+                        after,
+                    ),
+                    Err(e) => (
+                        json!({ "content": [{ "type": "text", "text": e }], "isError": true }),
+                        None,
+                    ),
                 };
-                let _ = out2.send(rpc_result(id, result));
+                let _ = out2.send((rpc_result(id, result), after));
                 state2.inflight.lock().unwrap().remove(&key2);
             });
             state
@@ -141,7 +156,10 @@ fn handle(state: &Arc<State>, out: &mpsc::UnboundedSender<Value>, msg: Value) {
             }
         }
         (_, Some(id)) => {
-            let _ = out.send(rpc_error(id, -32601, &format!("unknown method {method}")));
+            let _ = out.send((
+                rpc_error(id, -32601, &format!("unknown method {method}")),
+                None,
+            ));
         }
         (_, None) => {} // other notifications
     }
@@ -282,7 +300,20 @@ fn fmt_question(q: &QuestionRow) -> String {
     }
 }
 
-async fn call_tool(kind: &str, name: &str, args: &Value) -> Result<String, String> {
+/// The tool's text, plus a request to run after that text reached the client.
+async fn call_tool(
+    kind: &str,
+    name: &str,
+    args: &Value,
+) -> Result<(String, Option<Request>), String> {
+    call_tool_inner(kind, name, args).await
+}
+
+async fn call_tool_inner(
+    kind: &str,
+    name: &str,
+    args: &Value,
+) -> Result<(String, Option<Request>), String> {
     let me = whoami(kind).await?;
     let str_arg = |k: &str| args[k].as_str().map(str::to_string);
     match name {
@@ -296,7 +327,7 @@ async fn call_tool(kind: &str, name: &str, args: &Value) -> Result<String, Strin
                 thread: str_arg("thread"),
             }))
             .await?;
-            Ok(format!("Sent (#{}) to {to}.", row["id"]))
+            Ok((format!("Sent (#{}) to {to}.", row["id"]), None))
         }
         "read_inbox" => {
             let wait = wait_ms(kind, args, 0);
@@ -307,16 +338,12 @@ async fn call_tool(kind: &str, name: &str, args: &Value) -> Result<String, Strin
             .await?;
             let rows: Vec<MessageRow> =
                 serde_json::from_value(v["messages"].clone()).map_err(|e| e.to_string())?;
-            // Consume only what we are about to return. If this task is cancelled before
-            // here, nothing was consumed and the next read_inbox returns the same messages.
-            if !rows.is_empty() {
-                request(Request::Ack {
-                    name: me,
-                    ids: rows.iter().map(|r| r.id).collect(),
-                })
-                .await?;
-            }
-            Ok(fmt_messages(&rows))
+            // Consumed only after the result was written to the client (see the writer).
+            let ack = (!rows.is_empty()).then(|| Request::Ack {
+                name: me,
+                ids: rows.iter().map(|r| r.id).collect(),
+            });
+            Ok((fmt_messages(&rows), ack))
         }
         "ask_human" => {
             let question = str_arg("question").ok_or("`question` is required")?;
@@ -341,7 +368,7 @@ async fn call_tool(kind: &str, name: &str, args: &Value) -> Result<String, Strin
             })
             .await?;
             let q: QuestionRow = serde_json::from_value(v).map_err(|e| e.to_string())?;
-            Ok(fmt_question(&q))
+            Ok((fmt_question(&q), None))
         }
         "wait_for_answer" => {
             let id = args["question_id"]
@@ -353,7 +380,7 @@ async fn call_tool(kind: &str, name: &str, args: &Value) -> Result<String, Strin
             })
             .await?;
             let q: QuestionRow = serde_json::from_value(v).map_err(|e| e.to_string())?;
-            Ok(fmt_question(&q))
+            Ok((fmt_question(&q), None))
         }
         "post_status" => {
             let status = str_arg("status").ok_or("`status` is required")?;
@@ -363,7 +390,7 @@ async fn call_tool(kind: &str, name: &str, args: &Value) -> Result<String, Strin
                 text: str_arg("text"),
             })
             .await?;
-            Ok(format!("Status of {me}: {status}."))
+            Ok((format!("Status of {me}: {status}."), None))
         }
         "list_agents" => {
             let v = request(Request::ListAgents {}).await?;
@@ -381,7 +408,7 @@ async fn call_tool(kind: &str, name: &str, args: &Value) -> Result<String, Strin
                 ));
             }
             out.push_str("\nMurat is \"murat\"; \"all\" reaches every agent.");
-            Ok(out)
+            Ok((out, None))
         }
         other => Err(format!("unknown tool {other}")),
     }

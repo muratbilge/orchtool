@@ -408,9 +408,18 @@ impl Bus {
             .collect();
         let options_json = serde_json::to_string(&options)?;
         let mut db = self.db.lock().unwrap();
+        // A retry of the same question returns the original: while it is open, and also once
+        // answered as long as the asker has not received that answer yet (its answer message
+        // is unread). Asking again after reading the answer is a deliberate new question.
         let existing: Option<i64> = db
             .query_row(
-                "SELECT id FROM questions WHERE sender = ?1 AND text = ?2 AND options = ?3 AND state = 'open'",
+                "SELECT q.id FROM questions q
+                 WHERE q.sender = ?1 AND q.text = ?2 AND q.options = ?3
+                   AND (q.state = 'open' OR EXISTS (
+                        SELECT 1 FROM messages m WHERE m.question = q.id AND m.kind = 'answer'
+                          AND NOT EXISTS (SELECT 1 FROM message_reads r
+                                          WHERE r.message = m.id AND r.agent = q.sender)))
+                 ORDER BY q.id DESC LIMIT 1",
                 params![from, text, options_json],
                 |r| r.get(0),
             )
@@ -814,6 +823,11 @@ mod tests {
         assert!(!won2);
         assert_eq!(q2.answer.as_deref(), Some("yes"));
         assert!(bus.questions(false).unwrap().is_empty());
+        // Retried before the asker read the answer: the original (answered) question.
+        let retry = bus
+            .ask(&a, "Deploy now?", &["yes".into(), "no".into()])
+            .unwrap();
+        assert_eq!((retry.id, retry.state.as_str()), (q.id, "answered"));
         let inbox = read_all(&bus, &a);
         assert_eq!(inbox.len(), 1, "exactly one answer message");
         assert_eq!(
