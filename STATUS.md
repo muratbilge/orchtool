@@ -1,5 +1,40 @@
 # Status
 
+## 2026-11-02 — Phase 3 (TUI + agent status) — code done, awaiting Codex review + Murat's day of use — Claude
+
+Phase-2 review (CODEX-REVIEW-P2-RESULT.md): all 9 findings fixed in 741d00a, each with a test
+(acked delivery, one-transaction state changes, identity by pane/instance, ordered rows, Telegram
+dedup/durable sync/sender auth, idempotent ask, compare-and-set nudges with pre-typing checks).
+
+Phase 3 built
+- Layout in orchd (orch-proto/src/layout.rs, orchd/src/ui.rs): workspaces → tabs → split tree, atomic
+  `ui.op` (new workspace/tab, split, close, focus, select tab, rename, resize, zoom); `orch new`
+  panes are placed by cwd; kill removes from the layout; detach/reattach keeps it.
+- `events.subscribe`: snapshot + changes (panes, session, agents, questions, messages).
+- Screen-based status (orchd/src/detect.rs): working ("esc to interrupt"), blocked (Claude
+  permission/trust, Codex approval, y/n), idle; agent kind from argv or from registration.
+- TUI = plain `orch` (crates/orch/src/tui.rs): ratatui, each visible pane an attach stream into a
+  local vt100 screen (views stay attached → instant tab switches), sidebar (workspaces + agents with
+  status), status bar (tabs, ⚑ needs-you count, working/idle counts, clock), overlays: help, workspace
+  list, needs-you (answer questions / jump to blocked agents), messages (@agent text), prompts.
+  Keys like herdr: prefix (Ctrl-b, $ORCH_PREFIX) + c v s h/j/k/l H/J/K/L x z n p 1-9 w ( ) N A , $ a m b t d ?
+- Remote: `orch --host H` opens ONE `ssh H orch proxy --mux`; all connections are channels in it
+  (orch-proto/src/mux.rs).
+
+Checks
+- `scripts/check.sh` → exit 0: proto 9 (layout 5, mux 1), orch 2, orchd unit 18, panes 10, ui 3,
+  bus 9, spike 3.
+- Live in a herdr test pane (ORCH_PREFIX=C-a): auto workspace, typing, split right/down, focus
+  h/l, new tab, tab select, zoom, help, `A claude` → detected ⚠ blocked on the trust dialog →
+  needs-you lists it → answered in the pane → ○ idle; detach + reopen keeps 3 tabs.
+- Remote through the mux (stand-in ssh): split + typing OK; one proxy process.
+- Bandwidth: a pane printing `seq 1 300000` (2.1 MB) while attached remotely → 37.5 KB over the
+  connection for the whole session (≈55× less; latest-state sync).
+
+Open / for Murat
+- Real-SSH comparison with herdr from the laptop (needs the install + laptop binary).
+- Acceptance: one day of `orch` instead of herdr.
+
 ## 2026-11-02 — Phase 2 GREEN (agent bus, ask_human, Telegram) — Claude
 
 Built
