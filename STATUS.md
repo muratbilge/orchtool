@@ -1,5 +1,19 @@
 # Status
 
+
+## 2026-11-02 — Dev release installed (Murat's OK) — Claude
+
+- `scripts/install.sh`: orchd, orch, orch-mcp 0.1.0 (release) in ~/.local/bin; real orchd running on the
+  default socket (pong 0.24 ms).
+- Claude: `claude mcp add -s user orch ~/.local/bin/orch-mcp` (✔ Connected); `orch hook` on SessionStart,
+  UserPromptSubmit, PreToolUse, PostToolUse, Notification, Stop in ~/.claude/settings.json (timeout 5 s,
+  `|| true`, silent without orchd).
+- Codex: `[mcp_servers.orch]` with `env_vars = ["ORCH_PANE", "HERDR_PANE_ID"]` in ~/.codex/config.toml
+  (`codex mcp list` shows it enabled).
+- Backups: ~/.claude/settings.json, ~/.claude.json, ~/.codex/config.toml → `*.bak-orch-20261102-231148`.
+- No laptop binary: Murat reaches DevBox from the phone via Kabuk (phase 4).
+- Rollback: `claude mcp remove orch -s user`, restore the three backups.
+
 ## 2026-11-02 — Phase 3 review fixes (CODEX-REVIEW-P3-RESULT.md, 13 findings) — Claude
 
 All fixed: (1) orch-mcp acks inbox rows only after the result was written+flushed to the client;
