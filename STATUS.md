@@ -1,6 +1,34 @@
 # Status
 
 
+
+## 2026-11-03 — Phase 4 code done: Kabuk ↔ orchtool (Claude; Codex reviewed)
+
+orchtool (`89e23d6`, fixes `5cdcce0`, check green, installed):
+- `orch watch --json`: one JSON line per change — agents (bus joined with orch panes/layout, unregistered agent
+  panes, dead panes/stale MCP agents dropped), dialog screens of blocked agents, open questions, timeline tail;
+  events as hints, 10 s request timeout, 15 s refresh, 60 s heartbeat, error line + 5 s retry, exits on stdin EOF.
+- `orch focus` (`UiOp::Raise`, `Session.raised`): open TUIs switch to that workspace.
+- `orch read --hash` / `orch send --expect`: orchd checks the screen and sends under the terminal lock and
+  answers each screen state once (30 s) — first answer wins across phone/TUI/CLI. herdr panes: best effort.
+- `orch answer --literal --by`, `orch read/send herdr:ID`, `--host` refused where it would act locally.
+- Review leftovers from phase 3 closed: answer marked read after the MCP delivered it; mux teardown cancels
+  stuck bridges/connects; TUI holds keys for a still-attaching view and drops them after 3 s (fail closed).
+
+Kabuk 0.5.0 (22) (`/projects/kabuk`: `5d7bcbf` updater, `2e89041` live log — Sonnet subagent; `e2b2b6a`
+orch backend, `cbc617a` review fixes — Claude): 66 unit tests, 0 failures.
+- Server "Start with: orch" runs the orch TUI; agents panel from `orch watch`: Asks you (option buttons +
+  Reply…), Comms timeline + Message…, dialog answers, New agent in an orch pane, notifications with answer
+  buttons for bus questions.
+- In-app updater (signed update.json, own RSA key ~/.android-keys/kabuk-update-manifest.pem, APK cert = debug
+  keystore as before) via the relay server /apk/kabuk/; live log → container kabuk-logsink :8792
+  (`scripts/livelog`), Settings → Diagnostics switch, on by default.
+- Live-tested here with Kabuk's exact shell commands in a bare env (quoting, first-answer-wins, exit 4 for a
+  missing folder, literal numeric answers, stale-hash refusal). Not yet on the phone.
+
+Open: one-time bootstrap install of 0.5.0 (0.4.4 has no updater); phone test; phase-3 nudge race remains
+documented (screen-based, fail closed).
+
 ## 2026-11-02 — Dev release installed (Murat's OK) — Claude
 
 - `scripts/install.sh`: orchd, orch, orch-mcp 0.1.0 (release) in ~/.local/bin; real orchd running on the
