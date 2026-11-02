@@ -595,6 +595,12 @@ impl App {
             return;
         }
         let Some(pane) = self.focused() else { return };
+        if !self.views.contains_key(&pane) {
+            // A tab/pane just selected whose view is still attaching: keep the keys for it.
+            self.held.extend_from_slice(&bytes);
+            self.hold_input = Some((Instant::now(), true));
+            return;
+        }
         if let Some(v) = self.views.get(&pane) {
             if v.role == Role::Observer {
                 let _ = v.tx.send(Request::Takeover {});
@@ -615,18 +621,23 @@ impl App {
         self.try_release_input();
     }
 
-    /// Deliver held keys once the op replied and the focused pane has a view (or give up
-    /// waiting after 3 s).
+    /// Deliver held keys once the op replied and the focused pane has a view. After 3 s
+    /// without that they are dropped (fail closed): they must not land in another pane.
     fn try_release_input(&mut self) {
         let Some((since, op_done)) = self.hold_input else {
             return;
         };
         let ready = self.focused().is_some_and(|p| self.views.contains_key(&p));
-        if (op_done && ready) || since.elapsed() > Duration::from_secs(3) {
+        if op_done && ready {
             self.hold_input = None;
             let held = std::mem::take(&mut self.held);
             if !held.is_empty() {
                 self.send_input(held);
+            }
+        } else if since.elapsed() > Duration::from_secs(3) {
+            self.hold_input = None;
+            if !std::mem::take(&mut self.held).is_empty() {
+                self.flash("keys typed while the pane was opening were dropped".to_string());
             }
         }
     }

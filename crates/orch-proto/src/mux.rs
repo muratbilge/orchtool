@@ -14,7 +14,7 @@ use std::io;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 const OPEN: u8 = 1;
 const DATA: u8 = 2;
@@ -97,13 +97,24 @@ async fn deliver(chans: &Chans, out: &mpsc::Sender<Vec<u8>>, chan: u32, payload:
     }
 }
 
+/// Resolves once the transport is torn down (`true` sent, or the sender dropped).
+async fn stopped(stop: &mut watch::Receiver<bool>) {
+    while !*stop.borrow_and_update() {
+        if stop.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
 /// Bridge one channel to a local byte stream: its reads become DATA frames, incoming DATA
-/// is written to it, EOF on either side becomes CLOSE.
+/// is written to it, EOF on either side becomes CLOSE. Transport teardown (`stop`) ends it
+/// even in the middle of a blocked write, and closes the local stream.
 fn bridge(
     chan: u32,
     stream: impl AsyncRead + AsyncWrite + Unpin + Send + 'static,
     out: mpsc::Sender<Vec<u8>>,
     mut incoming: mpsc::Receiver<Vec<u8>>,
+    mut stop: watch::Receiver<bool>,
     on_done: impl FnOnce() + Send + 'static,
 ) {
     let (mut r, mut w) = tokio::io::split(stream);
@@ -126,8 +137,22 @@ fn bridge(
     tokio::spawn(async move {
         // Ends when the remote side closes the channel or the whole transport goes away
         // (every sender is dropped on teardown).
-        while let Some(data) = incoming.recv().await {
-            if w.write_all(&data).await.is_err() || w.flush().await.is_err() {
+        loop {
+            let data = tokio::select! {
+                d = incoming.recv() => match d {
+                    Some(d) => d,
+                    None => break,
+                },
+                _ = stopped(&mut stop) => break,
+            };
+            let wrote = tokio::select! {
+                r = async {
+                    w.write_all(&data).await?;
+                    w.flush().await
+                } => r.is_ok(),
+                _ = stopped(&mut stop) => false,
+            };
+            if !wrote {
                 break;
             }
         }
@@ -152,6 +177,7 @@ where
     let out = spawn_writer(output);
     let chans: Chans = Arc::default();
     let connect = Arc::new(connect);
+    let (stop_tx, stop_rx) = watch::channel(false);
     let result = loop {
         let frame = match read_frame(&mut input).await {
             Ok(Some(f)) => f,
@@ -164,11 +190,16 @@ where
                 let (tx, rx) = mpsc::channel(CHAN_QUEUE);
                 chans.lock().unwrap().insert(chan, tx);
                 let (out, chans, connect) = (out.clone(), Arc::clone(&chans), Arc::clone(&connect));
+                let mut stop = stop_rx.clone();
                 tokio::spawn(async move {
-                    match connect().await {
+                    let connected = tokio::select! {
+                        c = connect() => c,
+                        _ = stopped(&mut stop) => return,
+                    };
+                    match connected {
                         Ok(stream) => {
                             let chans2 = Arc::clone(&chans);
-                            bridge(chan, stream, out, rx, move || {
+                            bridge(chan, stream, out, rx, stop, move || {
                                 chans2.lock().unwrap().remove(&chan);
                             })
                         }
@@ -187,8 +218,10 @@ where
         }
     };
     // Transport gone (EOF or error): close every channel, so every orchd connection ends
-    // and releases what it holds (e.g. pane control).
+    // and releases what it holds (e.g. pane control) — also bridges stuck in a write and
+    // connects still in progress.
     chans.lock().unwrap().clear();
+    let _ = stop_tx.send(true);
     result
 }
 
@@ -197,6 +230,7 @@ where
 pub struct MuxClient {
     out: mpsc::Sender<Vec<u8>>,
     chans: Chans,
+    stop: watch::Receiver<bool>,
     next: Arc<AtomicU32>,
 }
 
@@ -208,6 +242,7 @@ impl MuxClient {
         let out = spawn_writer(output);
         let chans: Chans = Arc::default();
         let (chans2, out2) = (Arc::clone(&chans), out.clone());
+        let (stop_tx, stop) = watch::channel(false);
         tokio::spawn(async move {
             let mut input = input;
             while let Ok(Some((ty, chan, payload))) = read_frame(&mut input).await {
@@ -221,10 +256,12 @@ impl MuxClient {
             }
             // The transport is gone: close every channel.
             chans2.lock().unwrap().clear();
+            let _ = stop_tx.send(true);
         });
         Self {
             out,
             chans,
+            stop,
             next: Arc::new(AtomicU32::new(1)),
         }
     }
@@ -239,9 +276,16 @@ impl MuxClient {
         })?;
         let (app, mux_side) = tokio::io::duplex(256 * 1024);
         let chans = Arc::clone(&self.chans);
-        bridge(chan, mux_side, self.out.clone(), rx, move || {
-            chans.lock().unwrap().remove(&chan);
-        });
+        bridge(
+            chan,
+            mux_side,
+            self.out.clone(),
+            rx,
+            self.stop.clone(),
+            move || {
+                chans.lock().unwrap().remove(&chan);
+            },
+        );
         let (r, w) = tokio::io::split(app);
         let r: BoxRead = Box::new(r);
         let w: BoxWrite = Box::new(w);

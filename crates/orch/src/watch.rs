@@ -19,6 +19,7 @@ const COALESCE: Duration = Duration::from_millis(150);
 const REFRESH: Duration = Duration::from_secs(15);
 const HEARTBEAT: Duration = Duration::from_secs(60);
 const RETRY: Duration = Duration::from_secs(5);
+const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Agents without a live pane disappear from the phone after this long without a sign of life.
 const STALE_MS: i64 = 6 * 3600 * 1000;
 const TIMELINE: usize = 40;
@@ -65,7 +66,9 @@ fn line(s: &str) {
 async fn watch(socket: &Path, once: bool, last: &mut String) -> Result<()> {
     let mut req = Conn::unix(socket).await.context("orchd is not running")?;
     if once {
-        let s = snapshot(&mut req).await?;
+        let s = tokio::time::timeout(SNAPSHOT_TIMEOUT, snapshot(&mut req))
+            .await
+            .context("orchd did not answer")??;
         line(&s);
         return Ok(());
     }
@@ -86,9 +89,15 @@ async fn watch(socket: &Path, once: bool, last: &mut String) -> Result<()> {
     let result = loop {
         tokio::time::sleep(COALESCE).await;
         while rx.try_recv().is_ok() {}
-        let s = match snapshot(&mut req).await {
-            Ok(s) => s,
-            Err(e) => break Err(e),
+        // A daemon that stops answering must not freeze the phone's view: error out and retry.
+        let s = match tokio::time::timeout(SNAPSHOT_TIMEOUT, snapshot(&mut req)).await {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => break Err(e),
+            Err(_) => {
+                break Err(anyhow::anyhow!(
+                    "orchd did not answer within {SNAPSHOT_TIMEOUT:?}"
+                ))
+            }
         };
         if s != *last || beat.elapsed() >= HEARTBEAT {
             line(&s);
@@ -313,6 +322,12 @@ pub(crate) async fn herdr(args: &[&str]) -> Option<String> {
         .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// Recent text of a herdr pane (what `orch read herdr:ID` prints and hashes).
+pub(crate) async fn herdr_read(id: &str, lines: usize) -> Option<String> {
+    let n = lines.to_string();
+    herdr(&["pane", "read", id, "--source", "recent", "--lines", &n]).await
+}
+
 /// The ids of herdr's live panes; None when herdr can't be asked.
 async fn herdr_panes() -> Option<HashSet<String>> {
     let v: Value = serde_json::from_str(herdr(&["pane", "list"]).await?.trim()).ok()?;
@@ -328,8 +343,7 @@ async fn herdr_panes() -> Option<HashSet<String>> {
 /// Recent text of a pane given as `orch:pN`, `pN` or `herdr:ID`.
 pub(crate) async fn read_pane(c: &mut Conn, pane: &str, lines: usize) -> Option<String> {
     if let Some(id) = pane.strip_prefix("herdr:") {
-        let n = lines.to_string();
-        return herdr(&["pane", "read", id, "--source", "recent", "--lines", &n]).await;
+        return herdr_read(id, lines).await;
     }
     let id = pane.strip_prefix("orch:").unwrap_or(pane);
     let v = c

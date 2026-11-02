@@ -249,11 +249,65 @@ async fn send_with_enter_reaches_the_program() {
         pane: id.clone(),
         text: "hello cat".into(),
         enter: true,
+        ..Default::default()
     }))
     .await
     .unwrap();
     let t = wait_for_text(&mut c, &id, "hello cat\nhello cat").await;
     assert!(t.starts_with("hello cat"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn conditional_send_answers_a_screen_once() {
+    let d = daemon().await;
+    let mut c = Conn::unix(&d.socket).await.unwrap();
+    let id = new_pane(
+        &mut c,
+        &[
+            "sh",
+            "-c",
+            "printf 'Proceed?\\n 1. Yes\\n 2. No\\n'; exec cat",
+        ],
+        10,
+        40,
+    )
+    .await;
+    wait_for_text(&mut c, &id, "2. No").await;
+    let v = c
+        .request(&Request::Read(orch_proto::api::ReadPane {
+            pane: id.clone(),
+            lines: Some(60),
+            source: orch_proto::api::ReadSource::Recent,
+        }))
+        .await
+        .unwrap();
+    let hash = v["hash"].as_str().unwrap().to_string();
+    let send = |text: &str, expect: &str| {
+        Request::Send(SendPane {
+            pane: id.clone(),
+            text: text.into(),
+            expect: Some(expect.into()),
+            expect_lines: Some(60),
+            ..Default::default()
+        })
+    };
+    // A stale hash is refused; the right one goes through once; the same screen again is refused.
+    let e = c.request(&send("1", "0000000000000000")).await.unwrap_err();
+    assert!(e.to_string().contains("changed"), "{e}");
+    c.request(&send("1", &hash)).await.unwrap();
+    let mut other = Conn::unix(&d.socket).await.unwrap();
+    let e = other.request(&send("2", &hash)).await.unwrap_err();
+    assert!(
+        e.to_string().contains("changed") || e.to_string().contains("answered"),
+        "{e}"
+    );
+    wait_for_text(&mut c, &id, "2. No\n1").await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let t = read(&mut c, &id, ReadSource::Recent).await;
+    assert!(
+        !t.contains("12"),
+        "the second answer must not arrive: {t:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -286,6 +340,7 @@ async fn two_clients_mirror_and_detach_keeps_state() {
         pane: id.clone(),
         text: "while detached".into(),
         enter: true,
+        ..Default::default()
     }))
     .await
     .unwrap();
@@ -473,6 +528,7 @@ async fn input_is_bounded_when_the_program_does_not_read() {
                 pane: id.clone(),
                 text: chunk.clone(),
                 enter: false,
+                ..Default::default()
             }))
             .await;
         if let Err(orch_proto::client::ClientError::Remote(e)) = r {

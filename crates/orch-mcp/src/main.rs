@@ -300,6 +300,18 @@ fn fmt_question(q: &QuestionRow) -> String {
     }
 }
 
+/// A question's state for the agent. Once answered, the answer counts as received only after
+/// this text reached the client (then asking the same question again is a new question).
+fn answered(me: &str, v: Value) -> Result<(String, Option<Request>), String> {
+    let mid = v["answer_message"].as_i64();
+    let q: QuestionRow = serde_json::from_value(v).map_err(|e| e.to_string())?;
+    let ack = mid.filter(|_| q.state == "answered").map(|m| Request::Ack {
+        name: me.to_string(),
+        ids: vec![m],
+    });
+    Ok((fmt_question(&q), ack))
+}
+
 /// The tool's text, plus a request to run after that text reached the client.
 async fn call_tool(
     kind: &str,
@@ -356,7 +368,7 @@ async fn call_tool_inner(
                 })
                 .unwrap_or_default();
             let q = request(Request::Ask {
-                from: me,
+                from: me.clone(),
                 text: question,
                 options,
             })
@@ -367,8 +379,7 @@ async fn call_tool_inner(
                 wait_ms: Some(wait_ms(kind, args, 600)),
             })
             .await?;
-            let q: QuestionRow = serde_json::from_value(v).map_err(|e| e.to_string())?;
-            Ok((fmt_question(&q), None))
+            answered(&me, v)
         }
         "wait_for_answer" => {
             let id = args["question_id"]
@@ -379,8 +390,7 @@ async fn call_tool_inner(
                 wait_ms: Some(wait_ms(kind, args, 600)),
             })
             .await?;
-            let q: QuestionRow = serde_json::from_value(v).map_err(|e| e.to_string())?;
-            Ok((fmt_question(&q), None))
+            answered(&me, v)
         }
         "post_status" => {
             let status = str_arg("status").ok_or("`status` is required")?;

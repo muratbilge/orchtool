@@ -168,10 +168,10 @@ pub async fn questions(conn: &mut Conn, all: bool) -> Result<()> {
     Ok(())
 }
 
-pub async fn answer(conn: &mut Conn, id: i64, text: &str, by: &str) -> Result<()> {
-    // A bare number picks that option.
+pub async fn answer(conn: &mut Conn, id: i64, text: &str, by: &str, literal: bool) -> Result<()> {
+    // A bare number picks that option (unless --literal).
     let mut text = text.to_string();
-    if let Ok(n) = text.trim().parse::<usize>() {
+    if let (false, Ok(n)) = (literal, text.trim().parse::<usize>()) {
         let v = conn.request(&Request::ListQuestions { all: true }).await?;
         let rows: Vec<QuestionRow> = serde_json::from_value(v["questions"].clone())?;
         if let Some(opt) = rows

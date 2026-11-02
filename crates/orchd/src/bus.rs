@@ -318,6 +318,18 @@ impl Bus {
         Ok(rows)
     }
 
+    /// The timeline row that carries question `id`'s answer (None while open).
+    pub fn answer_message(&self, id: i64) -> Result<Option<i64>> {
+        let db = self.db.lock().unwrap();
+        Ok(db
+            .query_row(
+                "SELECT id FROM messages WHERE question = ?1 AND kind = 'answer' ORDER BY id LIMIT 1",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
     /// Mark delivered messages read (idempotent).
     pub fn ack(&self, name: &str, ids: &[i64]) -> Result<usize> {
         let name = normalize_name(name);

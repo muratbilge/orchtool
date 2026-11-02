@@ -7,7 +7,7 @@ use base64::Engine as _;
 use orch_proto::api::{AttachMode, AttachPane, NewPane, ReadSource, Request, Role, Stream};
 use orch_proto::client::{FrameReader, FrameWriter};
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -19,6 +19,8 @@ use tokio::time::Instant;
 pub const FRAME_INTERVAL: Duration = Duration::from_millis(40);
 /// Pause between typed text and the Enter key in `pane.send` (and nudges).
 pub const ENTER_DELAY_MS: u64 = 250;
+/// How long a conditional send's screen state counts as answered.
+const ANSWERED_FOR: Duration = Duration::from_secs(30);
 
 pub struct Daemon {
     pub bus: Arc<Bus>,
@@ -26,6 +28,8 @@ pub struct Daemon {
     pub(crate) ui_events: tokio::sync::broadcast::Sender<crate::ui::UiEvent>,
     panes: Mutex<BTreeMap<u64, Arc<Pane>>>,
     next_pane: AtomicU64,
+    /// Conditional sends that went through: pane → (screen hash, when). First answer wins.
+    answered: Mutex<HashMap<String, (String, Instant)>>,
     pub scrollback: usize,
     pub shutdown: Notify,
 }
@@ -55,6 +59,7 @@ impl Daemon {
             ui_events: tokio::sync::broadcast::channel(256).0,
             panes: Mutex::new(BTreeMap::new()),
             next_pane: AtomicU64::new(1),
+            answered: Mutex::new(HashMap::new()),
             scrollback,
             shutdown: Notify::new(),
         })
@@ -173,7 +178,8 @@ impl Daemon {
                     ReadSource::Visible => term.visible_text(),
                     ReadSource::Recent => term.recent_text(r.lines.unwrap_or(200)),
                 };
-                Ok(json!({ "pane": pane.id, "text": text }))
+                let hash = orch_proto::api::text_hash(&text);
+                Ok(json!({ "pane": pane.id, "text": text, "hash": hash }))
             }
             Request::Send(s) => {
                 let pane = self.find(&s.pane)?;
@@ -181,7 +187,24 @@ impl Daemon {
                     return Err(err("exited", "pane has exited"));
                 }
                 let full = || err("input_full", "the program is not reading its input");
-                if !s.text.is_empty() && !pane.write(s.text.into_bytes()) {
+                if let Some(expect) = &s.expect {
+                    // Check and send under the terminal lock: the screen can't change in between.
+                    let mut term = pane.term.lock().unwrap();
+                    let now =
+                        orch_proto::api::text_hash(&term.recent_text(s.expect_lines.unwrap_or(60)));
+                    if &now != expect {
+                        return Err(err("changed", "the pane's screen changed: not sent"));
+                    }
+                    let mut answered = self.answered.lock().unwrap();
+                    answered.retain(|_, (_, t)| t.elapsed() < ANSWERED_FOR);
+                    if answered.get(&pane.id).is_some_and(|(h, _)| h == expect) {
+                        return Err(err("answered", "this screen was already answered"));
+                    }
+                    if !s.text.is_empty() && !pane.write(s.text.clone().into_bytes()) {
+                        return Err(full());
+                    }
+                    answered.insert(pane.id.clone(), (expect.clone(), Instant::now()));
+                } else if !s.text.is_empty() && !pane.write(s.text.into_bytes()) {
                     return Err(full());
                 }
                 if s.enter {
@@ -262,7 +285,11 @@ impl Daemon {
             Request::AskWait { id, wait_ms } => {
                 let wait = Duration::from_millis(wait_ms.unwrap_or(0).min(3_600_000));
                 let q = self.bus.ask_wait(id, wait).await.map_err(bus_err)?;
-                Ok(serde_json::to_value(q).unwrap())
+                // Lets the asker mark the answer received once it really got it.
+                let answer_message = self.bus.answer_message(id).map_err(bus_err)?;
+                let mut v = serde_json::to_value(q).unwrap();
+                v["answer_message"] = json!(answer_message);
+                Ok(v)
             }
             Request::Answer { id, answer, by } => {
                 let (won, q) = self.bus.answer(id, &answer, &by).map_err(bus_err)?;

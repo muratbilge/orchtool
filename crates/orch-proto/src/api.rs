@@ -328,7 +328,7 @@ pub struct ReadPane {
     pub source: ReadSource,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SendPane {
     pub pane: String,
     #[serde(default)]
@@ -336,6 +336,24 @@ pub struct SendPane {
     /// Press Enter (CR) after the text, after a short pause so TUIs don't treat it as paste.
     #[serde(default)]
     pub enter: bool,
+    /// Conditional send (answering a dialog): only if the pane's recent text still has this
+    /// `hash` (from `pane.read`), checked and sent atomically; and each screen state is
+    /// answered once, so a second client's answer to the same dialog is refused.
+    #[serde(default)]
+    pub expect: Option<String>,
+    /// Lines the `expect` hash covers (as in the read that produced it; default 60).
+    #[serde(default)]
+    pub expect_lines: Option<usize>,
+}
+
+/// The hash `pane.read` reports and `pane.send` `expect` checks (FNV-1a 64, hex).
+pub fn text_hash(text: &str) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in text.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{h:016x}")
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

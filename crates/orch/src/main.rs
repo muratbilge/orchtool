@@ -75,6 +75,12 @@ enum Cmd {
         /// Key to press after the text: Enter Escape Tab BSpace Up Down Left Right C-c C-d … (repeatable)
         #[arg(long = "key")]
         keys: Vec<String>,
+        /// Only if the screen still has this hash (from `orch read --hash`, same --lines); a
+        /// screen state is answered once (first answer wins)
+        #[arg(long)]
+        expect: Option<String>,
+        #[arg(long, default_value_t = 60)]
+        lines: usize,
     },
     /// Print a pane's text
     Read {
@@ -84,6 +90,9 @@ enum Cmd {
         /// Only the visible screen
         #[arg(long)]
         visible: bool,
+        /// First line `hash:<h>` for a later `orch send --expect <h>`
+        #[arg(long)]
+        hash: bool,
     },
     /// Kill a pane's program (or remove an exited pane)
     Kill { pane: String },
@@ -161,6 +170,9 @@ enum Cmd {
         /// Who answers (shown in the timeline)
         #[arg(long, default_value = "cli")]
         by: String,
+        /// The text is the answer as is (a number is not an option index)
+        #[arg(long)]
+        literal: bool,
     },
     /// Ask Murat a question from a script/shell agent and wait for the answer
     Ask {
@@ -205,6 +217,7 @@ async fn main() {
 
 async fn run(cli: Cli) -> Result<()> {
     let socket = cli.socket.clone().unwrap_or_else(default_socket_path);
+    let cli_host = cli.host.clone();
     let connector = Connector::new(socket.clone(), cli.host.clone());
     let cmd = match cli.cmd {
         None | Some(Cmd::Ui) => return tui::run(connector).await,
@@ -214,17 +227,30 @@ async fn run(cli: Cli) -> Result<()> {
     if let Cmd::Proxy { mux } = cli.cmd {
         return proxy(&socket, mux).await;
     }
+    let herdr_pane = match &cli.cmd {
+        Cmd::Read { pane, .. } | Cmd::Send { pane, .. } => pane.starts_with("herdr:"),
+        _ => false,
+    };
+    if cli_host.is_some() && (herdr_pane || matches!(cli.cmd, Cmd::Watch { .. })) {
+        anyhow::bail!(
+            "--host is not supported for `orch watch` or herdr panes: run it there (ssh HOST orch …)"
+        );
+    }
     if let Cmd::Watch { once, .. } = cli.cmd {
         return watch::run(&socket, once).await;
     }
     // herdr panes (as agents on the bus name them) are read and typed into through herdr.
     match &cli.cmd {
-        Cmd::Read { pane, lines, .. } if pane.starts_with("herdr:") => {
-            let n = lines.to_string();
+        Cmd::Read {
+            pane, lines, hash, ..
+        } if pane.starts_with("herdr:") => {
             let id = &pane["herdr:".len()..];
-            let text = watch::herdr(&["pane", "read", id, "--source", "recent", "--lines", &n])
+            let text = watch::herdr_read(id, *lines)
                 .await
                 .context("herdr pane read failed")?;
+            if *hash {
+                println!("hash:{}", orch_proto::api::text_hash(&text));
+            }
             print!("{text}");
             return Ok(());
         }
@@ -233,8 +259,19 @@ async fn run(cli: Cli) -> Result<()> {
             text,
             enter,
             keys,
+            expect,
+            lines,
         } if pane.starts_with("herdr:") => {
             let id = &pane["herdr:".len()..];
+            // Best effort for herdr: re-read and compare right before typing (not atomic).
+            if let Some(expect) = expect {
+                let now = watch::herdr_read(id, *lines)
+                    .await
+                    .context("herdr pane read failed")?;
+                if &orch_proto::api::text_hash(&now) != expect {
+                    anyhow::bail!("the pane's screen changed: not sent");
+                }
+            }
             if let Some(t) = text {
                 watch::herdr(&["pane", "send-text", id, t])
                     .await
@@ -346,6 +383,8 @@ async fn run(cli: Cli) -> Result<()> {
             text,
             enter,
             keys,
+            expect,
+            lines,
         } => {
             let mut text = text.unwrap_or_default();
             for k in &keys {
@@ -355,6 +394,8 @@ async fn run(cli: Cli) -> Result<()> {
                 pane: strip_orch(pane),
                 text,
                 enter,
+                expect_lines: expect.is_some().then_some(lines),
+                expect,
             }))
             .await?;
         }
@@ -362,6 +403,7 @@ async fn run(cli: Cli) -> Result<()> {
             pane,
             lines,
             visible,
+            hash,
         } => {
             let v = conn
                 .request(&Request::Read(ReadPane {
@@ -374,6 +416,9 @@ async fn run(cli: Cli) -> Result<()> {
                     },
                 }))
                 .await?;
+            if hash {
+                println!("hash:{}", v["hash"].as_str().unwrap_or_default());
+            }
             println!("{}", v["text"].as_str().unwrap_or_default());
         }
         Cmd::Kill { pane } => {
@@ -409,7 +454,12 @@ async fn run(cli: Cli) -> Result<()> {
         Cmd::Msg { to, text, from } => bus::msg(&mut conn, &from, &to, &text.join(" ")).await?,
         Cmd::Inbox { name, wait, peek } => bus::inbox(&mut conn, &name, wait, peek).await?,
         Cmd::Questions { all } => bus::questions(&mut conn, all).await?,
-        Cmd::Answer { id, text, by } => bus::answer(&mut conn, id, &text.join(" "), &by).await?,
+        Cmd::Answer {
+            id,
+            text,
+            by,
+            literal,
+        } => bus::answer(&mut conn, id, &text.join(" "), &by, literal).await?,
         Cmd::Ask {
             text,
             from,
