@@ -169,7 +169,8 @@ async fn snapshot(c: &mut Conn) -> Result<String> {
             screens.insert(pane.to_string(), Value::String(text));
         }
     }
-    Ok(compose(list, &questions, screens, &timeline).to_string())
+    let workspaces = workspaces(&session, &panes);
+    Ok(compose(list, &questions, screens, &timeline, workspaces).to_string())
 }
 
 /// The watch line from its parts: agents (from `merge`) sorted blocked-first, the open questions,
@@ -179,6 +180,7 @@ fn compose(
     questions: &[QuestionRow],
     screens: serde_json::Map<String, Value>,
     timeline: &[MessageRow],
+    workspaces: Vec<Value>,
 ) -> Value {
     let hashes: serde_json::Map<String, Value> = screens
         .iter()
@@ -206,7 +208,72 @@ fn compose(
         "hashes": hashes,
         "screens": screens,
         "timeline": timeline,
+        "workspaces": workspaces,
     })
+}
+
+/// Most urgent status among panes: blocked > working > idle; None without agents.
+fn worst<'a>(statuses: impl Iterator<Item = Option<&'a str>>) -> Option<&'a str> {
+    let mut best: Option<&str> = None;
+    for s in statuses.flatten() {
+        match s {
+            "blocked" => return Some("blocked"),
+            "working" => best = Some("working"),
+            "idle" if best.is_none() => best = Some("idle"),
+            _ => {}
+        }
+    }
+    best
+}
+
+/// The layout for the phone's workspace bar: workspaces in orchd's order with their tabs (by
+/// id, so a tab closed meanwhile can't shift a tap onto another), each with the agents' most
+/// urgent status, and which workspace the TUI shows (the last raise).
+fn workspaces(session: &Session, panes: &[PaneInfo]) -> Vec<Value> {
+    let status: HashMap<&str, Option<&str>> = panes
+        .iter()
+        .map(|p| (p.id.as_str(), p.agent_status.as_deref()))
+        .collect();
+    let shown = session
+        .raised
+        .as_ref()
+        .map(|r| r.workspace.as_str())
+        .or_else(|| session.workspaces.first().map(|w| w.id.as_str()));
+    session
+        .workspaces
+        .iter()
+        .enumerate()
+        .map(|(i, w)| {
+            let tabs: Vec<Value> = w
+                .tabs
+                .iter()
+                .enumerate()
+                .map(|(ti, t)| {
+                    let ps = t.root.panes();
+                    json!({
+                        "index": ti,
+                        "id": t.id,
+                        "label": t.label,
+                        "panes": ps.iter().map(|p| format!("orch:{p}")).collect::<Vec<_>>(),
+                        "focus": if t.focus.is_empty() { Value::Null } else { json!(format!("orch:{}", t.focus)) },
+                        "zoomed": t.zoomed,
+                        "status": worst(ps.iter().map(|p| status.get(p.as_str()).copied().flatten())),
+                    })
+                })
+                .collect();
+            let all = w.tabs.iter().flat_map(|t| t.root.panes()).collect::<Vec<_>>();
+            json!({
+                "id": w.id,
+                "number": i + 1,
+                "label": w.label,
+                "cwd": w.cwd,
+                "status": worst(all.iter().map(|p| status.get(p.as_str()).copied().flatten())),
+                "shown": shown == Some(w.id.as_str()),
+                "active_tab": w.active_tab.min(w.tabs.len().saturating_sub(1)),
+                "tabs": tabs,
+            })
+        })
+        .collect()
 }
 
 fn order(s: &str) -> u8 {
@@ -534,7 +601,11 @@ mod tests {
             "orch:p1".into(),
             Value::String(" ❯ 1. Yes\n   2. No".into()),
         );
-        let line = compose(list, &[question], screens, &[row]);
+        let ws = workspaces(
+            &session_p1(),
+            &[pane("p1", Some("claude"), Some("blocked"))],
+        );
+        let line = compose(list, &[question], screens, &[row], ws);
         let keys = |v: &Value| -> Vec<String> { v.as_object().unwrap().keys().cloned().collect() };
         for k in keys(&fixture) {
             assert!(line.get(&k).is_some(), "top-level key {k:?} missing");
@@ -577,6 +648,22 @@ mod tests {
                 "fixture hashes match its screens"
             );
         }
+        for k in keys(&fixture["workspaces"][0]) {
+            assert!(
+                line["workspaces"][0].get(&k).is_some(),
+                "workspace key {k:?} missing"
+            );
+        }
+        for k in keys(&fixture["workspaces"][0]["tabs"][0]) {
+            assert!(
+                line["workspaces"][0]["tabs"][0].get(&k).is_some(),
+                "tab key {k:?} missing"
+            );
+        }
+        let w = &line["workspaces"][0];
+        assert_eq!(w["status"], "blocked");
+        assert_eq!(w["tabs"][0]["panes"][0], "orch:p1");
+        assert_eq!(w["tabs"][0]["focus"], "orch:p1");
         // One line, no embedded newline: what the phone reads with readLine().
         assert!(!line.to_string().contains('\n'));
     }

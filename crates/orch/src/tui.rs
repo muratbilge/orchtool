@@ -736,18 +736,40 @@ impl App {
     /// Focus / tab changes take effect locally at once, so keys typed right after them go to
     /// the new target; orchd's next session event confirms the same state.
     fn focus_local(&mut self, pane: &str) {
+        let before = self.current_ws().map(|w| w.id.clone());
         if let Some((wi, ti)) = self.session.locate(pane) {
             let w = &mut self.session.workspaces[wi];
             w.active_tab = ti;
             w.tabs[ti].focus = pane.to_string();
             self.ws_id = Some(w.id.clone());
         }
-        self.ui(
-            "focus",
+        // Another workspace: raise it, so the phone's workspace bar knows what is on screen.
+        let op = if self.current_ws().map(|w| w.id.clone()) != before {
+            UiOp::Raise {
+                pane: pane.to_string(),
+            }
+        } else {
             UiOp::Focus {
                 pane: pane.to_string(),
-            },
-        );
+            }
+        };
+        self.ui("focus", op);
+    }
+
+    /// Shows a workspace here and tells orchd (a raise), so `orch watch` reports it as shown
+    /// and the phone's workspace bar follows.
+    fn show_workspace(&mut self, id: String) {
+        self.scroll = None;
+        let changed = self.current_ws().map(|w| &w.id) != Some(&id);
+        let pane = self.session.workspace(&id).and_then(|w| {
+            w.tabs
+                .get(w.active_tab.min(w.tabs.len().saturating_sub(1)))
+                .map(|t| t.focus.clone())
+        });
+        self.ws_id = Some(id);
+        if let (true, Some(pane)) = (changed, pane.filter(|p| !p.is_empty())) {
+            self.ui("show", UiOp::Raise { pane });
+        }
     }
 
     fn select_tab_local(&mut self, ws: &str, index: usize) {
@@ -947,7 +969,8 @@ impl App {
                 // A new pane: follow it.
                 if let Some(id) = v["pane"]["id"].as_str() {
                     if let Some((wi, _)) = self.session.locate(id) {
-                        self.ws_id = Some(self.session.workspaces[wi].id.clone());
+                        let ws = self.session.workspaces[wi].id.clone();
+                        self.show_workspace(ws);
                     }
                 }
                 if what == "answer" {
@@ -979,6 +1002,14 @@ impl App {
             .find(|w| w.cwd == cwd)
             .or_else(|| self.session.workspaces.first())
             .map(|w| w.id.clone());
+        // What this TUI starts on is what is on screen now (for the phone's workspace bar).
+        if let Some(pane) = self
+            .current_tab()
+            .map(|t| t.focus.clone())
+            .filter(|p| !p.is_empty())
+        {
+            self.ui("show", UiOp::Raise { pane });
+        }
         if self.session.workspaces.is_empty() && !self.started_ws {
             // First start: a workspace with a shell in this directory.
             self.started_ws = true;
@@ -1164,9 +1195,8 @@ impl App {
                 self.mode = Mode::Workspaces(cur);
             }
             Hit::Workspace(i) => {
-                if let Some(w) = self.session.workspaces.get(i) {
-                    self.ws_id = Some(w.id.clone());
-                    self.scroll = None;
+                if let Some(id) = self.session.workspaces.get(i).map(|w| w.id.clone()) {
+                    self.show_workspace(id);
                 }
             }
             Hit::Tab(i) => {
@@ -1504,7 +1534,8 @@ impl App {
                     } else {
                         (cur + n - 1) % n
                     };
-                    self.ws_id = Some(self.session.workspaces[next].id.clone());
+                    let id = self.session.workspaces[next].id.clone();
+                    self.show_workspace(id);
                 }
             }
             b"w" => {
@@ -1631,8 +1662,13 @@ impl App {
                 } else if down {
                     Mode::Workspaces((sel + 1).min(n + self.ws_actions().len() - 1))
                 } else if let [d @ b'1'..=b'9'] = key {
-                    if let Some(w) = self.session.workspaces.get((d - b'1') as usize) {
-                        self.ws_id = Some(w.id.clone());
+                    if let Some(id) = self
+                        .session
+                        .workspaces
+                        .get((d - b'1') as usize)
+                        .map(|w| w.id.clone())
+                    {
+                        self.show_workspace(id);
                     }
                     Mode::Normal
                 } else {
@@ -1651,10 +1687,8 @@ impl App {
                     match items.get(sel) {
                         Some((_, Some(q), _)) => Mode::Prompt(Prompt::Answer(*q), String::new()),
                         Some((_, None, Some(pane))) => {
-                            if let Some((wi, _)) = self.session.locate(pane) {
-                                self.ws_id = Some(self.session.workspaces[wi].id.clone());
-                            }
-                            self.ui("focus", UiOp::Focus { pane: pane.clone() });
+                            let pane = pane.clone();
+                            self.focus_local(&pane);
                             Mode::Normal
                         }
                         _ => Mode::Normal,
@@ -2476,9 +2510,8 @@ impl App {
     /// Runs a workspace-list row: a workspace, or one of [`Self::ws_actions`] below them.
     fn workspace_row(&mut self, sel: usize) -> Mode {
         let n = self.session.workspaces.len();
-        if let Some(w) = self.session.workspaces.get(sel) {
-            self.ws_id = Some(w.id.clone());
-            self.scroll = None;
+        if let Some(id) = self.session.workspaces.get(sel).map(|w| w.id.clone()) {
+            self.show_workspace(id);
             return Mode::Normal;
         }
         let action = sel

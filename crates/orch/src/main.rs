@@ -5,6 +5,7 @@ mod bus;
 mod exit;
 mod tui;
 mod watch;
+mod ws;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -104,6 +105,16 @@ enum Cmd {
     Kill { pane: String },
     /// Focus a pane and show its workspace in every open `orch` TUI
     Focus { pane: String },
+    /// Workspaces: focus, new, rename, close (by id or label, as `orch watch` lists them)
+    Ws {
+        #[command(subcommand)]
+        cmd: ws::WsCmd,
+    },
+    /// Tabs of a workspace: new, focus, rename, close (tabs by id)
+    Tab {
+        #[command(subcommand)]
+        cmd: ws::TabCmd,
+    },
     /// Stream agents, questions, dialogs and the timeline as JSON lines (for Kabuk)
     Watch {
         /// JSON lines (the only format; accepted for clarity)
@@ -456,6 +467,8 @@ async fn run(cli: Cli) -> Result<()> {
         Cmd::StopDaemon { restart } => {
             conn.request(&Request::StopDaemon { restart }).await?;
         }
+        Cmd::Ws { cmd } => ws::ws(&mut conn, cmd).await?,
+        Cmd::Tab { cmd } => ws::tab_cmd(&mut conn, cmd).await?,
         Cmd::Proxy { .. } | Cmd::Hook { .. } | Cmd::Ui | Cmd::Watch { .. } => unreachable!(),
         Cmd::Agents { json } => bus::agents(&mut conn, json).await?,
         Cmd::Tail { follow, lines } => bus::tail(conn, follow, lines).await?,
