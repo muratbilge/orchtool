@@ -68,6 +68,9 @@ struct Scroll {
     offset: usize,
 }
 
+/// Rows under the workspaces in the workspace list (tappable on a phone).
+const WS_ACTIONS: [&str; 3] = ["+ new workspace…", "+ new tab (shell)", "+ new agent tab…"];
+
 /// Lines one wheel step moves (the phone sends one step per three rows dragged).
 const WHEEL_LINES: usize = 3;
 
@@ -80,6 +83,7 @@ enum Hit {
     Pane(String),
     NeedsYou,
     Help,
+    NewTab,
 }
 
 struct PaneView {
@@ -1101,6 +1105,7 @@ impl App {
             }
             Hit::NeedsYou => self.mode = Mode::NeedsYou(0),
             Hit::Help => self.mode = Mode::Help,
+            Hit::NewTab => self.new_tab(),
         }
     }
 
@@ -1277,9 +1282,15 @@ impl App {
         let row = (m.y - inner.y) as usize;
         match self.mode {
             Mode::Workspaces(_) => {
-                if row < self.session.workspaces.len() {
-                    self.mode = Mode::Workspaces(row);
-                    self.scroll = None;
+                // Workspaces, a blank row, then the action rows.
+                let n = self.session.workspaces.len();
+                let sel = match row {
+                    r if r < n => Some(r),
+                    r if r > n && r <= n + WS_ACTIONS.len() => Some(r - 1),
+                    _ => None,
+                };
+                if let Some(sel) = sel {
+                    self.mode = Mode::Workspaces(sel);
                     self.overlay_key(b"\r");
                 }
             }
@@ -1333,19 +1344,7 @@ impl App {
             return;
         }
         match key {
-            b"c" => {
-                if let Some((ws, _, _)) = ws {
-                    let spawn = self.spawn_here(Vec::new());
-                    self.hold_input = Some((Instant::now(), false));
-                    self.ui(
-                        "new tab",
-                        UiOp::NewTab {
-                            workspace: ws,
-                            spawn,
-                        },
-                    );
-                }
-            }
+            b"c" => self.new_tab(),
             b"v" | b"%" => self.split(Dir::Right, Vec::new()),
             b"s" | b"\"" => self.split(Dir::Down, Vec::new()),
             b"x" => {
@@ -1529,14 +1528,11 @@ impl App {
                 if esc {
                     Mode::Normal
                 } else if enter {
-                    if let Some(w) = self.session.workspaces.get(sel) {
-                        self.ws_id = Some(w.id.clone());
-                    }
-                    Mode::Normal
+                    self.workspace_row(sel)
                 } else if up {
                     Mode::Workspaces(sel.saturating_sub(1))
                 } else if down {
-                    Mode::Workspaces((sel + 1).min(n.saturating_sub(1)))
+                    Mode::Workspaces((sel + 1).min(n + WS_ACTIONS.len() - 1))
                 } else if let [d @ b'1'..=b'9'] = key {
                     if let Some(w) = self.session.workspaces.get((d - b'1') as usize) {
                         self.ws_id = Some(w.id.clone());
@@ -2013,6 +2009,7 @@ impl App {
                     Some(Hit::Tab(i)),
                 ));
             }
+            spans.push((Span::styled(" + ", base.fg(Color::Cyan)), Some(Hit::NewTab)));
         }
         if let Some((msg, _)) = &self.status {
             spans.push((
@@ -2105,7 +2102,8 @@ impl App {
     }
 
     fn workspaces_popup(&self) -> (Rect, Rect) {
-        self.popup_rect(60, (self.session.workspaces.len() as u16 + 4).max(6))
+        let rows = self.session.workspaces.len() + 1 + WS_ACTIONS.len();
+        self.popup_rect(60, (rows as u16 + 2).max(6))
     }
 
     fn needs_you_popup(&self) -> (Rect, Rect) {
@@ -2186,7 +2184,56 @@ impl App {
                 ])
             })
             .collect();
+        let n = self.session.workspaces.len();
+        let mut lines = lines;
+        lines.push(Line::from(""));
+        for (i, label) in WS_ACTIONS.iter().enumerate() {
+            let style = if sel == n + i {
+                Style::default().bg(Color::Blue).fg(Color::White)
+            } else {
+                Style::default().fg(Color::Cyan)
+            };
+            lines.push(Line::from(Span::styled(format!("   {label}"), style)));
+        }
         f.render_widget(Paragraph::new(lines), r);
+    }
+
+    /// Runs a workspace-list row: a workspace, or one of [`WS_ACTIONS`] below them.
+    fn workspace_row(&mut self, sel: usize) -> Mode {
+        let n = self.session.workspaces.len();
+        if let Some(w) = self.session.workspaces.get(sel) {
+            self.ws_id = Some(w.id.clone());
+            self.scroll = None;
+            return Mode::Normal;
+        }
+        match sel.checked_sub(n) {
+            Some(0) => Mode::Prompt(
+                Prompt::NewWorkspace,
+                self.current_ws().map(|w| w.cwd.clone()).unwrap_or_default(),
+            ),
+            Some(1) => {
+                self.new_tab();
+                Mode::Normal
+            }
+            Some(2) => Mode::Prompt(Prompt::NewAgent, "claude".into()),
+            _ => Mode::Normal,
+        }
+    }
+
+    fn new_tab(&mut self) {
+        let Some(ws) = self.current_ws().map(|w| w.id.clone()) else {
+            self.flash("no workspace yet: create one first");
+            return;
+        };
+        let spawn = self.spawn_here(Vec::new());
+        self.hold_input = Some((Instant::now(), false));
+        self.ui(
+            "new tab",
+            UiOp::NewTab {
+                workspace: ws,
+                spawn,
+            },
+        );
     }
 
     fn draw_needs_you(&self, f: &mut ratatui::Frame, sel: usize) {
