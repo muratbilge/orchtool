@@ -10,4 +10,7 @@ exec 9>/tmp/claude-1000/hardio-heavy.lock
 flock 9
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
+# The end-to-end tests run the real orch / orch-mcp binaries: build them first, or they test
+# whatever stale binary is in target/debug.
+cargo build --workspace --bins
 cargo test --workspace --all-targets

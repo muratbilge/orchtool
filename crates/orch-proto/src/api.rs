@@ -433,6 +433,11 @@ pub enum Stream {
         rev: u64,
         full: bool,
         data: String,
+        /// The program is on the alternate screen (less, vim, …): a viewer turns the wheel
+        /// into arrow keys there instead of scrolling back. Not part of `data`, so a plain
+        /// terminal client is not switched to its own alternate screen.
+        #[serde(default)]
+        alt: bool,
     },
     /// The client's role changed (attach, takeover by another client).
     Role { role: Role },

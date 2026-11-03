@@ -10,8 +10,8 @@ use crate::{client_env, Connector};
 use anyhow::{anyhow, Result};
 use base64::Engine as _;
 use orch_proto::api::{
-    AgentRow, AttachMode, AttachPane, Event, MessageRow, PaneInfo, QuestionRow, Request, Role,
-    SendMessage, Snapshot, Spawn, Stream, UiOp, HUMAN,
+    AgentRow, AttachMode, AttachPane, Event, MessageRow, PaneInfo, QuestionRow, ReadPane,
+    ReadSource, Request, Role, SendMessage, Snapshot, Spawn, Stream, UiOp, HUMAN,
 };
 use orch_proto::client::reply_result;
 use orch_proto::layout::{neighbor, Dir, Rect as LRect, Session, Toward};
@@ -51,6 +51,35 @@ enum Msg {
         what: String,
         result: Result<Value, String>,
     },
+    /// Scrollback text of a pane (for scrolling up in a shell).
+    History {
+        pane: String,
+        text: Result<String, String>,
+    },
+}
+
+/// Scrolled back in a pane: its history (from orchd's scrollback) is shown instead of the live
+/// screen until scrolled down to the end, tapped or typed into.
+struct Scroll {
+    pane: String,
+    /// None while the history is being fetched.
+    lines: Option<Vec<String>>,
+    /// Lines above the bottom.
+    offset: usize,
+}
+
+/// Lines one wheel step moves (the phone sends one step per three rows dragged).
+const WHEEL_LINES: usize = 3;
+
+/// Something tappable in the status bar or sidebar.
+#[derive(Clone, Debug, PartialEq)]
+enum Hit {
+    Workspaces,
+    Workspace(usize),
+    Tab(usize),
+    Pane(String),
+    NeedsYou,
+    Help,
 }
 
 struct PaneView {
@@ -61,6 +90,8 @@ struct PaneView {
     size: (u16, u16),
     exited: Option<Option<u32>>,
     last_used: Instant,
+    /// The program is on the alternate screen (from orchd; not visible in the parser).
+    alt: bool,
 }
 
 #[derive(Clone)]
@@ -109,6 +140,9 @@ struct App {
     /// is attached (≤ 3 s). (started, op replied)
     hold_input: Option<(Instant, bool)>,
     held: Vec<u8>,
+    scroll: Option<Scroll>,
+    /// Pane a mouse press was forwarded to (its release goes there too).
+    mouse_down: Option<String>,
 }
 
 fn prefix_byte() -> u8 {
@@ -129,7 +163,8 @@ impl RawGuard {
         crossterm::terminal::enable_raw_mode()?;
         let g = RawGuard;
         let mut out = std::io::stdout();
-        out.write_all(b"\x1b[?1049h\x1b[H\x1b[2J")?;
+        // Mouse reporting (SGR): taps and the wheel select workspaces, tabs and panes and scroll.
+        out.write_all(b"\x1b[?1049h\x1b[H\x1b[2J\x1b[?1000h\x1b[?1006h")?;
         out.flush()?;
         Ok(g)
     }
@@ -227,6 +262,8 @@ pub async fn run(connector: Connector) -> Result<()> {
         pending: Vec::new(),
         hold_input: None,
         held: Vec::new(),
+        scroll: None,
+        mouse_down: None,
     };
     let mut winch = signal(SignalKind::window_change())?;
     let mut tick = tokio::time::interval(Duration::from_secs(1));
@@ -402,11 +439,7 @@ impl App {
     /// Main area (right of the sidebar, above the status bar).
     fn main_area(&self) -> Rect {
         let (w, h) = self.size;
-        let side = if self.sidebar && w >= 60 {
-            SIDEBAR_W
-        } else {
-            0
-        };
+        let side = if self.sidebar_shown() { SIDEBAR_W } else { 0 };
         Rect::new(side, 0, w.saturating_sub(side), h.saturating_sub(1))
     }
 
@@ -527,6 +560,7 @@ impl App {
                 size,
                 exited: None,
                 last_used: Instant::now(),
+                alt: false,
             },
         );
         let (connector, tx, pane) = (self.connector.clone(), self.tx.clone(), pane.to_string());
@@ -590,6 +624,8 @@ impl App {
     }
 
     fn send_input(&mut self, bytes: Vec<u8>) {
+        // Typing returns to the live screen.
+        self.scroll = None;
         if self.hold_input.is_some() {
             self.held.extend_from_slice(&bytes);
             return;
@@ -675,7 +711,7 @@ impl App {
     }
 
     /// Mirror the focused pane's input modes on the real terminal (arrow keys in vim/less,
-    /// bracketed paste). Mouse reporting stays off: the TUI owns the screen coordinates.
+    /// bracketed paste). Mouse reporting stays on for the TUI itself (see `mouse`).
     fn apply_outer_modes(&mut self) {
         let modes = self
             .focused()
@@ -786,6 +822,7 @@ impl App {
                         rev,
                         full,
                         data,
+                        alt,
                         ..
                     } => {
                         if !full && base != v.rev {
@@ -793,6 +830,7 @@ impl App {
                         } else {
                             v.parser.process(data.as_bytes());
                             v.rev = rev;
+                            v.alt = alt;
                         }
                     }
                     Stream::Role { role } => v.role = role,
@@ -803,6 +841,24 @@ impl App {
             Msg::AttachFailed { pane, error } => {
                 self.views.remove(&pane);
                 self.flash(format!("{pane}: {error}"));
+            }
+            Msg::History { pane, text } => {
+                if let Some(sc) = self.scroll.as_mut().filter(|s| s.pane == pane) {
+                    match text {
+                        Ok(t) => {
+                            let mut lines: Vec<String> = t.lines().map(str::to_string).collect();
+                            while lines.last().is_some_and(|l| l.trim().is_empty()) {
+                                lines.pop();
+                            }
+                            sc.offset = sc.offset.min(lines.len().saturating_sub(1)).max(1);
+                            sc.lines = Some(lines);
+                        }
+                        Err(e) => {
+                            self.scroll = None;
+                            self.flash(format!("history: {e}"));
+                        }
+                    }
+                }
             }
             Msg::Keys(bytes) => self.keys(bytes),
             Msg::KeysFlush => self.flush_pending_keys(),
@@ -908,6 +964,14 @@ impl App {
     fn dispatch(&mut self, tokens: Vec<Token>) {
         let mut forward: Vec<u8> = Vec::new();
         for t in tokens {
+            if let Token::Mouse(m) = t {
+                if !forward.is_empty() {
+                    self.send_input(std::mem::take(&mut forward));
+                }
+                self.prefix_pending = false;
+                self.mouse(m);
+                continue;
+            }
             match (t, &self.mode) {
                 // A paste goes to the pane as-is (with its markers, which the pane asked for).
                 (Token::Paste(raw, _), Mode::Normal) => {
@@ -940,10 +1004,300 @@ impl App {
                     }
                     self.overlay_key(&key);
                 }
+                (Token::Mouse(_), _) => unreachable!(),
             }
         }
         if !forward.is_empty() {
             self.send_input(forward);
+        }
+    }
+
+    // ---------- mouse (taps and the wheel from the phone or a desktop terminal) ----------
+
+    fn mouse(&mut self, m: Mouse) {
+        if !matches!(self.mode, Mode::Normal) {
+            return self.overlay_mouse(m);
+        }
+        // Status bar: workspace list, tabs, needs-you, help.
+        if m.y + 1 == self.size.1 {
+            if m.left_press() {
+                if let Some(hit) = self.status_hit(m.x) {
+                    self.activate(hit);
+                }
+            }
+            return;
+        }
+        if self.sidebar_shown() && m.x < SIDEBAR_W {
+            if m.left_press() {
+                let hit = self
+                    .sidebar_lines(SIDEBAR_W)
+                    .into_iter()
+                    .nth(m.y as usize)
+                    .and_then(|(_, h)| h);
+                if let Some(hit) = hit {
+                    self.activate(hit);
+                }
+            }
+            return;
+        }
+        let Some((pane, rect)) = self
+            .pane_rects()
+            .into_iter()
+            .find(|(_, r)| contains(*r, m.x, m.y))
+        else {
+            return;
+        };
+        if let Some(up) = m.wheel() {
+            if m.press {
+                self.wheel(&pane, rect, up, m);
+            }
+            return;
+        }
+        let scrolled = self.scroll.as_ref().is_some_and(|s| s.pane == pane);
+        let focused = self.focused().as_deref() == Some(pane.as_str());
+        if m.left_press() && (m.y == rect.y || scrolled || !focused) {
+            // A tap on the title bar, a scrolled-back pane or another pane: back to live, focus.
+            if scrolled {
+                self.scroll = None;
+            }
+            if !focused {
+                self.focus_local(&pane);
+            }
+            return;
+        }
+        if m.y == rect.y || scrolled {
+            return;
+        }
+        if focused || self.mouse_down.as_deref() == Some(pane.as_str()) {
+            self.forward_mouse(&pane, rect, m);
+        }
+    }
+
+    fn activate(&mut self, hit: Hit) {
+        match hit {
+            Hit::Workspaces => {
+                let cur = self
+                    .ws_id
+                    .as_ref()
+                    .and_then(|id| self.session.workspaces.iter().position(|w| &w.id == id))
+                    .unwrap_or(0);
+                self.mode = Mode::Workspaces(cur);
+            }
+            Hit::Workspace(i) => {
+                if let Some(w) = self.session.workspaces.get(i) {
+                    self.ws_id = Some(w.id.clone());
+                    self.scroll = None;
+                }
+            }
+            Hit::Tab(i) => {
+                if let Some(ws) = self.current_ws().map(|w| w.id.clone()) {
+                    self.scroll = None;
+                    self.select_tab_local(&ws, i);
+                }
+            }
+            Hit::Pane(p) => {
+                self.scroll = None;
+                self.focus_local(&p);
+            }
+            Hit::NeedsYou => self.mode = Mode::NeedsYou(0),
+            Hit::Help => self.mode = Mode::Help,
+        }
+    }
+
+    /// The wheel over a pane: programs that track the mouse get it; full-screen programs
+    /// (less, vim without mouse) get arrow keys; a shell scrolls back through its history.
+    fn wheel(&mut self, pane: &str, rect: Rect, up: bool, m: Mouse) {
+        if let Some(sc) = self.scroll.as_mut().filter(|s| s.pane == pane) {
+            if up {
+                let h = Self::inner(rect).height as usize;
+                let max = sc
+                    .lines
+                    .as_ref()
+                    .map_or(usize::MAX, |l| l.len().saturating_sub(h).max(1));
+                sc.offset = (sc.offset + WHEEL_LINES).min(max);
+            } else {
+                sc.offset = sc.offset.saturating_sub(WHEEL_LINES);
+                if sc.offset == 0 {
+                    self.scroll = None;
+                }
+            }
+            return;
+        }
+        let Some(v) = self.views.get(pane) else {
+            return;
+        };
+        let s = v.parser.screen();
+        if s.mouse_protocol_mode() != vt100::MouseProtocolMode::None {
+            self.forward_mouse(pane, rect, m);
+        } else if v.alt {
+            let key: &[u8] = match (s.application_cursor(), up) {
+                (true, true) => b"\x1bOA",
+                (true, false) => b"\x1bOB",
+                (false, true) => b"\x1b[A",
+                (false, false) => b"\x1b[B",
+            };
+            self.send_to(pane, key.repeat(WHEEL_LINES));
+        } else if up {
+            self.scroll = Some(Scroll {
+                pane: pane.to_string(),
+                lines: None,
+                offset: WHEEL_LINES,
+            });
+            self.fetch_history(pane);
+        }
+    }
+
+    /// A mouse event for a program in a pane that asked for mouse reports, in its own
+    /// coordinates and encoding.
+    fn forward_mouse(&mut self, pane: &str, rect: Rect, m: Mouse) {
+        let inner = Self::inner(rect);
+        let Some(v) = self.views.get(pane) else {
+            return;
+        };
+        let s = v.parser.screen();
+        let mode = s.mouse_protocol_mode();
+        let release = !m.press;
+        let wheel = m.wheel().is_some();
+        let wanted = match mode {
+            vt100::MouseProtocolMode::None => false,
+            vt100::MouseProtocolMode::Press => m.press && !wheel,
+            _ => true,
+        };
+        if !wanted {
+            return;
+        }
+        let cx =
+            m.x.saturating_sub(inner.x)
+                .min(inner.width.saturating_sub(1)) as u32
+                + 1;
+        let cy =
+            m.y.saturating_sub(inner.y)
+                .min(inner.height.saturating_sub(1)) as u32
+                + 1;
+        let bytes = match s.mouse_protocol_encoding() {
+            vt100::MouseProtocolEncoding::Sgr => format!(
+                "\x1b[<{};{cx};{cy}{}",
+                m.btn,
+                if release { 'm' } else { 'M' }
+            )
+            .into_bytes(),
+            enc => {
+                // X10-style: a release has no button (3), each value offset by 32.
+                let b = if release {
+                    3 | (m.btn & (4 | 8 | 16))
+                } else {
+                    m.btn
+                } as u32;
+                let mut out = b"\x1b[M".to_vec();
+                for val in [b + 32, cx + 32, cy + 32] {
+                    if enc == vt100::MouseProtocolEncoding::Utf8 {
+                        let mut buf = [0u8; 4];
+                        let Some(c) = char::from_u32(val) else { return };
+                        out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+                    } else if val > 255 {
+                        return; // beyond what the encoding can say
+                    } else {
+                        out.push(val as u8);
+                    }
+                }
+                out
+            }
+        };
+        if m.press && !wheel {
+            self.mouse_down = Some(pane.to_string());
+        } else if release {
+            self.mouse_down = None;
+        }
+        self.send_to(pane, bytes);
+    }
+
+    /// Input for a pane that may not be the focused one (the wheel over another pane).
+    fn send_to(&mut self, pane: &str, bytes: Vec<u8>) {
+        if self.focused().as_deref() == Some(pane) {
+            return self.send_input(bytes);
+        }
+        if let Some(v) = self.views.get(pane) {
+            if v.role == Role::Observer {
+                let _ = v.tx.send(Request::Takeover {});
+            }
+            let data_b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+            let _ = v.tx.send(Request::Input { data_b64 });
+        }
+    }
+
+    fn fetch_history(&self, pane: &str) {
+        let (connector, tx, pane) = (self.connector.clone(), self.tx.clone(), pane.to_string());
+        tokio::spawn(async move {
+            let req = Request::Read(ReadPane {
+                pane: pane.clone(),
+                lines: Some(3000),
+                source: ReadSource::Recent,
+            });
+            let text = async {
+                let mut c = connector.connect().await.map_err(|e| e.to_string())?;
+                let v = c.request(&req).await.map_err(|e| e.to_string())?;
+                v["text"]
+                    .as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| "no text in reply".to_string())
+            }
+            .await;
+            let _ = tx.send(Msg::History { pane, text });
+        });
+    }
+
+    fn overlay_mouse(&mut self, m: Mouse) {
+        if let Some(up) = m.wheel() {
+            if m.press && matches!(self.mode, Mode::Workspaces(_) | Mode::NeedsYou(_)) {
+                self.overlay_key(if up { b"\x1b[A" } else { b"\x1b[B" });
+            }
+            return;
+        }
+        if !m.left_press() {
+            return;
+        }
+        let (outer, inner) = match &self.mode {
+            Mode::Help | Mode::Normal => {
+                self.mode = Mode::Normal;
+                return;
+            }
+            Mode::Workspaces(_) => self.workspaces_popup(),
+            Mode::NeedsYou(_) => self.needs_you_popup(),
+            Mode::Comms(_) => self.comms_popup(),
+            Mode::Prompt(..) => self.popup_rect(76, 8),
+        };
+        if !contains(outer, m.x, m.y) {
+            // A tap outside a popup closes it.
+            self.mode = Mode::Normal;
+            return;
+        }
+        if !contains(inner, m.x, m.y) {
+            return;
+        }
+        let row = (m.y - inner.y) as usize;
+        match self.mode {
+            Mode::Workspaces(_) => {
+                if row < self.session.workspaces.len() {
+                    self.mode = Mode::Workspaces(row);
+                    self.scroll = None;
+                    self.overlay_key(b"\r");
+                }
+            }
+            Mode::NeedsYou(_) => {
+                // Items wrap: find the one whose rows contain the tap.
+                let w = (inner.width as usize).max(1);
+                let mut at = 0usize;
+                for (i, (label, _, _)) in self.needs_you().iter().enumerate() {
+                    let rows = Line::from(format!(" {label}")).width().div_ceil(w).max(1);
+                    if row < at + rows {
+                        self.mode = Mode::NeedsYou(i);
+                        self.overlay_key(b"\r");
+                        return;
+                    }
+                    at += rows;
+                }
+            }
+            _ => {}
         }
     }
 
@@ -1399,6 +1753,10 @@ impl App {
             );
             let inner = Self::inner(rect);
             f.render_widget(Clear, inner);
+            if let Some(sc) = self.scroll.as_ref().filter(|s| s.pane == pane) {
+                self.draw_scroll(f, sc, rect);
+                continue;
+            }
             match self.views.get(&pane) {
                 Some(v) => {
                     f.render_widget(ScreenWidget(v.parser.screen()), inner);
@@ -1423,7 +1781,7 @@ impl App {
                 main,
             );
         }
-        if self.sidebar && full.width >= 60 {
+        if self.sidebar_shown() {
             self.draw_sidebar(
                 f,
                 Rect::new(
@@ -1452,6 +1810,29 @@ impl App {
         }
     }
 
+    /// A pane scrolled back: its history, with a bar saying how far up it is.
+    fn draw_scroll(&self, f: &mut ratatui::Frame, sc: &Scroll, rect: Rect) {
+        let inner = Self::inner(rect);
+        let h = inner.height as usize;
+        let text: Vec<Line> = match &sc.lines {
+            None => vec![Line::from(" loading history…")],
+            Some(lines) => {
+                let end = lines.len().saturating_sub(sc.offset);
+                let start = end.saturating_sub(h);
+                lines[start..end]
+                    .iter()
+                    .map(|l| Line::from(l.clone()))
+                    .collect()
+            }
+        };
+        f.render_widget(Paragraph::new(text), inner);
+        let bar = format!(" ↑ {} lines up — scroll down or tap to return ", sc.offset);
+        f.render_widget(
+            Paragraph::new(bar).style(Style::default().bg(Color::Yellow).fg(Color::Black)),
+            Rect::new(rect.x, rect.y, rect.width, 1.min(rect.height)),
+        );
+    }
+
     fn ws_status(&self, w: &orch_proto::layout::Workspace) -> Option<&'static str> {
         let mut best: Option<&'static str> = None;
         for t in &w.tabs {
@@ -1467,13 +1848,17 @@ impl App {
         best
     }
 
-    fn draw_sidebar(&self, f: &mut ratatui::Frame, area: Rect) {
-        let mut lines: Vec<Line> = vec![Line::from(Span::styled(
-            " WORKSPACES",
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        ))];
+    /// Sidebar rows (row 0 at the top), each with what tapping it does.
+    fn sidebar_lines(&self, width: u16) -> Vec<(Line<'static>, Option<Hit>)> {
+        let mut lines: Vec<(Line<'static>, Option<Hit>)> = vec![(
+            Line::from(Span::styled(
+                " WORKSPACES",
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            None,
+        )];
         for (i, w) in self.session.workspaces.iter().enumerate() {
             let cur = Some(&w.id) == self.ws_id.as_ref() || (self.ws_id.is_none() && i == 0);
             let (mark, color) = status_mark(self.ws_status(w));
@@ -1484,29 +1869,35 @@ impl App {
             } else {
                 Style::default().fg(Color::Gray)
             };
-            lines.push(Line::from(vec![
-                Span::styled(format!(" {mark}"), Style::default().fg(color)),
-                Span::styled(format!(" {} {}", i + 1, w.label), style),
-                Span::styled(
-                    format!(
-                        " {}",
-                        if w.tabs.len() > 1 {
-                            format!("·{}", w.tabs.len())
-                        } else {
-                            String::new()
-                        }
+            lines.push((
+                Line::from(vec![
+                    Span::styled(format!(" {mark}"), Style::default().fg(color)),
+                    Span::styled(format!(" {} {}", i + 1, w.label), style),
+                    Span::styled(
+                        format!(
+                            " {}",
+                            if w.tabs.len() > 1 {
+                                format!("·{}", w.tabs.len())
+                            } else {
+                                String::new()
+                            }
+                        ),
+                        Style::default().fg(Color::DarkGray),
                     ),
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ]));
+                ]),
+                Some(Hit::Workspace(i)),
+            ));
         }
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            " AGENTS",
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        )));
+        lines.push((Line::from(""), None));
+        lines.push((
+            Line::from(Span::styled(
+                " AGENTS",
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            None,
+        ));
         // Agents on screen (pane detection) + agents on the bus.
         let mut shown: Vec<String> = Vec::new();
         let mut panes: Vec<&PaneInfo> = self.panes.values().filter(|p| p.agent.is_some()).collect();
@@ -1523,10 +1914,13 @@ impl App {
                 shown.push(b.name.clone());
             }
             let (mark, color) = status_mark(p.agent_status.as_deref());
-            lines.push(Line::from(vec![
-                Span::styled(format!(" {mark} "), Style::default().fg(color)),
-                Span::raw(truncate(&name, (area.width as usize).saturating_sub(4))),
-            ]));
+            lines.push((
+                Line::from(vec![
+                    Span::styled(format!(" {mark} "), Style::default().fg(color)),
+                    Span::raw(truncate(&name, (width as usize).saturating_sub(4))),
+                ]),
+                Some(Hit::Pane(p.id.clone())),
+            ));
         }
         for a in &self.agents {
             if shown.contains(&a.name) || a.pane.as_deref().is_some_and(|p| p.starts_with("orch:"))
@@ -1534,22 +1928,37 @@ impl App {
                 continue;
             }
             let (mark, color) = status_mark(Some(a.status.as_str()));
-            lines.push(Line::from(vec![
-                Span::styled(format!(" {mark} "), Style::default().fg(color)),
-                Span::styled(
-                    truncate(&a.name, (area.width as usize).saturating_sub(4)),
-                    Style::default().fg(Color::Gray),
-                ),
-            ]));
+            lines.push((
+                Line::from(vec![
+                    Span::styled(format!(" {mark} "), Style::default().fg(color)),
+                    Span::styled(
+                        truncate(&a.name, (width as usize).saturating_sub(4)),
+                        Style::default().fg(Color::Gray),
+                    ),
+                ]),
+                None,
+            ));
         }
         let open = self.needs_you().len();
         if open > 0 {
-            lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled(
-                format!(" ⚑ {open} need you  ({} a)", prefix_name(self.prefix)),
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-            )));
+            lines.push((Line::from(""), None));
+            lines.push((
+                Line::from(Span::styled(
+                    format!(" ⚑ {open} need you  ({} a)", prefix_name(self.prefix)),
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                )),
+                Some(Hit::NeedsYou),
+            ));
         }
+        lines
+    }
+
+    fn draw_sidebar(&self, f: &mut ratatui::Frame, area: Rect) {
+        let lines: Vec<Line> = self
+            .sidebar_lines(area.width)
+            .into_iter()
+            .map(|(l, _)| l)
+            .collect();
         f.render_widget(
             Paragraph::new(lines).block(
                 Block::default()
@@ -1560,19 +1969,32 @@ impl App {
         );
     }
 
-    fn draw_status(&self, f: &mut ratatui::Frame, area: Rect) {
-        let mut spans: Vec<Span> = Vec::new();
+    fn sidebar_shown(&self) -> bool {
+        self.sidebar && self.size.0 >= 60
+    }
+
+    /// The status bar as spans, each with what tapping it does.
+    fn status_spans(&self, width: u16) -> Vec<(Span<'static>, Option<Hit>)> {
+        let mut spans: Vec<(Span<'static>, Option<Hit>)> = Vec::new();
         let base = Style::default().bg(Color::Indexed(235)).fg(Color::Gray);
         if self.prefix_pending {
-            spans.push(Span::styled(
-                " PREFIX ",
-                Style::default().bg(Color::Yellow).fg(Color::Black),
+            spans.push((
+                Span::styled(
+                    " PREFIX ",
+                    Style::default().bg(Color::Yellow).fg(Color::Black),
+                ),
+                None,
             ));
         }
         if let Some(w) = self.current_ws() {
-            spans.push(Span::styled(
-                format!(" {} ", w.label),
-                base.fg(Color::White).add_modifier(Modifier::BOLD),
+            // Without the sidebar (phone) the workspace name opens the workspace list.
+            let menu = if self.sidebar_shown() { "" } else { "☰ " };
+            spans.push((
+                Span::styled(
+                    format!(" {menu}{} ", w.label),
+                    base.fg(Color::White).add_modifier(Modifier::BOLD),
+                ),
+                Some(Hit::Workspaces),
             ));
             for (i, t) in w.tabs.iter().enumerate() {
                 let style = if i == w.active_tab {
@@ -1586,11 +2008,17 @@ impl App {
                     format!("{}:{}", i + 1, t.label)
                 };
                 let zoom = if t.zoomed { "+" } else { "" };
-                spans.push(Span::styled(format!(" {label}{zoom} "), style));
+                spans.push((
+                    Span::styled(format!(" {label}{zoom} "), style),
+                    Some(Hit::Tab(i)),
+                ));
             }
         }
         if let Some((msg, _)) = &self.status {
-            spans.push(Span::styled(format!("  {msg}"), base.fg(Color::Yellow)));
+            spans.push((
+                Span::styled(format!("  {msg}"), base.fg(Color::Yellow)),
+                None,
+            ));
         }
         let open = self.needs_you().len();
         let working = self
@@ -1612,30 +2040,84 @@ impl App {
             unsafe { libc::localtime_r(&(t as libc::time_t), &mut tm) };
             format!("{:02}:{:02}", tm.tm_hour, tm.tm_min)
         };
-        let right = format!(
-            "{}● {working}  ○ {idle}  {clock}  {} ? help ",
-            if open > 0 {
-                format!("⚑ {open}  ")
-            } else {
-                String::new()
-            },
-            prefix_name(self.prefix)
-        );
-        let left_w: usize = spans.iter().map(|s| s.width()).sum();
-        let pad = (area.width as usize).saturating_sub(left_w + right.chars().count());
-        spans.push(Span::styled(" ".repeat(pad), base));
-        spans.push(Span::styled(
-            right,
-            if open > 0 { base.fg(Color::Red) } else { base },
+        let mut right: Vec<(Span<'static>, Option<Hit>)> = Vec::new();
+        if open > 0 {
+            right.push((
+                Span::styled(format!("⚑ {open}  "), base.fg(Color::Red)),
+                Some(Hit::NeedsYou),
+            ));
+        }
+        right.push((
+            Span::styled(format!("● {working}  ○ {idle}  {clock}  "), base),
+            None,
         ));
+        right.push((
+            Span::styled(format!("{} ? help ", prefix_name(self.prefix)), base),
+            Some(Hit::Help),
+        ));
+        let used: usize = spans
+            .iter()
+            .chain(right.iter())
+            .map(|(s, _)| s.width())
+            .sum();
+        let pad = (width as usize).saturating_sub(used);
+        spans.push((Span::styled(" ".repeat(pad), base), None));
+        spans.extend(right);
+        spans
+    }
+
+    fn draw_status(&self, f: &mut ratatui::Frame, area: Rect) {
+        let base = Style::default().bg(Color::Indexed(235)).fg(Color::Gray);
+        let spans: Vec<Span> = self
+            .status_spans(area.width)
+            .into_iter()
+            .map(|(s, _)| s)
+            .collect();
         f.render_widget(Paragraph::new(Line::from(spans)).style(base), area);
     }
 
+    /// What is at column `x` of the status bar.
+    fn status_hit(&self, x: u16) -> Option<Hit> {
+        let mut at = 0usize;
+        for (span, hit) in self.status_spans(self.size.0) {
+            let w = span.width();
+            if (x as usize) >= at && (x as usize) < at + w {
+                return hit;
+            }
+            at += w;
+        }
+        None
+    }
+
+    /// Popup geometry: (outer rect, inner rect), centred on the screen.
+    fn popup_rect(&self, w: u16, h: u16) -> (Rect, Rect) {
+        let (fw, fh) = self.size;
+        let w = w.min(fw.saturating_sub(2));
+        let h = h.min(fh.saturating_sub(2));
+        let r = Rect::new(fw.saturating_sub(w) / 2, fh.saturating_sub(h) / 2, w, h);
+        let inner = Rect::new(
+            r.x + 1,
+            r.y + 1,
+            r.width.saturating_sub(2),
+            r.height.saturating_sub(2),
+        );
+        (r, inner)
+    }
+
+    fn workspaces_popup(&self) -> (Rect, Rect) {
+        self.popup_rect(60, (self.session.workspaces.len() as u16 + 4).max(6))
+    }
+
+    fn needs_you_popup(&self) -> (Rect, Rect) {
+        self.popup_rect(90, (self.needs_you().len() as u16 * 2 + 4).max(6))
+    }
+
+    fn comms_popup(&self) -> (Rect, Rect) {
+        self.popup_rect(self.size.0.saturating_sub(8), self.size.1.saturating_sub(4))
+    }
+
     fn popup(&self, f: &mut ratatui::Frame, title: &str, w: u16, h: u16) -> Rect {
-        let full = f.area();
-        let w = w.min(full.width.saturating_sub(2));
-        let h = h.min(full.height.saturating_sub(2));
-        let r = Rect::new((full.width - w) / 2, (full.height - h) / 2, w, h);
+        let (r, inner) = self.popup_rect(w, h);
         f.render_widget(Clear, r);
         f.render_widget(
             Block::default()
@@ -1644,12 +2126,7 @@ impl App {
                 .title(format!(" {title} ")),
             r,
         );
-        Rect::new(
-            r.x + 1,
-            r.y + 1,
-            r.width.saturating_sub(2),
-            r.height.saturating_sub(2),
-        )
+        inner
     }
 
     fn draw_help(&self, f: &mut ratatui::Frame) {
@@ -1675,11 +2152,12 @@ impl App {
     }
 
     fn draw_workspaces(&self, f: &mut ratatui::Frame, sel: usize) {
+        let (outer, _) = self.workspaces_popup();
         let r = self.popup(
             f,
-            "workspaces — Enter / 1-9, Esc",
-            60,
-            (self.session.workspaces.len() as u16 + 4).max(6),
+            "workspaces — tap / Enter / 1-9, Esc",
+            outer.width,
+            outer.height,
         );
         let lines: Vec<Line> = self
             .session
@@ -1713,11 +2191,12 @@ impl App {
 
     fn draw_needs_you(&self, f: &mut ratatui::Frame, sel: usize) {
         let items = self.needs_you();
+        let (outer, _) = self.needs_you_popup();
         let r = self.popup(
             f,
-            "needs you — Enter answers / jumps, Esc",
-            90,
-            (items.len() as u16 * 2 + 4).max(6),
+            "needs you — tap / Enter answers, Esc",
+            outer.width,
+            outer.height,
         );
         if items.is_empty() {
             f.render_widget(Paragraph::new(" Nothing waits for you. ✓"), r);
@@ -1739,12 +2218,12 @@ impl App {
     }
 
     fn draw_comms(&self, f: &mut ratatui::Frame, input: &str) {
-        let full = f.area();
+        let (outer, _) = self.comms_popup();
         let r = self.popup(
             f,
             "messages — @agent text + Enter, Esc",
-            full.width.saturating_sub(8),
-            full.height.saturating_sub(4),
+            outer.width,
+            outer.height,
         );
         let h = r.height.saturating_sub(2) as usize;
         let lines: Vec<Line> = self
@@ -1843,6 +2322,10 @@ impl App {
     }
 }
 
+fn contains(r: Rect, x: u16, y: u16) -> bool {
+    x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
+}
+
 fn truncate(s: &str, n: usize) -> String {
     if s.chars().count() <= n {
         s.to_string()
@@ -1880,6 +2363,51 @@ pub enum Token {
     Key(Vec<u8>),
     /// (raw bytes incl. markers, pasted text)
     Paste(Vec<u8>, String),
+    Mouse(Mouse),
+}
+
+/// An SGR mouse report: `btn` as sent (64/65 = wheel up/down, +32 = motion), 0-based cell.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Mouse {
+    pub btn: u16,
+    pub x: u16,
+    pub y: u16,
+    pub press: bool,
+}
+
+impl Mouse {
+    fn parse(key: &[u8]) -> Option<Mouse> {
+        let body = key.strip_prefix(b"\x1b[<")?;
+        let (last, body) = body.split_last()?;
+        let press = match last {
+            b'M' => true,
+            b'm' => false,
+            _ => return None,
+        };
+        let mut it = std::str::from_utf8(body).ok()?.split(';');
+        let mut num = || it.next()?.parse::<u16>().ok();
+        let (btn, x, y) = (num()?, num()?, num()?);
+        Some(Mouse {
+            btn,
+            x: x.saturating_sub(1),
+            y: y.saturating_sub(1),
+            press,
+        })
+    }
+    fn base(&self) -> u16 {
+        self.btn & !(4 | 8 | 16)
+    }
+    /// Some(true) = wheel up, Some(false) = down.
+    fn wheel(&self) -> Option<bool> {
+        match self.base() {
+            64 => Some(true),
+            65 => Some(false),
+            _ => None,
+        }
+    }
+    fn left_press(&self) -> bool {
+        self.press && self.base() == 0
+    }
 }
 
 const PASTE_START: &[u8] = b"\x1b[200~";
@@ -1909,6 +2437,9 @@ pub fn next_token(b: &[u8]) -> Option<(Token, usize)> {
         return None; // maybe the start of a paste marker
     }
     let n = complete_key_len(b)?;
+    if let Some(m) = Mouse::parse(&b[..n]) {
+        return Some((Token::Mouse(m), n));
+    }
     Some((Token::Key(b[..n].to_vec()), n))
 }
 
@@ -1966,6 +2497,24 @@ mod tests {
         assert_eq!(text, "a\nb");
         assert_eq!(n, raw.len());
         assert!(raw.ends_with(b"\x1b[201~"));
+    }
+
+    #[test]
+    fn mouse_reports_are_decoded() {
+        let Some((Token::Mouse(m), 10)) = next_token(b"\x1b[<0;5;12Mx") else {
+            panic!()
+        };
+        assert_eq!((m.x, m.y, m.press, m.left_press()), (4, 11, true, true));
+        let Some((Token::Mouse(m), _)) = next_token(b"\x1b[<64;1;1M") else {
+            panic!()
+        };
+        assert_eq!(m.wheel(), Some(true));
+        let Some((Token::Mouse(m), _)) = next_token(b"\x1b[<0;3;4m") else {
+            panic!()
+        };
+        assert!(!m.press && !m.left_press());
+        assert!(next_token(b"\x1b[<0;5;1").is_none(), "cut off");
+        assert!(matches!(next_token(b"\x1b[A"), Some((Token::Key(_), 3))));
     }
 
     #[test]

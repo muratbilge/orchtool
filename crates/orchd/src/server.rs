@@ -700,11 +700,12 @@ async fn send_frame(
     id: &str,
     writer: &mut FrameWriter,
 ) -> std::io::Result<()> {
-    let (frame, rows, cols, gen) = {
+    let (frame, rows, cols, gen, alt) = {
         let term = pane.term.lock().unwrap();
         let gen = pane.gen();
         let (rows, cols) = term.size();
-        (renderer.render(term.screen(), gen), rows, cols, gen)
+        let alt = term.screen().alternate_screen();
+        (renderer.render(term.screen(), gen), rows, cols, gen, alt)
     };
     let Some(frame) = frame else { return Ok(()) };
     let base = if frame.full { 0 } else { *seq };
@@ -717,6 +718,7 @@ async fn send_frame(
         rev: *seq,
         full: frame.full,
         data: frame.data,
+        alt,
     };
     writer.send_body(id, stream_body(&s)).await
 }

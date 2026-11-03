@@ -363,12 +363,8 @@ async fn questions_survive_mcp_and_daemon_restarts() {
         json!({ "question_id": id, "wait_seconds": 1 }),
     );
     assert!(r.contains(": sqlite"), "{r}");
-    // The answer is also in the inbox, exactly once.
-    let inbox = a.tool("read_inbox", json!({}));
-    assert!(
-        inbox.contains("Murat's answer to question") && inbox.contains("sqlite"),
-        "{inbox}"
-    );
+    // Delivered exactly once: wait_for_answer consumed the answer message, so it does not
+    // turn up again in the inbox.
     assert_eq!(a.tool("read_inbox", json!({})), "No new messages.");
 }
 
