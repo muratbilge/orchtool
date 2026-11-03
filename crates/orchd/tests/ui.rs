@@ -488,3 +488,58 @@ async fn restart_brings_the_layout_back_with_fresh_panes() {
     let _ = d.child.wait();
     assert!(!d.dir.join("restore.json").exists());
 }
+
+#[tokio::test]
+async fn rename_tab_uses_identity_after_an_earlier_tab_closes() {
+    let d = daemon("rename-id").await;
+    let v = op(
+        &d,
+        UiOp::NewWorkspace {
+            label: None,
+            spawn: spawn(&["cat"]),
+        },
+    )
+    .await;
+    let ws = session(&v).workspaces[0].id.clone();
+    let first = session(&v).workspaces[0].tabs[0].id.clone();
+    let v = op(
+        &d,
+        UiOp::NewTab {
+            workspace: ws.clone(),
+            spawn: spawn(&["cat"]),
+        },
+    )
+    .await;
+    let target = session(&v).workspaces[0].tabs[1].id.clone();
+    op(
+        &d,
+        UiOp::NewTab {
+            workspace: ws.clone(),
+            spawn: spawn(&["cat"]),
+        },
+    )
+    .await;
+    op(
+        &d,
+        UiOp::CloseTab {
+            workspace: ws.clone(),
+            index: 0,
+            tab: Some(first),
+        },
+    )
+    .await;
+    let v = op(
+        &d,
+        UiOp::RenameTab {
+            workspace: ws,
+            index: 1,
+            tab: Some(target.clone()),
+            label: "target".into(),
+        },
+    )
+    .await;
+    let s = session(&v);
+    assert_eq!(s.workspaces[0].tabs[0].id, target);
+    assert_eq!(s.workspaces[0].tabs[0].label, "target");
+    assert_ne!(s.workspaces[0].tabs[1].label, "target");
+}

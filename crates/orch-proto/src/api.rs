@@ -183,6 +183,8 @@ pub enum UiOp {
     RenameTab {
         workspace: String,
         index: usize,
+        #[serde(default)]
+        tab: Option<String>,
         label: String,
     },
     Resize {
@@ -329,7 +331,7 @@ pub struct NewPane {
 fn is_pulse_glyph(c: char) -> bool {
     matches!(
         c,
-        '●' | '○' | '◉' | '◯' | '⏺' | '✻' | '✽' | '✶' | '✳' | '✢' | '·' | '*' | '∗'
+        '●' | '○' | '◉' | '◯' | '⏺' | '✻' | '✽' | '✶' | '✳' | '✢' | '·' | '∗'
     ) || ('\u{2800}'..='\u{28ff}').contains(&c) // braille spinners
 }
 
@@ -339,7 +341,7 @@ fn is_spinner_status(line: &str) -> bool {
     let Some(open) = line.rfind('(') else {
         return false;
     };
-    if !line.ends_with(')') {
+    if !line.ends_with(')') || !line[..open].trim_end().ends_with('…') {
         return false;
     }
     let inner = &line[open + 1..];
@@ -347,25 +349,54 @@ fn is_spinner_status(line: &str) -> bool {
     digits > 0 && matches!(inner[digits..].chars().next(), Some('s' | 'm' | 'h'))
 }
 
-/// What the screen hash covers: per line without leading/trailing blanks and without one
-/// leading pulse glyph; spinner status lines and empty lines are left out. Only for identity
+/// Preserve content and indentation; canonicalize pulse glyphs and omit recognizable
+/// animated status lines. Only for identity
 /// (is this still the same dialog?), never shown.
 pub fn hash_normalize(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for line in text.lines() {
-        let mut l = line.trim();
-        if let Some(c) = l.chars().next() {
+        let l = line.trim_end();
+        let body = l.trim_start();
+        let indent = &l[..l.len() - body.len()];
+        let mut body = body;
+        if let Some(c) = body.chars().next() {
             if is_pulse_glyph(c) {
-                l = l[c.len_utf8()..].trim_start();
+                body = body[c.len_utf8()..].trim_start();
+                if is_spinner_status(body) {
+                    continue;
+                }
+                out.push_str(indent);
+                out.push_str("● ");
+                out.push_str(body);
+                out.push('\n');
+                continue;
             }
-        }
-        if l.is_empty() || is_spinner_status(l) {
-            continue;
         }
         out.push_str(l);
         out.push('\n');
     }
     out
+}
+
+#[cfg(test)]
+mod hash_tests {
+    use super::*;
+
+    #[test]
+    fn meaningful_dialog_changes_are_not_erased() {
+        for (a, b) in [
+            ("Delete backups (1h)", "Delete production (1h)"),
+            ("if ok:\n    delete()", "if ok:\ndelete()"),
+            ("*secret", "secret"),
+            ("a\n\nb", "a\nb"),
+        ] {
+            assert_ne!(text_hash(a), text_hash(b));
+        }
+        assert_eq!(
+            text_hash(" ● Bash(ls)\n ✻ Thinking… (1s · 2 tokens)\nYes?"),
+            text_hash(" ○ Bash(ls)\n ✽ Thinking… (2s · 4 tokens)\nYes?")
+        );
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

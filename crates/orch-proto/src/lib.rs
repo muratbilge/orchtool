@@ -85,8 +85,8 @@ mod tests {
 
     #[test]
     fn a_waiting_dialog_keeps_its_hash_while_the_agent_animates() {
-        let a = "  Listing first three entries in /tmp\n\u{2733} Mustering\u{2026} (11s \u{b7} \u{2193} 557 tokens)\n Do you want to proceed?\n \u{276f} 1. Yes\n   2. No\n";
-        let b = "\u{25cf} Listing first three entries in /tmp\n\u{2736} Mustering\u{2026} (12s \u{b7} \u{2193} 601 tokens)\n Do you want to proceed?\n \u{276f} 1. Yes\n   2. No\n\n";
+        let a = "\u{25cb} Listing first three entries in /tmp\n\u{2733} Mustering\u{2026} (11s \u{b7} \u{2193} 557 tokens)\n Do you want to proceed?\n \u{276f} 1. Yes\n   2. No\n";
+        let b = "\u{25cf} Listing first three entries in /tmp\n\u{2736} Mustering\u{2026} (12s \u{b7} \u{2193} 601 tokens)\n Do you want to proceed?\n \u{276f} 1. Yes\n   2. No\n";
         assert_eq!(
             text_hash(a),
             text_hash(b),

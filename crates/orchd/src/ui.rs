@@ -286,15 +286,18 @@ impl Daemon {
             UiOp::RenameTab {
                 workspace,
                 index,
+                tab,
                 label,
             } => self.edit(|s| {
                 let w = s
                     .workspace_mut(&workspace)
                     .ok_or_else(|| err("no_workspace", workspace.clone()))?;
-                w.tabs
-                    .get_mut(index)
-                    .ok_or_else(|| err("no_tab", format!("no tab {}", index + 1)))?
-                    .label = label.clone();
+                match &tab {
+                    Some(id) => w.tabs.iter_mut().find(|t| &t.id == id),
+                    None => w.tabs.get_mut(index),
+                }
+                .ok_or_else(|| err("no_tab", format!("no tab {}", index + 1)))?
+                .label = label.clone();
                 Ok(())
             })?,
             UiOp::Resize { pane, dir, delta } => self.edit(|s| {

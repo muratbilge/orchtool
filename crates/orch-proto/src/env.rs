@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 /// that inherits `CLAUDE_CODE_CHILD_SESSION` & co. takes itself for a sub-session of another
 /// one (no transcript saving, wrong session id).
 pub const SESSION_VARS: &[&str] = &[
+    "ORCH_AGENT",
     "ORCH_PANE",
     "STY",
     "CLAUDECODE",
@@ -48,10 +49,11 @@ fn login_vars() -> &'static Option<HashMap<String, String>> {
             .spawn()
             .ok()?;
         let mut out = child.stdout.take()?;
-        let reader = std::thread::spawn(move || {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
             let mut buf = Vec::new();
-            let _ = out.read_to_end(&mut buf);
-            buf
+            let _ = out.by_ref().take(1024 * 1024).read_to_end(&mut buf);
+            let _ = tx.send(buf);
         });
         let start = Instant::now();
         loop {
@@ -68,7 +70,7 @@ fn login_vars() -> &'static Option<HashMap<String, String>> {
                 }
             }
         }
-        let buf = reader.join().ok()?;
+        let buf = read_before_deadline(&rx, start, Duration::from_secs(3))?;
         Some(
             buf.split(|b| *b == 0)
                 .filter_map(|kv| {
@@ -79,6 +81,14 @@ fn login_vars() -> &'static Option<HashMap<String, String>> {
                 .collect(),
         )
     })
+}
+
+fn read_before_deadline(
+    rx: &std::sync::mpsc::Receiver<Vec<u8>>,
+    start: Instant,
+    budget: Duration,
+) -> Option<Vec<u8>> {
+    rx.recv_timeout(budget.saturating_sub(start.elapsed())).ok()
 }
 
 /// `current` completed from the login environment: variables it lacks are added, and PATH
@@ -138,6 +148,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn inherited_stdout_cannot_extend_the_deadline() {
+        let (_writer_still_open, rx) = std::sync::mpsc::channel();
+        let start = Instant::now();
+        assert!(read_before_deadline(&rx, start, Duration::from_millis(20)).is_none());
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
     fn bare_path_gets_the_login_entries_and_set_values_stay() {
         let login: HashMap<String, String> = [
             ("PATH", "/home/u/.local/bin:/usr/bin"),
@@ -170,5 +188,10 @@ mod tests {
         assert_eq!(m["X"], "y");
         assert!(is_session_var("CLAUDECODE") && is_session_var("HERDR_PANE_ID"));
         assert!(!is_session_var("PATH"));
+        assert!(is_session_var("ORCH_AGENT"));
+        let login = HashMap::from([("ORCH_AGENT".into(), "parent".into())]);
+        assert!(!merge(Vec::new(), &login)
+            .iter()
+            .any(|(k, _)| k == "ORCH_AGENT"));
     }
 }

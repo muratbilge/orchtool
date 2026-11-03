@@ -164,6 +164,7 @@ pub async fn tab_cmd(c: &mut Conn, cmd: TabCmd) -> Result<()> {
             c.request(&Request::Ui(UiOp::RenameTab {
                 workspace: w.id.clone(),
                 index,
+                tab: Some(t),
                 label: label.join(" "),
             }))
             .await?;

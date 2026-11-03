@@ -47,6 +47,7 @@ async fn daemon() -> Daemon {
         .arg("500")
         .arg("--db")
         .arg(dir.join("bus.db"))
+        .env("HOME", &dir)
         .spawn()
         .unwrap();
     for _ in 0..100 {

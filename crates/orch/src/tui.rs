@@ -1784,6 +1784,11 @@ impl App {
                     self.ui(
                         "rename",
                         UiOp::RenameTab {
+                            tab: self
+                                .session
+                                .workspace(&ws)
+                                .and_then(|w| w.tabs.get(index))
+                                .map(|t| t.id.clone()),
                             workspace: ws,
                             index,
                             label: input,
