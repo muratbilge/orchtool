@@ -5,6 +5,12 @@
 //! line. A line is also forced every 60 s so the phone knows the stream is alive. When orchd is
 //! not reachable it prints `{"error": "..."}` and retries every 5 s. Stdin EOF (the phone hung up)
 //! ends it at once.
+//!
+//! The line is a versioned contract (notes/kabuk-contract-v2.md): `"v"` bumps only when a field
+//! is removed, renamed or retyped, or an `orch` exit code changes — never on an addition; the
+//! phone ignores fields it does not know. `"orch"` is this binary's version, for diagnostics.
+//! `tests/fixtures/watch-v1.json` is a real line of the shape Kabuk's tests load too; the test
+//! below keeps every key of it in what `compose` builds.
 
 use anyhow::Result;
 use orch_proto::api::{AgentRow, MessageRow, PaneInfo, PaneState, QuestionRow, Request, HUMAN};
@@ -149,7 +155,7 @@ async fn snapshot(c: &mut Conn) -> Result<String> {
     } else {
         None
     };
-    let mut list = merge(&agents, &panes, &session, herdr_alive.as_ref(), now_ms());
+    let list = merge(&agents, &panes, &session, herdr_alive.as_ref(), now_ms());
     // The text of every waiting agent's pane, so the phone can show and answer its dialog.
     let mut screens = serde_json::Map::new();
     for a in &list {
@@ -163,21 +169,32 @@ async fn snapshot(c: &mut Conn) -> Result<String> {
             screens.insert(pane.to_string(), Value::String(text));
         }
     }
-    list.sort_by_key(|a| {
+    Ok(compose(list, &questions, screens, &timeline).to_string())
+}
+
+/// The watch line from its parts: agents (from `merge`) sorted blocked-first, the open questions,
+/// the blocked agents' screens and the timeline tail. Pure, so the fixture test can build one.
+fn compose(
+    mut agents: Vec<Value>,
+    questions: &[QuestionRow],
+    screens: serde_json::Map<String, Value>,
+    timeline: &[MessageRow],
+) -> Value {
+    agents.sort_by_key(|a| {
         (
             order(a["status"].as_str().unwrap_or("")),
             a["workspace_number"].as_u64().unwrap_or(u64::MAX),
         )
     });
-    Ok(json!({
+    json!({
         "v": 1,
+        "orch": env!("CARGO_PKG_VERSION"),
         "human": HUMAN,
-        "agents": list,
+        "agents": agents,
         "questions": questions,
         "screens": screens,
         "timeline": timeline,
     })
-    .to_string())
 }
 
 fn order(s: &str) -> u8 {
@@ -397,9 +414,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn merge_joins_layout_screen_and_drops_dead() {
-        let session = Session {
+    /// One workspace "proj" with one tab holding pane p1, raised.
+    fn session_p1() -> Session {
+        Session {
             version: 1,
             workspaces: vec![Workspace {
                 id: "w1".into(),
@@ -419,7 +436,12 @@ mod tests {
                 seq: 1,
                 workspace: "w1".into(),
             }),
-        };
+        }
+    }
+
+    #[test]
+    fn merge_joins_layout_screen_and_drops_dead() {
+        let session = session_p1();
         let panes = vec![
             pane("p1", Some("claude"), Some("blocked")),
             pane("p2", Some("codex"), Some("idle")),
@@ -443,5 +465,76 @@ mod tests {
         assert_eq!(out[0]["focused"], true);
         assert_eq!(out[3]["registered"], false);
         assert_eq!(out[3]["pane"], "orch:p2");
+    }
+
+    /// The contract with Kabuk: a composed line has every key of the frozen v1 fixture (a real
+    /// `--once` line; Kabuk's tests load the same file). Removing or renaming a key fails here.
+    #[test]
+    fn line_keeps_every_key_of_the_v1_fixture() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/watch-v1.json")).unwrap();
+        let session = session_p1();
+        let panes = vec![pane("p1", Some("claude"), Some("blocked"))];
+        let agents = vec![agent("webshop-claude", Some("orch:p1"), "blocked", 1000)];
+        let list = merge(&agents, &panes, &session, None, 2000);
+        let question = QuestionRow {
+            id: 1,
+            ts_ms: 1000,
+            from: "webshop-claude".into(),
+            text: "Deploy the webshop now?".into(),
+            options: vec!["yes, deploy".into(), "not yet".into()],
+            state: "open".into(),
+            answer: None,
+            answered_by: None,
+            answered_ts_ms: None,
+        };
+        let row = MessageRow {
+            id: 1,
+            ts_ms: 1000,
+            from: "webshop-claude".into(),
+            to: HUMAN.into(),
+            kind: "ask".into(),
+            text: "Deploy the webshop now?".into(),
+            thread: None,
+            question: Some(1),
+        };
+        let mut screens = serde_json::Map::new();
+        screens.insert(
+            "orch:p1".into(),
+            Value::String(" ❯ 1. Yes\n   2. No".into()),
+        );
+        let line = compose(list, &[question], screens, &[row]);
+        let keys = |v: &Value| -> Vec<String> { v.as_object().unwrap().keys().cloned().collect() };
+        for k in keys(&fixture) {
+            assert!(line.get(&k).is_some(), "top-level key {k:?} missing");
+        }
+        for k in keys(&fixture["agents"][0]) {
+            assert!(
+                line["agents"][0].get(&k).is_some(),
+                "agent key {k:?} missing"
+            );
+        }
+        for k in keys(&fixture["questions"][0]) {
+            assert!(
+                line["questions"][0].get(&k).is_some(),
+                "question key {k:?} missing"
+            );
+        }
+        for k in keys(&fixture["timeline"][0]) {
+            assert!(
+                line["timeline"][0].get(&k).is_some(),
+                "timeline key {k:?} missing"
+            );
+        }
+        assert_eq!(line["v"], 1);
+        assert_eq!(fixture["v"], 1, "fixture and code must agree on v");
+        assert!(line["orch"].as_str().is_some_and(|s| !s.is_empty()));
+        assert_eq!(line["agents"][0]["status"], "blocked");
+        assert_eq!(
+            line["screens"]["orch:p1"].as_str().unwrap().len(),
+            " ❯ 1. Yes\n   2. No".len()
+        );
+        // One line, no embedded newline: what the phone reads with readLine().
+        assert!(!line.to_string().contains('\n'));
     }
 }
