@@ -1,5 +1,42 @@
 # Status
 
+## 2026-11-03 (evening) — Touch TUI, restart with layout, review council — Claude (orchtool session)
+
+Handover state for whichever session continues. Everything below is committed, `scripts/check.sh` green (65 tests),
+installed in ~/.local/bin, and the live orchd was restarted at 17:50 onto it (layout restored, 3 panes).
+
+- **TUI on the phone** (`crates/orch/src/tui.rs`): SGR mouse on.
+  - Taps: focus a pane, select a tab, the `+` in the status bar opens a new tab, `☰ <workspace>` opens the workspace list.
+  - The workspace list has `+ new workspace / tab / agent`, `× close tab / workspace` and `↻ restart orchd`. It scrolls, and confirmations have tappable Yes/Cancel buttons.
+  - The wheel scrolls a shell back through orchd's scrollback, sends arrow keys to programs on the alternate screen, and passes mouse events through to programs that ask for them.
+  - The status bar degrades at narrow widths, and there is no idle redraw.
+- **orchd**:
+  - `UiOp::CloseTab{workspace,index,tab}` (the tab id decides) and `UiOp::CloseWorkspace`.
+  - `Stream::Screen.alt`.
+  - `daemon.stop{restart}` saves `restore.json` before stopping (a failed save refuses the stop) and removes the socket first. The next orchd recreates the layout (`crates/orchd/src/restore.rs`):
+    - same folders, sizes and programs;
+    - agents resume: `claude --continue`, `codex resume --last`, also when they were typed into a shell;
+    - each agent gets its old bus name (`ORCH_AGENT`).
+    - CLI: `orch stop-daemon --restart`.
+  - NOTE: today's restart was saved by the old orchd, so agents came back as plain shells and got new bus names. From now on restarts keep them.
+- **Environment**: `orch_proto::env::full_env()` fills PATH and profile variables from `$SHELL -lc env` when orch or orchd were started from a bare SSH command. Panes and `orch new` use it.
+- **Bus**: a new agent name does not inherit earlier `all` broadcasts.
+- **watch**:
+  - `seen_ms` is rounded to whole minutes (the line had churned about once a second).
+  - herdr's pane list is cached for 15 s.
+  - New field `hashes` (pane → screen hash).
+  - `text_hash` hashes `hash_normalize(text)`, ignoring pulsing bullets, spinners and spinner status lines. `read --hash`, watch `hashes`, `send --expect` and the answered-once memory all share it.
+- **Review council** (report: https://claude.ai/artifact/XS5yAuejFeobjU3gBnZX4J; Codex: CODEX-REVIEW-P5-TUI-RESULT.md):
+  - The orchtool findings are fixed.
+  - The Kabuk findings are in notes/kabuk-council-findings.md. The Kabuk session applied 13 of the 17 in 0.5.4–0.5.6.
+- **Open, Murat's call**:
+  - Native workspace/tab bar. orchtool half: a `workspaces` array in watch, plus `orch ws` and `orch tab` CLI over the existing UiOps.
+  - Long-press agent menu in Kabuk.
+  - Timeline only when changed (a contract change).
+  - Questions from agents that are gone (expiry or Dismiss).
+  - Phase 5: task queue, `limited` status, `orch wait`, worktrees.
+  - Smaller items: one TUI frame per key, the help screen at phone width, a `│` split border, `read` without hard line breaks, and the 250 ms Enter delay only for Codex panes.
+
 ## 2026-11-03 — Telegram removed; honest Kabuk contract, phase 1 — Claude
 
 - **Telegram is out of orchtool** (Murat's decision, 2026-11-03): `orchd/src/telegram.rs`, `orchd --no-telegram`,
