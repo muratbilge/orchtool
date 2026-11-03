@@ -1,5 +1,21 @@
 # Status
 
+## 2026-11-03 — Telegram removed; honest Kabuk contract, phase 1 — Claude
+
+- **Telegram is out of orchtool** (Murat's decision, 2026-11-03): `orchd/src/telegram.rs`, `orchd --no-telegram`,
+  `orch telegram pair`, the `telegram.pair` request and the bus's Telegram bookkeeping (`tg_map_*`, pairing kv) are
+  gone; `ureq` dropped. `~/.config/orchtool/telegram.env` is no longer read — Murat can delete it. The SQLite
+  tables stay (`kv` still holds the pane counter, `dedup` the dedup keys, `tg_map` is unused; no drop migration).
+  **The running orchd keeps the bridge until its next restart** (old binary in memory). Kabuk keeps herdr as a
+  fallback; it still sees herdr panes through `orch watch`.
+- `orch` exit codes (crates/orch/src/exit.rs, `orch --help`): 10 screen changed, 11 already answered (screen or
+  question; stderr carries the answer), 12 pane exited, 13 input full, 14 no such pane/question/not placed,
+  20 orchd unreachable, 1 other, 2 clap; 3/4 reserved for Kabuk's wrapper. orchd answers a missing question
+  with `no_question`.
+- `orch watch` line: `"orch": "<version>"` next to `"v": 1`; `snapshot()` split into a pure `compose()`;
+  `crates/orch/tests/fixtures/watch-v1.json` (a real 0.1.0 `--once` line, same file as Kabuk's
+  `orch-watch.json` plus the `orch` key) asserted by a unit test. Contract note: `notes/kabuk-contract-v2.md`.
+
 
 
 ## 2026-11-03 — Phase 4 code done: Kabuk ↔ orchtool (Claude; Codex reviewed)

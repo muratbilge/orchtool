@@ -302,6 +302,7 @@ impl Daemon {
                     return Err(err("no_question", format!("no question #{id}")));
                 }
                 let (won, q) = self.bus.answer(id, &answer, &by).map_err(bus_err)?;
+
                 if won {
                     let _ = self.bus.set_status(&q.from, "working", Some("answered"));
                 }
@@ -310,10 +311,6 @@ impl Daemon {
             Request::ListQuestions { all } => {
                 let rows = self.bus.questions(all).map_err(bus_err)?;
                 Ok(json!({ "questions": rows }))
-            }
-            Request::TelegramPair {} => {
-                let code = crate::telegram::new_pair_code(&self.bus).map_err(bus_err)?;
-                Ok(json!({ "code": code }))
             }
             Request::Subscribe {}
             | Request::Attach(_)

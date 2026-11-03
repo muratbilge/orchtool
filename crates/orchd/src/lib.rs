@@ -6,6 +6,5 @@ pub mod pane;
 pub mod render;
 pub mod restore;
 pub mod server;
-pub mod telegram;
 pub mod term;
 pub mod ui;

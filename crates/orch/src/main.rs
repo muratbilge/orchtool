@@ -209,11 +209,6 @@ enum Cmd {
         #[arg(long, default_value = "claude")]
         kind: String,
     },
-    /// Telegram: `orch telegram pair` prints a one-time code for the bot
-    Telegram {
-        #[arg(value_parser = ["pair"])]
-        action: String,
-    },
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -483,13 +478,6 @@ async fn run(cli: Cli) -> Result<()> {
             let text = (!text.is_empty()).then(|| text.join(" "));
             conn.request(&Request::SetStatus { name, status, text })
                 .await?;
-        }
-        Cmd::Telegram { .. } => {
-            let v = conn.request(&Request::TelegramPair {}).await?;
-            println!(
-                "Send this to your orchtool bot in Telegram (valid 10 min):\n\n  /pair {}",
-                v["code"].as_str().unwrap_or("?")
-            );
         }
     }
     Ok(())

@@ -47,7 +47,6 @@ async fn daemon() -> Daemon {
         .arg("500")
         .arg("--db")
         .arg(dir.join("bus.db"))
-        .arg("--no-telegram")
         .spawn()
         .unwrap();
     for _ in 0..100 {

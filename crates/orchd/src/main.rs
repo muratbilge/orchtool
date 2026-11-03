@@ -1,6 +1,6 @@
 //! orchd — the orchtool daemon. Usually started by `orch` on first use (or by systemd --user).
 //!
-//! Usage: orchd [--socket PATH] [--db PATH] [--scrollback LINES] [--no-telegram]
+//! Usage: orchd [--socket PATH] [--db PATH] [--scrollback LINES]
 
 use orchd::bus::Bus;
 use orchd::server::{serve, start_nudger, Daemon};
@@ -12,7 +12,7 @@ use tokio::signal::unix::{signal, SignalKind};
 const DEFAULT_SCROLLBACK: usize = 3000;
 
 fn usage() -> ! {
-    eprintln!("usage: orchd [--socket PATH] [--db PATH] [--scrollback LINES] [--no-telegram]");
+    eprintln!("usage: orchd [--socket PATH] [--db PATH] [--scrollback LINES]");
     std::process::exit(2);
 }
 
@@ -24,7 +24,6 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_SCROLLBACK);
     let mut db = orch_proto::client::state_dir().join("orchtool.db");
-    let mut telegram = true;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -36,7 +35,6 @@ async fn main() -> anyhow::Result<()> {
                     .unwrap_or_else(|| usage())
             }
             "--db" => db = PathBuf::from(args.next().unwrap_or_else(|| usage())),
-            "--no-telegram" => telegram = false,
             "--version" => {
                 println!("orchd {}", env!("CARGO_PKG_VERSION"));
                 return Ok(());
@@ -71,13 +69,6 @@ async fn main() -> anyhow::Result<()> {
     let daemon = Daemon::new(scrollback, Arc::clone(&bus));
     start_nudger(Arc::clone(&daemon));
     orchd::ui::start_detector(Arc::clone(&daemon));
-    match (telegram, orchd::telegram::TgConfig::load()) {
-        (true, Some(cfg)) => orchd::telegram::start(Arc::clone(&bus), cfg),
-        (true, None) => {
-            eprintln!("orchd: telegram off (no TG_TOKEN in ~/.config/orchtool/telegram.env)")
-        }
-        (false, _) => {}
-    }
     // After a restart: the layout the previous orchd saved, with fresh panes.
     let restore = dir.join("restore.json");
     if let Ok(data) = std::fs::read(&restore) {

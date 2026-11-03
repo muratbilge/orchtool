@@ -101,9 +101,6 @@ pub enum Request {
         #[serde(default)]
         all: bool,
     },
-    /// Start Telegram pairing: returns a one-time code to send to the bot as `/pair CODE`.
-    #[serde(rename = "telegram.pair")]
-    TelegramPair {},
 
     // ---- workspaces / TUI (phase 3) ----
     /// The layout: workspaces → tabs → split tree.

@@ -168,7 +168,7 @@ fn handle(state: &Arc<State>, out: &mpsc::UnboundedSender<Out>, msg: Value) {
 const INSTRUCTIONS: &str = "You are connected to orchtool, Murat's agent bus. Other agents (Claude, Codex, …) \
 and Murat himself are reachable here. Use send_message to talk to another agent or to Murat (to: \"murat\"), \
 read_inbox to get messages sent to you, and ask_human when you need Murat's decision — he can answer from his \
-terminal, phone or Telegram. Keep messages short and concrete. When a tool result says a question is not answered \
+terminal or phone. Keep messages short and concrete. When a tool result says a question is not answered \
 yet, call wait_for_answer with that question_id instead of asking again.";
 
 fn tools() -> Value {
@@ -191,7 +191,7 @@ fn tools() -> Value {
         },
         {
             "name": "ask_human",
-            "description": "Ask Murat a question and wait for his answer (he sees it in his terminal, on his phone and in Telegram). Offer options when there are clear choices. If the answer does not arrive within the wait, you get a question_id: call wait_for_answer with it — do not ask again.",
+            "description": "Ask Murat a question and wait for his answer (he sees it in his terminal and on his phone). Offer options when there are clear choices. If the answer does not arrive within the wait, you get a question_id: call wait_for_answer with it — do not ask again.",
             "inputSchema": { "type": "object", "properties": {
                 "question": { "type": "string", "description": "Self-contained question with the context Murat needs" },
                 "options": { "type": "array", "items": { "type": "string" }, "description": "Optional short answer choices (max 8)" },

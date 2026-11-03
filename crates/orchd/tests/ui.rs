@@ -39,7 +39,6 @@ async fn daemon(tag: &str) -> D {
         .arg(&socket)
         .arg("--db")
         .arg(dir.join("db"))
-        .arg("--no-telegram")
         .env("HOME", &dir)
         .spawn()
         .unwrap();
@@ -413,7 +412,6 @@ async fn restart_brings_the_layout_back_with_fresh_panes() {
         .arg(&d.socket)
         .arg("--db")
         .arg(d.dir.join("db"))
-        .arg("--no-telegram")
         .env("HOME", &d.dir)
         .spawn()
         .unwrap();

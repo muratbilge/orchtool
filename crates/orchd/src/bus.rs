@@ -25,8 +25,6 @@ pub enum BusEvent {
     Message(MessageRow),
     Question(QuestionRow),
     Agent(AgentRow),
-    /// "Something changed, re-check the store" (e.g. Telegram got paired).
-    Changed,
 }
 
 pub struct Bus {
@@ -59,6 +57,8 @@ CREATE TABLE IF NOT EXISTS questions(
     options TEXT NOT NULL, state TEXT NOT NULL, answer TEXT, answered_by TEXT, answered_ts INTEGER);
 CREATE TABLE IF NOT EXISTS kv(k TEXT PRIMARY KEY, v TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS dedup(k TEXT PRIMARY KEY);
+-- tg_map belonged to the Telegram bridge, removed 2026-11-03 (Murat's decision). Existing
+-- databases keep the table; nothing reads or writes it and there is no drop migration.
 CREATE TABLE IF NOT EXISTS tg_map(
     tg_msg INTEGER PRIMARY KEY, question INTEGER, agent TEXT, edited INTEGER NOT NULL DEFAULT 0);
 ";
@@ -84,19 +84,12 @@ impl Bus {
     fn with_connection(db: Connection) -> Result<Self> {
         db.busy_timeout(Duration::from_secs(5))?;
         db.execute_batch(SCHEMA)?;
-        // Columns added after the first release of the schema.
-        for (table, col, decl) in [
-            ("agents", "ident", "TEXT"),
-            ("tg_map", "edited", "INTEGER NOT NULL DEFAULT 0"),
-        ] {
-            let has: bool = db
-                .prepare(&format!(
-                    "SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?1"
-                ))?
-                .exists(params![col])?;
-            if !has {
-                db.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {col} {decl}"))?;
-            }
+        // Columns added after the first release of the schema: agents.ident.
+        let has_ident: bool = db
+            .prepare("SELECT 1 FROM pragma_table_info('agents') WHERE name = 'ident'")?
+            .exists([])?;
+        if !has_ident {
+            db.execute_batch("ALTER TABLE agents ADD COLUMN ident TEXT")?;
         }
         let (tx, _) = broadcast::channel(1024);
         Ok(Self {
@@ -107,10 +100,6 @@ impl Bus {
 
     pub fn subscribe(&self) -> broadcast::Receiver<BusEvent> {
         self.tx.subscribe()
-    }
-
-    pub fn poke(&self) {
-        self.emit(BusEvent::Changed);
     }
 
     fn emit(&self, e: BusEvent) {
@@ -265,7 +254,7 @@ impl Bus {
             .context("unexpected duplicate")
     }
 
-    /// Like `send`, but at most once per `dedup` key (e.g. a Telegram update id), atomically.
+    /// Like `send`, but at most once per `dedup` key (an external event's id), atomically.
     /// `None` = this key was already applied.
     #[allow(clippy::too_many_arguments)]
     pub fn send_dedup(
@@ -393,14 +382,6 @@ impl Bus {
             rows
         };
         Ok(rows)
-    }
-
-    pub fn max_message_id(&self) -> Result<i64> {
-        Ok(self.db.lock().unwrap().query_row(
-            "SELECT COALESCE(MAX(id), 0) FROM messages",
-            [],
-            |r| r.get(0),
-        )?)
     }
 
     // ---------- questions ----------
@@ -533,32 +514,7 @@ impl Bus {
         }
     }
 
-    // ---------- small key/value + telegram bookkeeping ----------
-
-    pub fn kv_get(&self, k: &str) -> Result<Option<String>> {
-        Ok(self
-            .db
-            .lock()
-            .unwrap()
-            .query_row("SELECT v FROM kv WHERE k = ?1", params![k], |r| r.get(0))
-            .optional()?)
-    }
-
-    pub fn kv_set(&self, k: &str, v: &str) -> Result<()> {
-        self.db.lock().unwrap().execute(
-            "INSERT INTO kv(k, v) VALUES (?1, ?2) ON CONFLICT(k) DO UPDATE SET v = ?2",
-            params![k, v],
-        )?;
-        Ok(())
-    }
-
-    pub fn kv_del(&self, k: &str) -> Result<()> {
-        self.db
-            .lock()
-            .unwrap()
-            .execute("DELETE FROM kv WHERE k = ?1", params![k])?;
-        Ok(())
-    }
+    // ---------- persistent counters (table kv) ----------
 
     /// Atomically take the next value of a persistent counter (pane ids that never repeat).
     pub fn next_counter(&self, k: &str) -> Result<u64> {
@@ -578,52 +534,6 @@ impl Bus {
         )?;
         tx.commit()?;
         Ok(next)
-    }
-
-    pub fn tg_map_set(
-        &self,
-        tg_msg: i64,
-        question: Option<i64>,
-        agent: Option<&str>,
-    ) -> Result<()> {
-        self.db.lock().unwrap().execute(
-            "INSERT OR REPLACE INTO tg_map(tg_msg, question, agent, edited) VALUES (?1, ?2, ?3, 0)",
-            params![tg_msg, question, agent],
-        )?;
-        Ok(())
-    }
-
-    pub fn tg_map_get(&self, tg_msg: i64) -> Result<Option<(Option<i64>, Option<String>)>> {
-        Ok(self
-            .db
-            .lock()
-            .unwrap()
-            .query_row(
-                "SELECT question, agent FROM tg_map WHERE tg_msg = ?1",
-                params![tg_msg],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?)
-    }
-
-    /// Telegram messages showing question `question`: (message id, already edited to answered).
-    pub fn tg_msgs_for_question(&self, question: i64) -> Result<Vec<(i64, bool)>> {
-        let db = self.db.lock().unwrap();
-        let rows = db
-            .prepare("SELECT tg_msg, edited FROM tg_map WHERE question = ?1")?
-            .query_map(params![question], |r| {
-                Ok((r.get(0)?, r.get::<_, i64>(1)? != 0))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows)
-    }
-
-    pub fn tg_mark_edited(&self, tg_msg: i64) -> Result<()> {
-        self.db.lock().unwrap().execute(
-            "UPDATE tg_map SET edited = 1 WHERE tg_msg = ?1",
-            params![tg_msg],
-        )?;
-        Ok(())
     }
 }
 
@@ -915,7 +825,7 @@ mod tests {
         let path = dir.join("bus.db");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        // An old-schema database (no agents.ident, no tg_map.edited) opens and migrates.
+        // An old-schema database (no agents.ident; the historical tg_map) opens and migrates.
         {
             let db = Connection::open(&path).unwrap();
             db.execute_batch(

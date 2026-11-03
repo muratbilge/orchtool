@@ -401,7 +401,7 @@ pub async fn subscribe(
                         let questions = daemon.bus.questions(false).unwrap_or_default();
                         writer.send_body(&id, send(Event::Questions { questions })).await?
                     }
-                    Ok(BusEvent::Message(_)) | Ok(BusEvent::Changed) => {
+                    Ok(BusEvent::Message(_)) => {
                         for message in daemon.bus.log(Some(last_msg), 500).unwrap_or_default() {
                             last_msg = last_msg.max(message.id);
                             writer.send_body(&id, send(Event::Message { message })).await?;

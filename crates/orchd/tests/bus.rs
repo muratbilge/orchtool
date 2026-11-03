@@ -1,4 +1,4 @@
-//! End-to-end bus tests: real orchd, real orch-mcp / orch binaries, mock Telegram API.
+//! End-to-end bus tests: real orchd, real orch-mcp / orch binaries.
 
 use orch_proto::api::{QuestionRow, Request};
 use orch_proto::client::Conn;
@@ -41,21 +41,13 @@ impl Env {
     }
 
     /// Start orchd with its own db; HOME points into the temp dir so no real config is read.
-    async fn start(&mut self, extra_env: &[(&str, String)], telegram: bool) {
+    async fn start(&mut self) {
         let mut cmd = Command::new(bin("orchd"));
         cmd.arg("--socket")
             .arg(&self.socket)
             .arg("--db")
             .arg(self.dir.join("bus.db"))
-            .env("HOME", &self.dir)
-            .env_remove("TG_TOKEN")
-            .env_remove("TG_CHAT");
-        if !telegram {
-            cmd.arg("--no-telegram");
-        }
-        for (k, v) in extra_env {
-            cmd.env(k, v);
-        }
+            .env("HOME", &self.dir);
         self.daemon = Some(cmd.spawn().unwrap());
         for _ in 0..100 {
             if Conn::unix(&self.socket).await.is_ok() {
@@ -197,7 +189,7 @@ async fn answer(env: &Env, id: i64, text: &str, by: &str) -> Value {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn two_agents_talk_and_one_asks_murat() {
     let mut env = Env::new("talk");
-    env.start(&[], false).await;
+    env.start().await;
     let mut alice = env.mcp("alice", "claude-code");
     let mut bob = env.mcp("bob", "codex-mcp-client");
 
@@ -336,7 +328,7 @@ fn mcp_recv(lines: &Arc<Mutex<BufReader<std::process::ChildStdout>>>, id: i64) -
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn questions_survive_mcp_and_daemon_restarts() {
     let mut env = Env::new("resume");
-    env.start(&[], false).await;
+    env.start().await;
     let mut a = env.mcp("worker", "codex-mcp-client");
     let r = a.tool(
         "ask_human",
@@ -354,7 +346,7 @@ async fn questions_survive_mcp_and_daemon_restarts() {
         .unwrap();
     drop(a); // the agent's MCP process dies
     env.stop(); // and orchd restarts
-    env.start(&[], false).await;
+    env.start().await;
     assert_eq!(open_questions(&env).await.len(), 1, "question persisted");
     answer(&env, id, "sqlite", "cli").await;
     let mut a = env.mcp("worker", "codex-mcp-client");
@@ -371,7 +363,7 @@ async fn questions_survive_mcp_and_daemon_restarts() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mcp_call_cancellation_and_unknown_method() {
     let mut env = Env::new("cancel");
-    env.start(&[], false).await;
+    env.start().await;
     let mut a = env.mcp("canceller", "claude-code");
     let id = a.send(
         "tools/call",
@@ -406,7 +398,7 @@ fn run_hook(env: &Env, agent: &str, event: &str) -> String {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn claude_stop_hook_hands_over_unread_messages() {
     let mut env = Env::new("hook");
-    env.start(&[], false).await;
+    env.start().await;
     assert_eq!(run_hook(&env, "carol", "SessionStart"), "");
     let mut c = env.conn().await;
     let agents = c.request(&Request::ListAgents {}).await.unwrap();
@@ -436,261 +428,10 @@ async fn claude_stop_hook_hands_over_unread_messages() {
     assert_eq!(run_hook(&env, "carol", "Stop"), "");
 }
 
-// ---------- Telegram against a mock Bot API ----------
-
-#[derive(Default)]
-struct MockTg {
-    calls: Vec<(String, Value)>,
-    updates: Vec<Value>,
-    next_msg: i64,
-}
-
-async fn mock_telegram() -> (String, Arc<Mutex<MockTg>>) {
-    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let state = Arc::new(Mutex::new(MockTg {
-        next_msg: 100,
-        ..Default::default()
-    }));
-    let st = state.clone();
-    tokio::spawn(async move {
-        loop {
-            let (sock, _) = listener.accept().await.unwrap();
-            let st = st.clone();
-            tokio::spawn(async move {
-                let mut r = tokio::io::BufReader::new(sock);
-                loop {
-                    let mut request_line = String::new();
-                    if r.read_line(&mut request_line).await.unwrap_or(0) == 0 {
-                        return;
-                    }
-                    let path = request_line
-                        .split_whitespace()
-                        .nth(1)
-                        .unwrap_or("")
-                        .to_string();
-                    let mut len = 0usize;
-                    loop {
-                        let mut h = String::new();
-                        r.read_line(&mut h).await.unwrap();
-                        if h == "\r\n" || h.is_empty() {
-                            break;
-                        }
-                        if let Some(v) = h.to_ascii_lowercase().strip_prefix("content-length:") {
-                            len = v.trim().parse().unwrap_or(0);
-                        }
-                    }
-                    let mut body = vec![0u8; len];
-                    r.read_exact(&mut body).await.unwrap();
-                    let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
-                    let method = path.rsplit('/').next().unwrap_or("").to_string();
-                    assert!(path.starts_with("/bottesttoken/"), "token in path");
-                    let result = if method == "getUpdates" {
-                        let mut ups = Vec::new();
-                        for _ in 0..10 {
-                            ups = std::mem::take(&mut st.lock().unwrap().updates);
-                            if !ups.is_empty() {
-                                break;
-                            }
-                            tokio::time::sleep(Duration::from_millis(50)).await;
-                        }
-                        json!(ups)
-                    } else {
-                        let mut s = st.lock().unwrap();
-                        s.next_msg += 1;
-                        let id = s.next_msg;
-                        s.calls.push((method.clone(), body));
-                        json!({ "message_id": id })
-                    };
-                    let resp = json!({ "ok": true, "result": result }).to_string();
-                    let out = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{resp}",
-                        resp.len()
-                    );
-                    if r.get_mut().write_all(out.as_bytes()).await.is_err() {
-                        return;
-                    }
-                }
-            });
-        }
-    });
-    (format!("http://{addr}"), state)
-}
-
-async fn wait_call(tg: &Arc<Mutex<MockTg>>, pred: impl Fn(&str, &Value) -> bool) -> (i64, Value) {
-    for _ in 0..100 {
-        {
-            let s = tg.lock().unwrap();
-            for (i, (m, b)) in s.calls.iter().enumerate() {
-                if pred(m, b) {
-                    // message_id handed out for call i = 101 + i
-                    return (101 + i as i64, b.clone());
-                }
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!(
-        "expected Telegram call not made; calls: {:?}",
-        tg.lock().unwrap().calls
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn telegram_buttons_and_replies_answer_questions() {
-    let (api, tg) = mock_telegram().await;
-    let mut env = Env::new("tg");
-    env.start(
-        &[
-            ("TG_TOKEN", "testtoken".into()),
-            ("TG_API", api.clone()),
-            ("TG_CHAT", "42".into()),
-        ],
-        true,
-    )
-    .await;
-    let mut a = env.mcp("deployer", "claude-code");
-    a.tool("list_agents", json!({})); // register
-    let ask_id = a.send(
-        "tools/call",
-        json!({ "name": "ask_human", "arguments": { "question": "Ship 1.4?", "options": ["ship", "wait"], "wait_seconds": 20 } }),
-    );
-    let (_, body) = wait_call(&tg, |m, b| {
-        m == "sendMessage" && b["text"].as_str().unwrap_or("").contains("Ship 1.4?")
-    })
-    .await;
-    assert_eq!(body["chat_id"], 42);
-    let data = body["reply_markup"]["inline_keyboard"][0][0]["callback_data"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    assert!(data.starts_with("a:") && data.ends_with(":0"));
-
-    // A stranger pressing the button is ignored.
-    tg.lock()
-        .unwrap()
-        .updates
-        .push(json!({ "update_id": 1, "callback_query": {
-        "id": "x", "data": data, "from": { "id": 99 }, "message": { "chat": { "id": 99 } } } }));
-    tokio::time::sleep(Duration::from_millis(400)).await;
-    assert_eq!(open_questions(&env).await.len(), 1);
-
-    // Murat presses "ship".
-    tg.lock()
-        .unwrap()
-        .updates
-        .push(json!({ "update_id": 2, "callback_query": {
-        "id": "y", "data": data, "from": { "id": 42 }, "message": { "chat": { "id": 42 } } } }));
-    let lines = a.lines.clone();
-    let got = tokio::task::spawn_blocking(move || mcp_recv(&lines, ask_id))
-        .await
-        .unwrap();
-    assert!(got.contains(": ship"), "{got}");
-    // The Telegram message is updated to show the answer.
-    wait_call(&tg, |m, b| {
-        m == "editMessageText" && b["text"].as_str().unwrap_or("").contains("✅ ship")
-    })
-    .await;
-
-    // Agent → Murat message, Murat replies in Telegram → lands in the agent's inbox.
-    a.tool(
-        "send_message",
-        json!({ "to": "murat", "text": "release notes are ready" }),
-    );
-    let (mid, _) = wait_call(&tg, |m, b| {
-        m == "sendMessage"
-            && b["text"]
-                .as_str()
-                .unwrap_or("")
-                .contains("release notes are ready")
-    })
-    .await;
-    tg.lock()
-        .unwrap()
-        .updates
-        .push(json!({ "update_id": 3, "message": {
-        "chat": { "id": 42, "type": "private" }, "from": { "id": 42 }, "text": "thanks, publish them",
-        "reply_to_message": { "message_id": mid } } }));
-    let mut inbox = String::new();
-    for _ in 0..40 {
-        inbox = a.tool("read_inbox", json!({}));
-        if inbox.contains("publish them") {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    assert!(
-        inbox.contains("from murat: thanks, publish them"),
-        "{inbox}"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn telegram_pairing_with_one_time_code() {
-    let (api, tg) = mock_telegram().await;
-    let mut env = Env::new("pair");
-    env.start(&[("TG_TOKEN", "testtoken".into()), ("TG_API", api)], true)
-        .await;
-    // A question asked before pairing must still reach Murat once paired.
-    let mut early = env.mcp("early", "codex-mcp-client");
-    early.tool(
-        "ask_human",
-        json!({ "question": "Asked before pairing?", "wait_seconds": 0 }),
-    );
-    let code = env
-        .conn()
-        .await
-        .request(&Request::TelegramPair {})
-        .await
-        .unwrap()["code"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    // Wrong code: nothing. Right code from a private chat: paired.
-    tg.lock()
-        .unwrap()
-        .updates
-        .push(json!({ "update_id": 1, "message": {
-        "chat": { "id": 7, "type": "private" }, "from": { "id": 7 }, "text": "/pair 000000x" } }));
-    tg.lock()
-        .unwrap()
-        .updates
-        .push(json!({ "update_id": 2, "message": {
-        "chat": { "id": 7, "type": "private" }, "from": { "id": 7 }, "text": format!("/pair {code}") } }));
-    wait_call(&tg, |m, b| {
-        m == "sendMessage"
-            && b["chat_id"] == 7
-            && b["text"].as_str().unwrap_or("").contains("Paired")
-    })
-    .await;
-    wait_call(&tg, |m, b| {
-        m == "sendMessage"
-            && b["chat_id"] == 7
-            && b["text"]
-                .as_str()
-                .unwrap_or("")
-                .contains("Asked before pairing?")
-    })
-    .await;
-    // Now questions go to chat 7.
-    let mut a = env.mcp("p", "codex-mcp-client");
-    a.tool(
-        "ask_human",
-        json!({ "question": "Paired test?", "wait_seconds": 0 }),
-    );
-    wait_call(&tg, |m, b| {
-        m == "sendMessage"
-            && b["chat_id"] == 7
-            && b["text"].as_str().unwrap_or("").contains("Paired test?")
-    })
-    .await;
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancelled_reads_and_retried_asks_lose_and_duplicate_nothing() {
     let mut env = Env::new("cancel2");
-    env.start(&[], false).await;
+    env.start().await;
     let mut a = env.mcp("reader", "claude-code");
     let mut b = env.mcp("writer", "claude-code");
     b.tool("list_agents", json!({}));
@@ -720,51 +461,6 @@ async fn cancelled_reads_and_retried_asks_lose_and_duplicate_nothing() {
     );
     assert!(r.contains("Not answered yet"), "{r}");
     assert_eq!(open_questions(&env).await.len(), 1, "no duplicate question");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn telegram_group_or_other_users_cannot_answer() {
-    let (api, tg) = mock_telegram().await;
-    let mut env = Env::new("tgauth");
-    env.start(
-        &[
-            ("TG_TOKEN", "testtoken".into()),
-            ("TG_API", api),
-            ("TG_CHAT", "42".into()),
-        ],
-        true,
-    )
-    .await;
-    let mut a = env.mcp("asker", "codex-mcp-client");
-    a.tool(
-        "ask_human",
-        json!({ "question": "Who may answer?", "options": ["me"], "wait_seconds": 0 }),
-    );
-    let (mid, body) = wait_call(&tg, |m, b| {
-        m == "sendMessage" && b["text"].as_str().unwrap_or("").contains("Who may answer?")
-    })
-    .await;
-    let data = body["reply_markup"]["inline_keyboard"][0][0]["callback_data"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    {
-        let mut s = tg.lock().unwrap();
-        // Right chat id, wrong sender (a group member).
-        s.updates.push(
-            json!({ "update_id": 1, "callback_query": { "id": "a", "data": data,
-            "from": { "id": 77 }, "message": { "chat": { "id": 42, "type": "group" } } } }),
-        );
-        // Reply from a group chat that happens to use the paired id.
-        s.updates.push(json!({ "update_id": 2, "message": { "chat": { "id": 42, "type": "group" },
-            "from": { "id": 77 }, "text": "group says yes", "reply_to_message": { "message_id": mid } } }));
-    }
-    tokio::time::sleep(Duration::from_millis(600)).await;
-    assert_eq!(
-        open_questions(&env).await.len(),
-        1,
-        "nobody but Murat can answer"
-    );
 }
 
 async fn register_in_pane(env: &Env, name: &str, kind: &str, pane: &str) {
@@ -827,7 +523,7 @@ async fn msg(env: &Env, to: &str, text: &str) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn nudges_only_reach_idle_panes() {
     let mut env = Env::new("nudge");
-    env.start(&[], false).await;
+    env.start().await;
     // An "agent" pane showing an agent's idle prompt footer, then echoing input (cat).
     let idle = new_pane(
         &env,
