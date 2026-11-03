@@ -180,6 +180,15 @@ fn compose(
     screens: serde_json::Map<String, Value>,
     timeline: &[MessageRow],
 ) -> Value {
+    let hashes: serde_json::Map<String, Value> = screens
+        .iter()
+        .filter_map(|(pane, text)| {
+            Some((
+                pane.clone(),
+                Value::String(orch_proto::api::text_hash(text.as_str()?)),
+            ))
+        })
+        .collect();
     agents.sort_by_key(|a| {
         (
             order(a["status"].as_str().unwrap_or("")),
@@ -192,6 +201,9 @@ fn compose(
         "human": HUMAN,
         "agents": agents,
         "questions": questions,
+        // Per screen the hash `orch read --hash --lines 60` would print for that same text, so
+        // the phone can answer with one `orch send --expect` (orchd refuses a stale screen).
+        "hashes": hashes,
         "screens": screens,
         "timeline": timeline,
     })
@@ -553,6 +565,18 @@ mod tests {
             line["screens"]["orch:p1"].as_str().unwrap().len(),
             " ❯ 1. Yes\n   2. No".len()
         );
+        assert_eq!(
+            line["hashes"]["orch:p1"],
+            orch_proto::api::text_hash(" ❯ 1. Yes\n   2. No"),
+            "hash of exactly the screen text"
+        );
+        for (pane, text) in fixture["screens"].as_object().unwrap() {
+            assert_eq!(
+                fixture["hashes"][pane],
+                orch_proto::api::text_hash(text.as_str().unwrap()),
+                "fixture hashes match its screens"
+            );
+        }
         // One line, no embedded newline: what the phone reads with readLine().
         assert!(!line.to_string().contains('\n'));
     }

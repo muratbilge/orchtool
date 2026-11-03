@@ -38,6 +38,7 @@ with `readLine()`. Closing the channel closes `orch`'s stdin and ends it at once
   | `agents` | array | see below, sorted blocked → working → done → idle → other, then by workspace number |
   | `questions` | array | **open** bus questions: `id` int, `ts_ms` int, `from`, `text`, `options` [string], `state` ("open"), `answer`/`answered_by`/`answered_ts_ms` null while open |
   | `screens` | object | pane name (as in `agents[].pane`) → the last **60 lines of recent text** of every agent whose status is `blocked`; nothing for the others |
+  | `hashes` | object | (since 2026-11-03, additive) pane → the hash `orch read <pane> --hash --lines 60` would print for exactly that `screens` text; answer with one exec: `orch send <pane> <key> --expect <hash> --lines 60` |
   | `timeline` | array | the last **40** bus rows, oldest first: `id`, `ts_ms`, `from`, `to`, `kind` (msg/ask/answer/status/event), `text`, `thread` (string/null), `question` (int/null) |
 
   `agents[]`: `name` (bus name, or `<kind>-<pane id>` for an unregistered agent pane), `kind` (claude/codex/shell…),
