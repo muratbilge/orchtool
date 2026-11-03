@@ -2,6 +2,7 @@
 
 mod attach;
 mod bus;
+mod exit;
 mod tui;
 mod watch;
 
@@ -15,7 +16,12 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 #[derive(Parser)]
-#[command(name = "orch", version, about = "orchtool: agent workspace manager")]
+#[command(
+    name = "orch",
+    version,
+    about = "orchtool: agent workspace manager",
+    after_help = exit::HELP
+)]
 struct Cli {
     /// orchd socket (default $ORCHD_SOCKET or ~/.local/state/orchtool/orchd.sock)
     #[arg(long, global = true)]
@@ -215,7 +221,7 @@ async fn main() {
     let cli = Cli::parse();
     if let Err(e) = run(cli).await {
         eprintln!("orch: {e:#}");
-        std::process::exit(1);
+        std::process::exit(exit::code(&e));
     }
 }
 
@@ -273,7 +279,10 @@ async fn run(cli: Cli) -> Result<()> {
                     .await
                     .context("herdr pane read failed")?;
                 if &orch_proto::api::text_hash(&now) != expect {
-                    anyhow::bail!("the pane's screen changed: not sent");
+                    return Err(exit::CliError::Changed(
+                        "the pane's screen changed: not sent".into(),
+                    )
+                    .into());
                 }
             }
             if let Some(t) = text {
@@ -642,7 +651,10 @@ async fn connect(socket: &Path, host: Option<&str>) -> Result<Conn> {
     }
     orch_proto::client::connect_or_start(socket)
         .await
-        .with_context(|| format!("connecting to orchd at {}", socket.display()))
+        .map_err(|e| {
+            exit::CliError::Unreachable(format!("connecting to orchd at {}: {e}", socket.display()))
+        })
+        .map_err(Into::into)
 }
 
 async fn proxy(socket: &Path, mux: bool) -> Result<()> {

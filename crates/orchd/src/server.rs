@@ -298,6 +298,9 @@ impl Daemon {
                 Ok(v)
             }
             Request::Answer { id, answer, by } => {
+                if self.bus.question(id).map_err(bus_err)?.is_none() {
+                    return Err(err("no_question", format!("no question #{id}")));
+                }
                 let (won, q) = self.bus.answer(id, &answer, &by).map_err(bus_err)?;
                 if won {
                     let _ = self.bus.set_status(&q.from, "working", Some("answered"));

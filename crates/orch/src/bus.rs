@@ -193,11 +193,13 @@ pub async fn answer(conn: &mut Conn, id: i64, text: &str, by: &str, literal: boo
     if v["won"].as_bool() == Some(true) {
         println!("answered #{id} → {}", q.from);
     } else {
-        bail!(
+        // Exit 11: first answer wins; the existing answer goes with the message.
+        return Err(crate::exit::CliError::Answered(format!(
             "#{id} was already answered by {}: {}",
             q.answered_by.unwrap_or_default(),
             q.answer.unwrap_or_default()
-        );
+        ))
+        .into());
     }
     Ok(())
 }

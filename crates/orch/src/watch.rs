@@ -6,7 +6,7 @@
 //! not reachable it prints `{"error": "..."}` and retries every 5 s. Stdin EOF (the phone hung up)
 //! ends it at once.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use orch_proto::api::{AgentRow, MessageRow, PaneInfo, PaneState, QuestionRow, Request, HUMAN};
 use orch_proto::client::Conn;
 use orch_proto::layout::Session;
@@ -64,18 +64,22 @@ fn line(s: &str) {
 
 /// One connection's worth of watching; returns (or errs) when the event stream ends.
 async fn watch(socket: &Path, once: bool, last: &mut String) -> Result<()> {
-    let mut req = Conn::unix(socket).await.context("orchd is not running")?;
+    let unreachable = |e: std::io::Error| {
+        crate::exit::CliError::Unreachable(format!("orchd is not running: {e}"))
+    };
+    let mut req = Conn::unix(socket).await.map_err(unreachable)?;
     if once {
         let s = tokio::time::timeout(SNAPSHOT_TIMEOUT, snapshot(&mut req))
             .await
-            .context("orchd did not answer")??;
+            .map_err(|_| {
+                crate::exit::CliError::Unreachable(format!(
+                    "orchd did not answer within {SNAPSHOT_TIMEOUT:?}"
+                ))
+            })??;
         line(&s);
         return Ok(());
     }
-    let (mut events, mut w) = Conn::unix(socket)
-        .await
-        .context("orchd is not running")?
-        .into_parts();
+    let (mut events, mut w) = Conn::unix(socket).await.map_err(unreachable)?.into_parts();
     w.send_body("w", serde_json::to_value(Request::Subscribe {})?)
         .await?;
     let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(1);
