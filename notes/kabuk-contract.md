@@ -1,3 +1,5 @@
+> **Superseded** by `kabuk-contract-v2.md` (orchtool era). This is the herdr-era contract, kept for history.
+
 # Kabuk → herdr contract (source inspection, 2026-11-02)
 
 Inspected `/projects/kabuk` at commit
