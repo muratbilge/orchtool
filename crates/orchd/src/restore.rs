@@ -65,7 +65,14 @@ pub fn restart_spec(sp: &SavedPane) -> (Vec<String>, Vec<(String, String)>) {
                     a.contains(" resume ") || a.contains("--resume ") || a.contains(" -r ")
                 }) =>
         {
-            (sp.argv.clone(), Vec::new())
+            let mut argv = sp.argv.clone();
+            // Its bus name for the agent (the first command), as for the other restored agents.
+            if let (Some(n), Some(script)) = (&sp.bus_name, argv.last_mut()) {
+                if !script.starts_with("ORCH_AGENT=") {
+                    *script = format!("ORCH_AGENT='{}' {script}", n.replace('\'', ""));
+                }
+            }
+            (argv, Vec::new())
         }
         Some(kind) if shell_pane => {
             let shell = sp
@@ -324,7 +331,10 @@ mod tests {
             Some("codex"),
             Some("o-codex"),
         ));
-        assert_eq!(argv, v(&["bash", "-lc", script]));
+        assert_eq!(
+            argv,
+            v(&["bash", "-lc", &format!("ORCH_AGENT='o-codex' {script}")])
+        );
         let script = "claude --resume 6a43; exec bash";
         let (argv, _) = restart_spec(&saved(&["bash", "-lc", script], Some("claude"), None));
         assert_eq!(argv, v(&["bash", "-lc", script]));
