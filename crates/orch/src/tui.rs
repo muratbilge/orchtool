@@ -51,6 +51,8 @@ enum Msg {
         what: String,
         result: Result<Value, String>,
     },
+    /// orchd stopped for a restart: start this TUI again (which starts the new orchd).
+    Restart,
     /// Scrollback text of a pane (for scrolling up in a shell).
     History {
         pane: String,
@@ -75,9 +77,22 @@ enum Closing {
     /// (workspace id, tab index)
     Tab(String, usize),
     Workspace(String),
+    /// Stop orchd (every pane dies) and come back on a fresh one (the installed version).
+    Daemon,
 }
 
-const CLOSE_YES: &str = " Yes, close (y) ";
+/// The action rows of the workspace list.
+#[derive(Clone, Copy)]
+enum WsAction {
+    NewWorkspace,
+    NewTab,
+    NewAgent,
+    CloseTab,
+    CloseWorkspace,
+    RestartDaemon,
+}
+
+const CLOSE_YES: &str = " Yes (y) ";
 const CLOSE_NO: &str = " Cancel (n) ";
 
 /// Lines one wheel step moves (the phone sends one step per three rows dragged).
@@ -156,6 +171,10 @@ struct App {
     scroll: Option<Scroll>,
     /// Pane a mouse press was forwarded to (its release goes there too).
     mouse_down: Option<String>,
+    /// orchd is being restarted: its going away is expected.
+    restarting: bool,
+    /// Leave the loop and exec this program again.
+    restart: bool,
 }
 
 fn prefix_byte() -> u8 {
@@ -277,6 +296,8 @@ pub async fn run(connector: Connector) -> Result<()> {
         held: Vec::new(),
         scroll: None,
         mouse_down: None,
+        restarting: false,
+        restart: false,
     };
     let mut winch = signal(SignalKind::window_change())?;
     let mut tick = tokio::time::interval(Duration::from_secs(1));
@@ -328,6 +349,17 @@ pub async fn run(connector: Connector) -> Result<()> {
             break Ok(());
         }
     };
+    if app.restart && result.is_ok() {
+        drop(guard);
+        // Run again by the name we were started with (PATH lookup or the full path): after an
+        // install, /proc/self/exe points at the replaced, deleted binary.
+        use std::os::unix::process::CommandExt;
+        let mut args = std::env::args_os();
+        let argv0 = args.next().unwrap_or_else(|| "orch".into());
+        let e = std::process::Command::new(argv0).args(args).exec();
+        eprintln!("orch: restart failed: {e}");
+        std::process::exit(1);
+    }
     finish(guard, result)
 }
 
@@ -824,7 +856,12 @@ impl App {
                     }
                 }
             },
+            Msg::EventsClosed(_) if self.restarting => {}
             Msg::EventsClosed(e) => return Err(anyhow!("lost orchd: {e}")),
+            Msg::Restart => {
+                self.restart = true;
+                self.quit = true;
+            }
             Msg::Frame { pane, stream } => {
                 let Some(v) = self.views.get_mut(&pane) else {
                     return Ok(());
@@ -2221,10 +2258,10 @@ impl App {
         let n = self.session.workspaces.len();
         let mut lines = lines;
         lines.push(Line::from(""));
-        for (i, label) in self.ws_actions().iter().enumerate() {
+        for (i, (label, _)) in self.ws_actions().iter().enumerate() {
             let style = if sel == n + i {
                 Style::default().bg(Color::Blue).fg(Color::White)
-            } else if label.starts_with('×') {
+            } else if label.starts_with('×') || label.starts_with('↻') {
                 Style::default().fg(Color::Red)
             } else {
                 Style::default().fg(Color::Cyan)
@@ -2236,18 +2273,22 @@ impl App {
 
     /// The action rows under the workspaces in the workspace list (tappable on a phone);
     /// the close rows act on the workspace / tab on screen.
-    fn ws_actions(&self) -> Vec<String> {
+    fn ws_actions(&self) -> Vec<(String, WsAction)> {
         let mut v = vec![
-            "+ new workspace…".to_string(),
-            "+ new tab (shell)".to_string(),
-            "+ new agent tab…".to_string(),
+            ("+ new workspace…".to_string(), WsAction::NewWorkspace),
+            ("+ new tab (shell)".to_string(), WsAction::NewTab),
+            ("+ new agent tab…".to_string(), WsAction::NewAgent),
         ];
         if let Some(w) = self.current_ws() {
             if let Some(t) = w.tabs.get(w.active_tab) {
-                v.push(format!("× close tab {}…", t.label));
+                v.push((format!("× close tab {}…", t.label), WsAction::CloseTab));
             }
-            v.push(format!("× close workspace {}…", w.label));
+            v.push((
+                format!("× close workspace {}…", w.label),
+                WsAction::CloseWorkspace,
+            ));
         }
+        v.push(("↻ restart orchd…".to_string(), WsAction::RestartDaemon));
         v
     }
 
@@ -2283,6 +2324,10 @@ impl App {
                 ),
                 None => "That workspace is gone already.".into(),
             },
+            Closing::Daemon => format!(
+                "Restart orchd?\nAll {} pane(s) are killed; orch comes back on the\ninstalled orchd.",
+                self.panes.len()
+            ),
         }
     }
 
@@ -2296,6 +2341,30 @@ impl App {
             Closing::Workspace(workspace) => {
                 self.ui("close workspace", UiOp::CloseWorkspace { workspace })
             }
+            Closing::Daemon => {
+                self.restarting = true;
+                self.flash("restarting orchd…");
+                let (connector, tx) = (self.connector.clone(), self.tx.clone());
+                tokio::spawn(async move {
+                    if let Ok(mut c) = connector.connect().await {
+                        let _ = c.request(&Request::StopDaemon {}).await;
+                    }
+                    // Wait until the old orchd is gone, so the restarted TUI starts a new one
+                    // instead of reaching the one shutting down.
+                    for _ in 0..100 {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        if let Some(p) = connector.local_socket() {
+                            if orch_proto::client::Conn::unix(p).await.is_err() {
+                                break;
+                            }
+                        } else {
+                            tokio::time::sleep(Duration::from_secs(2)).await;
+                            break;
+                        }
+                    }
+                    let _ = tx.send(Msg::Restart);
+                });
+            }
         }
     }
 
@@ -2307,24 +2376,30 @@ impl App {
             self.scroll = None;
             return Mode::Normal;
         }
-        match sel.checked_sub(n) {
-            Some(0) => Mode::Prompt(
+        let action = sel
+            .checked_sub(n)
+            .and_then(|i| self.ws_actions().get(i).map(|(_, a)| *a));
+        match action {
+            Some(WsAction::NewWorkspace) => Mode::Prompt(
                 Prompt::NewWorkspace,
                 self.current_ws().map(|w| w.cwd.clone()).unwrap_or_default(),
             ),
-            Some(1) => {
+            Some(WsAction::NewTab) => {
                 self.new_tab();
                 Mode::Normal
             }
-            Some(2) => Mode::Prompt(Prompt::NewAgent, "claude".into()),
-            Some(3) => match self.current_ws() {
+            Some(WsAction::NewAgent) => Mode::Prompt(Prompt::NewAgent, "claude".into()),
+            Some(WsAction::RestartDaemon) => {
+                Mode::Prompt(Prompt::ConfirmClose(Closing::Daemon), String::new())
+            }
+            Some(WsAction::CloseTab) => match self.current_ws() {
                 Some(w) => Mode::Prompt(
                     Prompt::ConfirmClose(Closing::Tab(w.id.clone(), w.active_tab)),
                     String::new(),
                 ),
                 None => Mode::Normal,
             },
-            Some(4) => match self.current_ws() {
+            Some(WsAction::CloseWorkspace) => match self.current_ws() {
                 Some(w) => Mode::Prompt(
                     Prompt::ConfirmClose(Closing::Workspace(w.id.clone())),
                     String::new(),
@@ -2444,7 +2519,14 @@ impl App {
             Prompt::NewAgent => ("new agent tab", "command (claude, codex, …):".to_string()),
             Prompt::RenameTab => ("rename tab", "name:".to_string()),
             Prompt::RenameWorkspace => ("rename workspace", "name:".to_string()),
-            Prompt::ConfirmClose(c) => ("close", self.closing_text(c)),
+            Prompt::ConfirmClose(c) => (
+                if matches!(c, Closing::Daemon) {
+                    "restart"
+                } else {
+                    "close"
+                },
+                self.closing_text(c),
+            ),
             Prompt::Answer(id) => {
                 let q = self.questions.iter().find(|q| q.id == *id);
                 let opts = q

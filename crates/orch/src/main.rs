@@ -571,6 +571,11 @@ impl Connector {
         }
     }
 
+    /// The local orchd socket (None when talking to another machine).
+    pub(crate) fn local_socket(&self) -> Option<&std::path::Path> {
+        self.host.is_none().then_some(self.socket.as_path())
+    }
+
     pub(crate) async fn connect(&self) -> Result<Conn> {
         let Some(host) = self.host.as_deref() else {
             return connect(&self.socket, None).await;
