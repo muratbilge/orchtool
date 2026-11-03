@@ -210,15 +210,21 @@ impl Daemon {
                 })?;
                 self.unplace(&id);
             }
-            UiOp::CloseTab { workspace, index } => {
+            UiOp::CloseTab {
+                workspace,
+                index,
+                tab,
+            } => {
                 let panes = {
                     let s = self.session.lock().unwrap();
                     let w = s
                         .workspace(&workspace)
                         .ok_or_else(|| err("no_workspace", format!("no workspace {workspace}")))?;
-                    w.tabs
-                        .get(index)
-                        .ok_or_else(|| err("no_tab", format!("no tab {index} in {workspace}")))?
+                    let t = match &tab {
+                        Some(id) => w.tabs.iter().find(|t| &t.id == id),
+                        None => w.tabs.get(index),
+                    };
+                    t.ok_or_else(|| err("no_tab", format!("that tab is gone from {}", w.label)))?
                         .root
                         .panes()
                 };

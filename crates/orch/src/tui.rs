@@ -74,8 +74,8 @@ struct Scroll {
 #[derive(Clone)]
 enum Closing {
     Pane(String),
-    /// (workspace id, tab index)
-    Tab(String, usize),
+    /// (workspace id, tab id): ids, not positions — another client may close a tab meanwhile.
+    Tab(String, String),
     Workspace(String),
     /// Stop orchd (every pane dies) and come back on a fresh one (the installed version).
     Daemon,
@@ -302,6 +302,7 @@ pub async fn run(connector: Connector) -> Result<()> {
     let mut winch = signal(SignalKind::window_change())?;
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     let mut dirty = true;
+    let mut last_minute = 0u64;
     let mut last_draw = Instant::now() - Duration::from_secs(1);
     let frame = Duration::from_millis(16);
     let result: Result<()> = loop {
@@ -338,10 +339,19 @@ pub async fn run(connector: Connector) -> Result<()> {
                 dirty = true;
             }
             _ = tick.tick() => {
+                // Redraw only for what the tick changes on screen (a flash expiring, the
+                // status-bar clock's minute): an idle TUI sends nothing over SSH.
                 if app.status.as_ref().is_some_and(|(_, t)| t.elapsed() > Duration::from_secs(4)) {
                     app.status = None;
+                    dirty = true;
                 }
-                dirty = true;
+                let minute = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs() / 60);
+                if minute != last_minute {
+                    last_minute = minute;
+                    dirty = true;
+                }
             }
             _ = tokio::time::sleep(wait) => {}
         }
@@ -948,7 +958,13 @@ impl App {
                     }
                 }
             }
-            Err(e) => self.flash(format!("{what}: {e}")),
+            Err(e) => {
+                if what == "restart" {
+                    // orchd stays up: its going away is no longer expected.
+                    self.restarting = false;
+                }
+                self.flash(format!("{what}: {e}"))
+            }
         }
     }
 
@@ -1067,6 +1083,20 @@ impl App {
     fn mouse(&mut self, m: Mouse) {
         if !matches!(self.mode, Mode::Normal) {
             return self.overlay_mouse(m);
+        }
+        // A press went to a program: its drag and release go there too, wherever they happen
+        // (coordinates are clamped to that pane).
+        if let Some(p) = self.mouse_down.clone() {
+            if !m.press || m.btn & 32 != 0 {
+                match self.pane_rects().into_iter().find(|(q, _)| *q == p) {
+                    Some((_, rect)) => self.forward_mouse(&p, rect, m),
+                    None => self.mouse_down = None,
+                }
+                if !m.press {
+                    self.mouse_down = None;
+                }
+                return;
+            }
         }
         // Status bar: workspace list, tabs, needs-you, help.
         if m.y + 1 == self.size.1 {
@@ -1315,7 +1345,7 @@ impl App {
             Mode::Workspaces(_) => self.workspaces_popup(),
             Mode::NeedsYou(_) => self.needs_you_popup(),
             Mode::Comms(_) => self.comms_popup(),
-            Mode::Prompt(..) => self.popup_rect(76, 8),
+            Mode::Prompt(p, _) => self.prompt_popup(p),
         };
         if !contains(outer, m.x, m.y) {
             // A tap outside a popup closes it.
@@ -1343,9 +1373,10 @@ impl App {
             return;
         }
         match self.mode {
-            Mode::Workspaces(_) => {
-                // Workspaces, a blank row, then the action rows.
+            Mode::Workspaces(cur) => {
+                // Workspaces, a blank row, then the action rows (scrolled to keep `cur` shown).
                 let n = self.session.workspaces.len();
+                let row = row + self.workspaces_offset(cur);
                 let sel = match row {
                     r if r < n => Some(r),
                     r if r > n && r <= n + self.ws_actions().len() => Some(r - 1),
@@ -1356,19 +1387,9 @@ impl App {
                     self.overlay_key(b"\r");
                 }
             }
-            Mode::NeedsYou(_) => {
-                // Items wrap: find the one whose rows contain the tap.
-                let w = (inner.width as usize).max(1);
-                let mut at = 0usize;
-                for (i, (label, _, _)) in self.needs_you().iter().enumerate() {
-                    let rows = Line::from(format!(" {label}")).width().div_ceil(w).max(1);
-                    if row < at + rows {
-                        self.mode = Mode::NeedsYou(i);
-                        self.overlay_key(b"\r");
-                        return;
-                    }
-                    at += rows;
-                }
+            Mode::NeedsYou(_) if row < self.needs_you().len() => {
+                self.mode = Mode::NeedsYou(row);
+                self.overlay_key(b"\r");
             }
             _ => {}
         }
@@ -1410,7 +1431,13 @@ impl App {
             b"&" => {
                 if let Some(w) = self.current_ws() {
                     self.mode = Mode::Prompt(
-                        Prompt::ConfirmClose(Closing::Tab(w.id.clone(), w.active_tab)),
+                        Prompt::ConfirmClose(Closing::Tab(
+                            w.id.clone(),
+                            w.tabs
+                                .get(w.active_tab)
+                                .map(|t| t.id.clone())
+                                .unwrap_or_default(),
+                        )),
                         String::new(),
                     );
                 }
@@ -2122,6 +2149,25 @@ impl App {
             Span::styled(format!("{} ? help ", prefix_name(self.prefix)), base),
             Some(Hit::Help),
         ));
+        // Narrow (phone): the clock and counts go first, then help; "⚑ n" never goes — it
+        // moves next to the workspace name if even that doesn't fit.
+        let w =
+            |v: &[(Span<'static>, Option<Hit>)]| v.iter().map(|(s, _)| s.width()).sum::<usize>();
+        if w(&spans) + w(&right) > width as usize {
+            right.retain(|(_, h)| h.is_some());
+        }
+        if w(&spans) + w(&right) > width as usize {
+            right.retain(|(_, h)| *h != Some(Hit::Help));
+        }
+        if w(&spans) + w(&right) > width as usize && !right.is_empty() {
+            let at = spans
+                .iter()
+                .position(|(_, h)| *h == Some(Hit::Workspaces))
+                .map_or(0, |i| i + 1);
+            for (i, item) in right.drain(..).enumerate() {
+                spans.insert(at + i, item);
+            }
+        }
         let used: usize = spans
             .iter()
             .chain(right.iter())
@@ -2178,6 +2224,25 @@ impl App {
 
     fn needs_you_popup(&self) -> (Rect, Rect) {
         self.popup_rect(90, (self.needs_you().len() as u16 * 2 + 4).max(6))
+    }
+
+    fn prompt_popup(&self, p: &Prompt) -> (Rect, Rect) {
+        // A confirmation's text wraps on a phone: room for it above the buttons.
+        let h = if matches!(p, Prompt::ConfirmClose(_)) {
+            10
+        } else {
+            8
+        };
+        self.popup_rect(76, h)
+    }
+
+    /// First row of the workspace list shown: keeps the selection visible when the list is
+    /// taller than the screen (rows: workspaces, a blank row, the action rows).
+    fn workspaces_offset(&self, sel: usize) -> usize {
+        let (_, inner) = self.workspaces_popup();
+        let n = self.session.workspaces.len();
+        let row = if sel < n { sel } else { sel + 1 };
+        (row + 1).saturating_sub(inner.height as usize)
     }
 
     fn comms_popup(&self) -> (Rect, Rect) {
@@ -2268,6 +2333,8 @@ impl App {
             };
             lines.push(Line::from(Span::styled(format!("   {label}"), style)));
         }
+        let skip = self.workspaces_offset(sel);
+        let lines: Vec<Line> = lines.into_iter().skip(skip).collect();
         f.render_widget(Paragraph::new(lines), r);
     }
 
@@ -2302,10 +2369,10 @@ impl App {
         };
         match c {
             Closing::Pane(p) => format!("Kill {p} and close it?"),
-            Closing::Tab(ws, i) => match self
+            Closing::Tab(ws, tab) => match self
                 .session
                 .workspace(ws)
-                .and_then(|w| Some((w, w.tabs.get(*i)?)))
+                .and_then(|w| Some((w, w.tabs.iter().find(|t| &t.id == tab)?)))
             {
                 Some((w, t)) => format!(
                     "Close tab {} of {}?\n{} killed.",
@@ -2335,8 +2402,22 @@ impl App {
         self.scroll = None;
         match c {
             Closing::Pane(pane) => self.ui("close", UiOp::ClosePane { pane }),
-            Closing::Tab(workspace, index) => {
-                self.ui("close tab", UiOp::CloseTab { workspace, index })
+            Closing::Tab(workspace, tab) => {
+                let index = self
+                    .session
+                    .workspace(&workspace)
+                    .and_then(|w| w.tabs.iter().position(|t| t.id == tab));
+                match index {
+                    Some(index) => self.ui(
+                        "close tab",
+                        UiOp::CloseTab {
+                            workspace,
+                            index,
+                            tab: Some(tab),
+                        },
+                    ),
+                    None => self.flash("that tab is gone already"),
+                }
             }
             Closing::Workspace(workspace) => {
                 self.ui("close workspace", UiOp::CloseWorkspace { workspace })
@@ -2346,23 +2427,47 @@ impl App {
                 self.flash("restarting orchd…");
                 let (connector, tx) = (self.connector.clone(), self.tx.clone());
                 tokio::spawn(async move {
-                    if let Ok(mut c) = connector.connect().await {
-                        let _ = c.request(&Request::StopDaemon { restart: true }).await;
+                    let fail = |e: String| {
+                        let _ = tx.send(Msg::Reply {
+                            what: "restart".into(),
+                            result: Err(e),
+                        });
+                    };
+                    match connector.connect().await {
+                        Ok(mut c) => {
+                            // orchd refuses (and keeps running) when it can't save the layout.
+                            if let Err(orch_proto::client::ClientError::Remote(e)) =
+                                c.request(&Request::StopDaemon { restart: true }).await
+                            {
+                                return fail(e.message);
+                            }
+                        }
+                        Err(e) => return fail(e.to_string()),
                     }
-                    // Wait until the old orchd is gone, so the restarted TUI starts a new one
-                    // instead of reaching the one shutting down.
+                    // Wait until the old orchd is gone (it removes its socket first), so the
+                    // restarted TUI starts a new one instead of reaching the one shutting down.
+                    let mut gone = false;
                     for _ in 0..100 {
                         tokio::time::sleep(Duration::from_millis(100)).await;
-                        if let Some(p) = connector.local_socket() {
-                            if orch_proto::client::Conn::unix(p).await.is_err() {
+                        match connector.local_socket() {
+                            Some(p) => {
+                                if orch_proto::client::Conn::unix(p).await.is_err() {
+                                    gone = true;
+                                    break;
+                                }
+                            }
+                            None => {
+                                tokio::time::sleep(Duration::from_secs(2)).await;
+                                gone = true;
                                 break;
                             }
-                        } else {
-                            tokio::time::sleep(Duration::from_secs(2)).await;
-                            break;
                         }
                     }
-                    let _ = tx.send(Msg::Restart);
+                    if gone {
+                        let _ = tx.send(Msg::Restart);
+                    } else {
+                        fail("orchd did not stop within 10 s".into());
+                    }
                 });
             }
         }
@@ -2394,7 +2499,13 @@ impl App {
             }
             Some(WsAction::CloseTab) => match self.current_ws() {
                 Some(w) => Mode::Prompt(
-                    Prompt::ConfirmClose(Closing::Tab(w.id.clone(), w.active_tab)),
+                    Prompt::ConfirmClose(Closing::Tab(
+                        w.id.clone(),
+                        w.tabs
+                            .get(w.active_tab)
+                            .map(|t| t.id.clone())
+                            .unwrap_or_default(),
+                    )),
                     String::new(),
                 ),
                 None => Mode::Normal,
@@ -2448,10 +2559,15 @@ impl App {
                 } else {
                     Style::default()
                 };
+                // One row each (the full text is in the answer prompt): taps map 1:1 to rows.
+                let label = truncate(
+                    &label.replace('\n', " "),
+                    (r.width as usize).saturating_sub(1),
+                );
                 Line::from(Span::styled(format!(" {label}"), style))
             })
             .collect();
-        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), r);
+        f.render_widget(Paragraph::new(lines), r);
     }
 
     fn draw_comms(&self, f: &mut ratatui::Frame, input: &str) {
@@ -2550,8 +2666,10 @@ impl App {
                 )
             }
         };
-        let r = self.popup(f, title, 76, 8);
+        let (outer, _) = self.prompt_popup(p);
+        let r = self.popup(f, title, outer.width, outer.height);
         let mut lines: Vec<Line> = hint.lines().map(|l| Line::from(l.to_string())).collect();
+        let mut text_area = r;
         if matches!(p, Prompt::ConfirmClose(_)) {
             // Buttons on the last row (tappable; y / Enter and n / Esc work too).
             f.render_widget(
@@ -2565,6 +2683,8 @@ impl App {
                 ])),
                 Rect::new(r.x, r.y + r.height.saturating_sub(1), r.width, 1),
             );
+            // The text never covers the buttons, however much it wraps.
+            text_area.height = r.height.saturating_sub(1);
         } else {
             lines.push(Line::from(vec![
                 Span::styled("› ", Style::default().fg(Color::Blue)),
@@ -2573,7 +2693,7 @@ impl App {
             let y = r.y + lines.len() as u16 - 1;
             f.set_cursor_position((r.x + 2 + input.chars().count() as u16, y));
         }
-        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), r);
+        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), text_area);
     }
 }
 

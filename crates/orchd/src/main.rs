@@ -71,6 +71,7 @@ async fn main() -> anyhow::Result<()> {
     orchd::ui::start_detector(Arc::clone(&daemon));
     // After a restart: the layout the previous orchd saved, with fresh panes.
     let restore = dir.join("restore.json");
+    let _ = daemon.restore_path.set(restore.clone());
     if let Ok(data) = std::fs::read(&restore) {
         // Read once: a layout that makes orchd fail must not come back on every start.
         let _ = std::fs::remove_file(&restore);
@@ -96,18 +97,11 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     eprintln!("orchd: stopping, killing panes");
-    server.abort();
-    if daemon
-        .restart_requested
-        .load(std::sync::atomic::Ordering::SeqCst)
-    {
-        match daemon.save_layout(&restore) {
-            Ok(()) => eprintln!("orchd: layout saved for the restart"),
-            Err(e) => eprintln!("orchd: saving the layout failed: {e}"),
-        }
-    }
-    daemon.kill_all();
+    // The socket goes first: from now on a client finds no orchd and starts a new one, and
+    // this one never touches the path again (it would unlink the new orchd's socket).
     let _ = std::fs::remove_file(&socket);
+    server.abort();
+    daemon.kill_all();
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     Ok(())
 }

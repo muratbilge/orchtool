@@ -3,6 +3,7 @@
 
 pub mod api;
 pub mod client;
+pub mod env;
 pub mod layout;
 pub mod mux;
 

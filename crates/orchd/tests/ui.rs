@@ -328,12 +328,24 @@ async fn close_tab_and_workspace_kill_their_panes() {
     };
     assert_eq!(list().await, 4);
 
-    // Closing tab 2 of "a" kills both panes of its split; tab 1 stays.
+    // Closing tab 2 of "a" (by its id; the index is ignored then) kills both panes of its
+    // split; tab 1 stays.
+    let now: Session = serde_json::from_value(
+        Conn::unix(&d.socket)
+            .await
+            .unwrap()
+            .request(&Request::UiGet {})
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let tab2 = now.workspace(&ws).unwrap().tabs[1].id.clone();
     let v = op(
         &d,
         UiOp::CloseTab {
             workspace: ws.clone(),
-            index: 1,
+            index: 0,
+            tab: Some(tab2.clone()),
         },
     )
     .await;
@@ -341,6 +353,18 @@ async fn close_tab_and_workspace_kill_their_panes() {
     let a = s.workspace(&ws).unwrap();
     assert_eq!(a.tabs.len(), 1);
     assert_eq!(a.tabs[0].root.panes(), vec![p1]);
+    assert_eq!(list().await, 2);
+    // Again with the same id: that tab is gone, nothing else is touched.
+    let r = Conn::unix(&d.socket)
+        .await
+        .unwrap()
+        .request(&Request::Ui(UiOp::CloseTab {
+            workspace: ws.clone(),
+            index: 0,
+            tab: Some(tab2),
+        }))
+        .await;
+    assert!(r.is_err(), "vanished tab is an error");
     assert_eq!(list().await, 2);
 
     // Closing workspace "a" (by label) removes it and its pane; "b" is untouched.

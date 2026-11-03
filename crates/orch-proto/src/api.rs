@@ -160,6 +160,10 @@ pub enum UiOp {
     CloseTab {
         workspace: String,
         index: usize,
+        /// The tab's id: when given, it decides (and a vanished tab is an error), so a tab
+        /// closed meanwhile by another client can't shift the index onto the wrong one.
+        #[serde(default)]
+        tab: Option<String>,
     },
     /// Kill every pane of a workspace and remove it.
     CloseWorkspace {

@@ -32,8 +32,8 @@ pub struct Daemon {
     answered: Mutex<HashMap<String, (String, Instant)>>,
     pub scrollback: usize,
     pub shutdown: Notify,
-    /// `daemon.stop` asked for a restart: save the layout for the next orchd.
-    pub restart_requested: std::sync::atomic::AtomicBool,
+    /// Where `daemon.stop` with `restart` saves the layout for the next orchd (set by main).
+    pub restore_path: std::sync::OnceLock<std::path::PathBuf>,
 }
 
 #[derive(Debug)]
@@ -64,7 +64,7 @@ impl Daemon {
             answered: Mutex::new(HashMap::new()),
             scrollback,
             shutdown: Notify::new(),
-            restart_requested: Default::default(),
+            restore_path: Default::default(),
         })
     }
 
@@ -227,8 +227,16 @@ impl Daemon {
                 Ok(json!({ "pane": id }))
             }
             Request::StopDaemon { restart } => {
+                // Saved while every pane still runs, before anything stops: if saving fails,
+                // nothing is killed and the caller hears why.
                 if restart {
-                    self.restart_requested.store(true, Ordering::SeqCst);
+                    let path = self
+                        .restore_path
+                        .get()
+                        .ok_or_else(|| err("save_failed", "no place to save the layout"))?;
+                    self.save_layout(path).map_err(|e| {
+                        err("save_failed", format!("saving the layout failed: {e}"))
+                    })?;
                 }
                 self.shutdown.notify_one();
                 Ok(json!({ "stopping": true }))
@@ -634,7 +642,8 @@ async fn attach_loop(
             .send_body(id, stream_body(&Stream::Role { role: current }))
             .await?;
     }
-    let mut seq: u64 = 0;
+    // (revision, alternate-screen flag last sent)
+    let mut seq: (u64, Option<bool>) = (0, None);
     let mut dirty = true;
     let mut last_sent = Instant::now() - FRAME_INTERVAL;
     loop {
@@ -702,7 +711,7 @@ async fn attach_loop(
 async fn send_frame(
     pane: &Arc<Pane>,
     renderer: &mut Renderer,
-    seq: &mut u64,
+    seq: &mut (u64, Option<bool>),
     id: &str,
     writer: &mut FrameWriter,
 ) -> std::io::Result<()> {
@@ -713,15 +722,25 @@ async fn send_frame(
         let alt = term.screen().alternate_screen();
         (renderer.render(term.screen(), gen), rows, cols, gen, alt)
     };
-    let Some(frame) = frame else { return Ok(()) };
-    let base = if frame.full { 0 } else { *seq };
-    *seq += 1;
+    // A switch to/from the alternate screen with identical content still has to reach the
+    // client (it decides what the wheel does): an empty diff carries the new flag.
+    let frame = match frame {
+        Some(f) => f,
+        None if seq.1 != Some(alt) => crate::render::Frame {
+            full: false,
+            data: String::new(),
+        },
+        None => return Ok(()),
+    };
+    seq.1 = Some(alt);
+    let base = if frame.full { 0 } else { seq.0 };
+    seq.0 += 1;
     let s = Stream::Screen {
         gen,
         rows,
         cols,
         base,
-        rev: *seq,
+        rev: seq.0,
         full: frame.full,
         data: frame.data,
         alt,

@@ -511,7 +511,10 @@ const SESSION_VARS: &[&str] = &[
 
 /// This shell's environment minus variables that belong to the calling session.
 pub(crate) fn client_env(extra: &[String]) -> Result<Vec<(String, String)>> {
-    let mut env: Vec<(String, String)> = std::env::vars()
+    // Completed from the login shell: started from a bare SSH command (the phone), PATH and
+    // the profile's variables would be missing in the pane.
+    let mut env: Vec<(String, String)> = orch_proto::env::full_env()
+        .into_iter()
         .filter(|(k, _)| {
             !(k.starts_with("HERDR_")
                 || k.starts_with("TMUX")

@@ -74,11 +74,12 @@ impl Pane {
             anyhow::bail!("cwd is not a directory: {cwd}");
         }
         cmd.cwd(&cwd);
-        if let Some(env) = &req.env {
-            cmd.env_clear();
-            for (k, v) in env {
-                cmd.env(k, v);
-            }
+        // No environment given: orchd's own, completed from the login shell (orchd may have
+        // been started from a bare SSH command whose PATH has no ~/.local/bin).
+        let env = req.env.clone().unwrap_or_else(orch_proto::env::full_env);
+        cmd.env_clear();
+        for (k, v) in &env {
+            cmd.env(k, v);
         }
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");

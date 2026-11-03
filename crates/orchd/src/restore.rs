@@ -24,6 +24,64 @@ pub struct SavedPane {
     pub cols: u16,
     #[serde(default)]
     pub name: Option<String>,
+    /// The agent seen in the pane (claude / codex), also when it was started inside a shell.
+    #[serde(default)]
+    pub agent: Option<String>,
+    /// Its name on the bus: the restarted agent takes it again (unread mail, open questions).
+    #[serde(default)]
+    pub bus_name: Option<String>,
+}
+
+const SHELLS: [&str; 5] = ["bash", "zsh", "sh", "fish", "dash"];
+
+fn base(p: &str) -> &str {
+    Path::new(p)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(p)
+}
+
+/// What to start for a saved pane, plus extra environment. An agent that ran inside a shell
+/// comes back resumed inside that shell (and the shell stays when it exits); an agent started
+/// directly is resumed directly. Either way it gets its old bus name.
+pub fn restart_spec(sp: &SavedPane) -> (Vec<String>, Vec<(String, String)>) {
+    let agent = sp
+        .agent
+        .as_deref()
+        .filter(|a| matches!(*a, "claude" | "codex"));
+    let shell_pane =
+        sp.argv.is_empty() || sp.argv.first().is_some_and(|a| SHELLS.contains(&base(a)));
+    let name_env = |v: &mut Vec<(String, String)>| {
+        if let Some(n) = &sp.bus_name {
+            v.push(("ORCH_AGENT".into(), n.clone()));
+        }
+    };
+    match agent {
+        Some(kind) if shell_pane => {
+            let shell = sp
+                .argv
+                .first()
+                .cloned()
+                .or_else(|| std::env::var("SHELL").ok())
+                .unwrap_or_else(|| "/bin/bash".into());
+            let resume = restart_argv(&[kind.to_string()]).join(" ");
+            // Only the agent gets the name, not every program started later in the shell.
+            let name = sp
+                .bus_name
+                .as_deref()
+                .map(|n| format!("ORCH_AGENT='{}' ", n.replace('\'', "")))
+                .unwrap_or_default();
+            let script = format!("{name}{resume}; exec '{}'", shell.replace('\'', ""));
+            (vec![shell, "-lc".into(), script], Vec::new())
+        }
+        _ => {
+            let mut env = Vec::new();
+            if agent.is_some() {
+                name_env(&mut env);
+            }
+            (restart_argv(&sp.argv), env)
+        }
+    }
 }
 
 /// What to run again: the same program; agents resume their last conversation.
@@ -72,6 +130,7 @@ impl Daemon {
     pub fn snapshot_layout(&self) -> Saved {
         let session = self.session.lock().unwrap().clone();
         let mut panes = HashMap::new();
+        let agents = self.bus.agents().unwrap_or_default();
         for p in self.all_panes() {
             if p.exit_code().is_some() {
                 continue;
@@ -84,6 +143,10 @@ impl Daemon {
                 .filter(|c| !c.ends_with(" (deleted)"))
                 .unwrap_or_else(|| p.cwd.clone());
             let (rows, cols) = p.size();
+            let bus_name = agents
+                .iter()
+                .find(|a| a.pane.as_deref() == Some(format!("orch:{}", p.id).as_str()))
+                .map(|a| a.name.clone());
             panes.insert(
                 p.id.clone(),
                 SavedPane {
@@ -92,6 +155,8 @@ impl Daemon {
                     rows,
                     cols,
                     name: p.name.clone(),
+                    agent: p.kind(),
+                    bus_name,
                 },
             );
         }
@@ -125,11 +190,19 @@ impl Daemon {
                         failed.push(old);
                         continue;
                     };
+                    let (argv, extra) = restart_spec(sp);
+                    // orchd's own environment, plus the agent's bus name.
+                    let env = (!extra.is_empty()).then(|| {
+                        orch_proto::env::full_env()
+                            .into_iter()
+                            .chain(extra.iter().cloned())
+                            .collect::<Vec<_>>()
+                    });
                     let req = |cwd: Option<String>| NewPane {
                         name: sp.name.clone(),
-                        argv: restart_argv(&sp.argv),
+                        argv: argv.clone(),
                         cwd,
-                        env: None,
+                        env: env.clone(),
                         rows: Some(sp.rows.max(2)),
                         cols: Some(sp.cols.max(2)),
                     };
@@ -204,5 +277,39 @@ mod tests {
         );
         assert_eq!(restart_argv(&v(&["bash"])), v(&["bash"]));
         assert!(restart_argv(&[]).is_empty());
+    }
+
+    fn saved(argv: &[&str], agent: Option<&str>, bus: Option<&str>) -> SavedPane {
+        SavedPane {
+            argv: v(argv),
+            cwd: "/tmp".into(),
+            rows: 20,
+            cols: 80,
+            name: None,
+            agent: agent.map(str::to_string),
+            bus_name: bus.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn agents_typed_into_a_shell_come_back_resumed_with_their_name() {
+        let (argv, env) =
+            restart_spec(&saved(&["/bin/bash"], Some("claude"), Some("kabuk-claude")));
+        assert_eq!(argv[0], "/bin/bash");
+        assert_eq!(argv[1], "-lc");
+        assert_eq!(
+            argv[2],
+            "ORCH_AGENT='kabuk-claude' claude --continue; exec '/bin/bash'"
+        );
+        assert!(env.is_empty(), "the shell itself gets no agent name");
+
+        let (argv, env) = restart_spec(&saved(&["codex"], Some("codex"), Some("x-codex")));
+        assert_eq!(argv, v(&["codex", "resume", "--last"]));
+        assert_eq!(env, vec![("ORCH_AGENT".to_string(), "x-codex".to_string())]);
+
+        // A plain shell stays a plain shell.
+        let (argv, env) = restart_spec(&saved(&["bash", "--norc"], None, None));
+        assert_eq!(argv, v(&["bash", "--norc"]));
+        assert!(env.is_empty());
     }
 }

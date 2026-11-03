@@ -283,7 +283,9 @@ fn merge(
             "workspace": workspace,
             "workspace_number": number,
             "focused": focused,
-            "seen_ms": a.last_seen_ms,
+            // Whole minutes: every hook call bumps last_seen, and the exact value would make
+            // the line differ (and go to the phone) about once a second for nothing.
+            "seen_ms": a.last_seen_ms - a.last_seen_ms.rem_euclid(60_000),
             "registered": true,
         }));
     }
@@ -349,8 +351,25 @@ pub(crate) async fn herdr_read(id: &str, lines: usize) -> Option<String> {
     herdr(&["pane", "read", id, "--source", "recent", "--lines", &n]).await
 }
 
-/// The ids of herdr's live panes; None when herdr can't be asked.
+/// How long herdr's pane list is reused: asking herdr costs 40-80 ms and a process, and a
+/// snapshot runs on every hint (often several per second).
+const HERDR_CACHE: Duration = Duration::from_secs(15);
+
+/// The ids of herdr's live panes (cached for [`HERDR_CACHE`]); None when herdr can't be asked.
 async fn herdr_panes() -> Option<HashSet<String>> {
+    type Cache = std::sync::Mutex<Option<(Instant, Option<HashSet<String>>)>>;
+    static CACHE: Cache = std::sync::Mutex::new(None);
+    if let Some((at, v)) = CACHE.lock().unwrap().as_ref() {
+        if at.elapsed() < HERDR_CACHE {
+            return v.clone();
+        }
+    }
+    let v = herdr_panes_now().await;
+    *CACHE.lock().unwrap() = Some((Instant::now(), v.clone()));
+    v
+}
+
+async fn herdr_panes_now() -> Option<HashSet<String>> {
     let v: Value = serde_json::from_str(herdr(&["pane", "list"]).await?.trim()).ok()?;
     Some(
         v["result"]["panes"]
