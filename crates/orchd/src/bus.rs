@@ -156,6 +156,18 @@ impl Bus {
         if name == HUMAN || name == "all" {
             anyhow::bail!("{name:?} is reserved");
         }
+        // A name seen for the first time starts with an empty inbox: broadcasts sent before it
+        // existed are not news to it (a restarted session would otherwise get them all again).
+        let is_new = !db
+            .prepare("SELECT 1 FROM agents WHERE name = ?1")?
+            .exists(params![name])?;
+        if is_new {
+            db.execute(
+                "INSERT OR IGNORE INTO message_reads(message, agent)
+                 SELECT id, ?1 FROM messages WHERE recipient = 'all'",
+                params![name],
+            )?;
+        }
         db.execute(
             "INSERT INTO agents(name, kind, pane, cwd, status, last_seen, ident)
              VALUES (?1, ?2, ?3, ?4, 'unknown', ?5, ?6)
@@ -697,6 +709,33 @@ mod tests {
         // No pane, no instance → always a fresh name, never someone else's mailbox.
         let c = reg_full(&bus, "codex", None, None, "/x/proj");
         assert!(c != a && c != b);
+    }
+
+    #[test]
+    fn new_agents_do_not_get_old_broadcasts() {
+        let dir = std::env::temp_dir().join(format!("orch-bus-bc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let bus = Bus::open(&dir.join("db")).unwrap();
+        let reg = |name: &str| RegisterAgent {
+            name: Some(name.into()),
+            kind: "claude".into(),
+            ..Default::default()
+        };
+        let old = bus.register(&reg("old")).unwrap().name;
+        bus.send(&old, "all", "msg", "before", None, None).unwrap();
+        let late = bus.register(&reg("late")).unwrap().name;
+        assert!(
+            bus.inbox(&late).unwrap().is_empty(),
+            "sent before it existed"
+        );
+        bus.send(&old, "all", "msg", "after", None, None).unwrap();
+        let rows = bus.inbox(&late).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].text, "after");
+        // Registering again (same name) does not swallow unread broadcasts.
+        bus.register(&reg("late")).unwrap();
+        assert_eq!(bus.inbox(&late).unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
