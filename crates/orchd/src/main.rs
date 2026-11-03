@@ -78,6 +78,19 @@ async fn main() -> anyhow::Result<()> {
         }
         (false, _) => {}
     }
+    // After a restart: the layout the previous orchd saved, with fresh panes.
+    let restore = dir.join("restore.json");
+    if let Ok(data) = std::fs::read(&restore) {
+        // Read once: a layout that makes orchd fail must not come back on every start.
+        let _ = std::fs::remove_file(&restore);
+        match serde_json::from_slice::<orchd::restore::Saved>(&data) {
+            Ok(saved) => {
+                let n = daemon.restore_layout(saved);
+                eprintln!("orchd: restored the layout with {n} pane(s)");
+            }
+            Err(e) => eprintln!("orchd: ignoring {}: {e}", restore.display()),
+        }
+    }
     let server = tokio::spawn(serve(listener, Arc::clone(&daemon)));
     let mut term = signal(SignalKind::terminate())?;
     let mut int = signal(SignalKind::interrupt())?;
@@ -93,6 +106,15 @@ async fn main() -> anyhow::Result<()> {
     }
     eprintln!("orchd: stopping, killing panes");
     server.abort();
+    if daemon
+        .restart_requested
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        match daemon.save_layout(&restore) {
+            Ok(()) => eprintln!("orchd: layout saved for the restart"),
+            Err(e) => eprintln!("orchd: saving the layout failed: {e}"),
+        }
+    }
     daemon.kill_all();
     let _ = std::fs::remove_file(&socket);
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;

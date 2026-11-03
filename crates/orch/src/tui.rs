@@ -2325,7 +2325,7 @@ impl App {
                 None => "That workspace is gone already.".into(),
             },
             Closing::Daemon => format!(
-                "Restart orchd?\nAll {} pane(s) are killed; orch comes back on the\ninstalled orchd.",
+                "Restart orchd (the installed version)?\nWorkspaces and tabs come back; the {} running\nprogram(s) start again in their folders\n(claude / codex continue their last chat).",
                 self.panes.len()
             ),
         }
@@ -2347,7 +2347,7 @@ impl App {
                 let (connector, tx) = (self.connector.clone(), self.tx.clone());
                 tokio::spawn(async move {
                     if let Ok(mut c) = connector.connect().await {
-                        let _ = c.request(&Request::StopDaemon {}).await;
+                        let _ = c.request(&Request::StopDaemon { restart: true }).await;
                     }
                     // Wait until the old orchd is gone, so the restarted TUI starts a new one
                     // instead of reaching the one shutting down.

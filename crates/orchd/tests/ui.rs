@@ -357,3 +357,112 @@ async fn close_tab_and_workspace_kill_their_panes() {
     assert_eq!(s.workspaces[0].label, "b");
     assert_eq!(list().await, 1);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restart_brings_the_layout_back_with_fresh_panes() {
+    let mut d = daemon("restart").await;
+    let v = op(
+        &d,
+        UiOp::NewWorkspace {
+            label: Some("keep".into()),
+            spawn: spawn(&["bash", "--norc"]),
+        },
+    )
+    .await;
+    let ws = session(&v).workspaces[0].id.clone();
+    let shell = v["pane"]["id"].as_str().unwrap().to_string();
+    let v = op(
+        &d,
+        UiOp::Split {
+            pane: shell.clone(),
+            dir: Dir::Right,
+            spawn: spawn(&["cat"]),
+        },
+    )
+    .await;
+    let cat = v["pane"]["id"].as_str().unwrap().to_string();
+    op(
+        &d,
+        UiOp::NewTab {
+            workspace: ws.clone(),
+            spawn: spawn(&["sleep", "1000"]),
+        },
+    )
+    .await;
+    // The shell moves to another folder: it comes back there, not where it started.
+    let mut c = Conn::unix(&d.socket).await.unwrap();
+    c.request(&Request::Send(orch_proto::api::SendPane {
+        pane: shell.clone(),
+        text: format!("cd {}", d.dir.display()),
+        enter: true,
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let before: Session =
+        serde_json::from_value(c.request(&Request::UiGet {}).await.unwrap()).unwrap();
+
+    c.request(&Request::StopDaemon { restart: true })
+        .await
+        .unwrap();
+    let _ = d.child.wait();
+    assert!(d.dir.join("restore.json").exists(), "layout saved");
+    d.child = Command::new(env!("CARGO_BIN_EXE_orchd"))
+        .arg("--socket")
+        .arg(&d.socket)
+        .arg("--db")
+        .arg(d.dir.join("db"))
+        .arg("--no-telegram")
+        .env("HOME", &d.dir)
+        .spawn()
+        .unwrap();
+    let mut c = None;
+    for _ in 0..100 {
+        if let Ok(x) = Conn::unix(&d.socket).await {
+            c = Some(x);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let mut c = c.unwrap();
+    let after: Session =
+        serde_json::from_value(c.request(&Request::UiGet {}).await.unwrap()).unwrap();
+    assert!(!d.dir.join("restore.json").exists(), "read once");
+
+    // Same workspaces, tabs and split shape, new pane ids.
+    assert_eq!(after.workspaces.len(), 1);
+    let (b, a) = (&before.workspaces[0], &after.workspaces[0]);
+    assert_eq!((a.id.as_str(), a.label.as_str()), (b.id.as_str(), "keep"));
+    assert_eq!(a.tabs.len(), 2);
+    assert_eq!(a.active_tab, b.active_tab);
+    let new = a.tabs[0].root.panes();
+    assert_eq!(new.len(), 2);
+    assert!(!new.contains(&shell) && !new.contains(&cat));
+    assert!(matches!(
+        a.tabs[0].root,
+        orch_proto::layout::Node::Split {
+            dir: Dir::Right,
+            ..
+        }
+    ));
+    let panes = c.request(&Request::ListPanes {}).await.unwrap();
+    let panes: Vec<orch_proto::api::PaneInfo> =
+        serde_json::from_value(panes["panes"].clone()).unwrap();
+    let info = |id: &str| panes.iter().find(|p| p.id == id).unwrap().clone();
+    assert_eq!(info(&new[0]).argv, vec!["bash", "--norc"]);
+    assert_eq!(
+        info(&new[0]).cwd,
+        d.dir.display().to_string(),
+        "the shell's folder"
+    );
+    assert_eq!(info(&new[1]).argv, vec!["cat"]);
+    assert_eq!(info(&a.tabs[1].root.panes()[0]).argv, vec!["sleep", "1000"]);
+
+    // A plain stop forgets the layout.
+    c.request(&Request::StopDaemon { restart: false })
+        .await
+        .unwrap();
+    let _ = d.child.wait();
+    assert!(!d.dir.join("restore.json").exists());
+}

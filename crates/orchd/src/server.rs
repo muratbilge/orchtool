@@ -32,6 +32,8 @@ pub struct Daemon {
     answered: Mutex<HashMap<String, (String, Instant)>>,
     pub scrollback: usize,
     pub shutdown: Notify,
+    /// `daemon.stop` asked for a restart: save the layout for the next orchd.
+    pub restart_requested: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Debug)]
@@ -62,6 +64,7 @@ impl Daemon {
             answered: Mutex::new(HashMap::new()),
             scrollback,
             shutdown: Notify::new(),
+            restart_requested: Default::default(),
         })
     }
 
@@ -223,7 +226,10 @@ impl Daemon {
                 self.unplace(&id);
                 Ok(json!({ "pane": id }))
             }
-            Request::StopDaemon {} => {
+            Request::StopDaemon { restart } => {
+                if restart {
+                    self.restart_requested.store(true, Ordering::SeqCst);
+                }
                 self.shutdown.notify_one();
                 Ok(json!({ "stopping": true }))
             }

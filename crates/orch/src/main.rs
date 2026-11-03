@@ -125,7 +125,11 @@ enum Cmd {
         count: u32,
     },
     /// Stop orchd (kills all panes)
-    StopDaemon,
+    StopDaemon {
+        /// Save the layout: the next orchd recreates it (same folders; agents continue)
+        #[arg(long)]
+        restart: bool,
+    },
 
     // ---- agent bus ----
     /// List agents on the bus
@@ -445,8 +449,8 @@ async fn run(cli: Cli) -> Result<()> {
             }
         }
         Cmd::Latency { pane, count } => attach::latency(conn, &pane, count).await?,
-        Cmd::StopDaemon => {
-            conn.request(&Request::StopDaemon {}).await?;
+        Cmd::StopDaemon { restart } => {
+            conn.request(&Request::StopDaemon { restart }).await?;
         }
         Cmd::Proxy { .. } | Cmd::Hook { .. } | Cmd::Ui | Cmd::Watch { .. } => unreachable!(),
         Cmd::Agents { json } => bus::agents(&mut conn, json).await?,

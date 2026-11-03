@@ -36,8 +36,13 @@ pub enum Request {
     /// Attach stream only: ask for a full snapshot.
     #[serde(rename = "resnapshot")]
     Resnapshot {},
+    /// Stop orchd (every pane dies). With `restart`, the layout is saved and the next orchd
+    /// recreates it (fresh panes in the same folders; agents continue their conversation).
     #[serde(rename = "daemon.stop")]
-    StopDaemon {},
+    StopDaemon {
+        #[serde(default)]
+        restart: bool,
+    },
 
     // ---- agent bus (phase 2) ----
     /// Register (or re-identify) an agent; the server picks/returns its name.

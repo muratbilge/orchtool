@@ -4,6 +4,7 @@ pub mod bus;
 pub mod detect;
 pub mod pane;
 pub mod render;
+pub mod restore;
 pub mod server;
 pub mod telegram;
 pub mod term;
