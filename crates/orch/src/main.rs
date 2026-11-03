@@ -183,6 +183,11 @@ enum Cmd {
         #[arg(long)]
         all: bool,
     },
+    /// Manage an individual question
+    Question {
+        #[command(subcommand)]
+        command: QuestionCmd,
+    },
     /// Answer a question: orch answer <id> <text>  (or the option number)
     Answer {
         id: i64,
@@ -220,6 +225,12 @@ enum Cmd {
         #[arg(long, default_value = "claude")]
         kind: String,
     },
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum QuestionCmd {
+    /// Dismiss an open question (14: gone, 11: already answered)
+    Close { id: i64 },
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -475,6 +486,12 @@ async fn run(cli: Cli) -> Result<()> {
         Cmd::Msg { to, text, from } => bus::msg(&mut conn, &from, &to, &text.join(" ")).await?,
         Cmd::Inbox { name, wait, peek } => bus::inbox(&mut conn, &name, wait, peek).await?,
         Cmd::Questions { all } => bus::questions(&mut conn, all).await?,
+        Cmd::Question {
+            command: QuestionCmd::Close { id },
+        } => {
+            conn.request(&Request::CloseQuestion { id }).await?;
+            println!("closed question #{id}");
+        }
         Cmd::Answer {
             id,
             text,

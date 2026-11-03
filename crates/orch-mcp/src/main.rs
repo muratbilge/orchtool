@@ -284,7 +284,9 @@ fn fmt_messages(rows: &[MessageRow]) -> String {
 }
 
 fn fmt_question(q: &QuestionRow) -> String {
-    if q.state == "answered" {
+    if q.state == "expired" {
+        format!("Question #{} expired or was dismissed; no human answer was given. Stop waiting for it.", q.id)
+    } else if q.state == "answered" {
         format!(
             "Murat answered question #{}: {}",
             q.id,

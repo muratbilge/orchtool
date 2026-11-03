@@ -147,6 +147,8 @@ impl Daemon {
             }
             self.unplace(&id);
         }
+        self.expire_questions()
+            .map_err(|e| err("bus", e.to_string()))?;
         Ok(())
     }
 
@@ -336,6 +338,9 @@ pub fn start_detector(daemon: Arc<Daemon>) {
             tick.tick().await;
             let d = Arc::clone(&daemon);
             let now = tokio::task::spawn_blocking(move || {
+                if let Err(e) = d.expire_questions() {
+                    eprintln!("orchd: expiring questions: {e}");
+                }
                 d.pane_infos()
                     .into_iter()
                     .map(|p| (p.id, p.agent_status, p.title, p.exit_code.is_some()))

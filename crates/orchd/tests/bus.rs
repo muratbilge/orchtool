@@ -583,3 +583,97 @@ async fn nudges_only_reach_idle_panes() {
         "working status respected"
     );
 }
+
+#[tokio::test]
+async fn question_close_cli_exit_codes_and_pane_exit_expiration() {
+    let mut env = Env::new("expiry");
+    env.start().await;
+    let mut c = env.conn().await;
+    let q = c
+        .request(&Request::Ask {
+            from: "test".into(),
+            text: "dismiss?".into(),
+            options: vec![],
+        })
+        .await
+        .unwrap();
+    let close = |id: i64| {
+        Command::new(bin("orch"))
+            .arg("--socket")
+            .arg(&env.socket)
+            .args(["question", "close", &id.to_string()])
+            .env("HOME", &env.dir)
+            .output()
+            .unwrap()
+            .status
+            .code()
+            .unwrap()
+    };
+    let id = q["id"].as_i64().unwrap();
+    assert_eq!(close(id), 0);
+    assert_eq!(close(id), 14);
+    assert_eq!(close(999999), 14);
+    let q = c
+        .request(&Request::Ask {
+            from: "test".into(),
+            text: "answer?".into(),
+            options: vec![],
+        })
+        .await
+        .unwrap();
+    let id = q["id"].as_i64().unwrap();
+    c.request(&Request::Answer {
+        id,
+        answer: "yes".into(),
+        by: "human".into(),
+    })
+    .await
+    .unwrap();
+    assert_eq!(close(id), 11);
+    let pane = c
+        .request(&Request::NewPane(orch_proto::api::NewPane {
+            argv: vec!["/bin/sh".into()],
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    let pane = pane["id"].as_str().unwrap().to_string();
+    c.request(&Request::RegisterAgent(orch_proto::api::RegisterAgent {
+        name: Some("shell".into()),
+        kind: "shell".into(),
+        pane: Some(format!("orch:{pane}")),
+        cwd: None,
+        instance: None,
+    }))
+    .await
+    .unwrap();
+    let q = c
+        .request(&Request::Ask {
+            from: "shell".into(),
+            text: "still here?".into(),
+            options: vec![],
+        })
+        .await
+        .unwrap();
+    c.request(&Request::Send(orch_proto::api::SendPane {
+        pane,
+        text: "exit".into(),
+        enter: true,
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+    for _ in 0..100 {
+        let v = c
+            .request(&Request::AskWait {
+                id: q["id"].as_i64().unwrap(),
+                wait_ms: Some(100),
+            })
+            .await
+            .unwrap();
+        if v["state"] == "expired" {
+            return;
+        }
+    }
+    panic!("exit did not expire the question");
+}

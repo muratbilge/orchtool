@@ -451,6 +451,66 @@ impl Bus {
         question_row(&self.db.lock().unwrap(), id)
     }
 
+    /// First terminal state wins, shared with answer(). No answer message is fabricated.
+    pub fn close_question(&self, id: i64) -> Result<Option<(bool, QuestionRow)>> {
+        let db = self.db.lock().unwrap();
+        let won = db.execute(
+            "UPDATE questions SET state = 'expired', answered_by = 'orchd', answered_ts = ?2
+             WHERE id = ?1 AND state = 'open'",
+            params![id, now_ms()],
+        )? == 1;
+        let q = question_row(&db, id)?;
+        drop(db);
+        if won {
+            self.emit(BusEvent::Question(q.clone().expect("updated question")));
+        }
+        Ok(q.map(|q| (won, q)))
+    }
+
+    /// Retire questions whose orch pane is gone, or whose agent has been silent for six hours.
+    pub fn expire_questions(
+        &self,
+        live: &std::collections::HashSet<String>,
+        now: i64,
+    ) -> Result<usize> {
+        let db = self.db.lock().unwrap();
+        let rows = {
+            let mut st = db.prepare(
+                "SELECT q.id, a.pane, COALESCE(a.last_seen, q.ts)
+                 FROM questions q LEFT JOIN agents a ON a.name = q.sender WHERE q.state = 'open'",
+            )?;
+            let rows = st
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, Option<String>>(1)?,
+                        r.get::<_, i64>(2)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
+        let mut expired = Vec::new();
+        for (id, pane, seen) in rows {
+            if now.saturating_sub(seen) > 6 * 3600 * 1000
+                || pane
+                    .as_deref()
+                    .is_some_and(|p| p.starts_with("orch:") && !live.contains(p))
+            {
+                db.execute("UPDATE questions SET state = 'expired', answered_by = 'orchd', answered_ts = ?2 WHERE id = ?1 AND state = 'open'", params![id, now])?;
+                if let Some(q) = question_row(&db, id)? {
+                    expired.push(q);
+                }
+            }
+        }
+        drop(db);
+        let count = expired.len();
+        for q in expired {
+            self.emit(BusEvent::Question(q));
+        }
+        Ok(count)
+    }
+
     pub fn questions(&self, all: bool) -> Result<Vec<QuestionRow>> {
         let db = self.db.lock().unwrap();
         let sql = if all {
@@ -883,5 +943,61 @@ mod tests {
         assert_eq!(bus.question(id).unwrap().unwrap().text, "persist me");
         assert!(bus.answer(id, "done", "cli").unwrap().0);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod expiration_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[tokio::test]
+    async fn expiry_and_answers_are_terminal_and_waiters_wake() {
+        let bus = Bus::open(Path::new(":memory:")).unwrap();
+        let q = bus.ask("agent", "ship?", &[]).unwrap();
+        assert!(bus.close_question(q.id).unwrap().unwrap().0);
+        let got = bus.ask_wait(q.id, Duration::from_secs(10)).await.unwrap();
+        assert_eq!(got.state, "expired");
+        assert!(!bus.answer(q.id, "yes", "human").unwrap().0);
+        assert!(bus.questions(false).unwrap().is_empty());
+        assert!(bus.answer_message(q.id).unwrap().is_none());
+        assert!(!bus.close_question(q.id).unwrap().unwrap().0);
+        assert!(bus.close_question(9999).unwrap().is_none());
+        let next = bus.ask("agent", "ship?", &[]).unwrap();
+        assert_ne!(next.id, q.id);
+        bus.answer(next.id, "no", "human").unwrap();
+        let (won, answered) = bus.close_question(next.id).unwrap().unwrap();
+        assert!(!won);
+        assert_eq!(answered.answer.as_deref(), Some("no"));
+    }
+
+    #[test]
+    fn gone_panes_and_six_hour_staleness_expire_only_open_questions() {
+        let bus = Bus::open(Path::new(":memory:")).unwrap();
+        bus.register(&RegisterAgent {
+            name: Some("a".into()),
+            kind: "shell".into(),
+            pane: Some("orch:p1".into()),
+            cwd: None,
+            instance: None,
+        })
+        .unwrap();
+        let q = bus.ask("a", "hello?", &[]).unwrap();
+        let live = HashSet::from(["orch:p1".to_string()]);
+        let now = bus.agents().unwrap()[0].last_seen_ms;
+        assert_eq!(
+            bus.expire_questions(&live, now + 6 * 3600 * 1000).unwrap(),
+            0
+        );
+        assert_eq!(
+            bus.expire_questions(&live, now + 6 * 3600 * 1000 + 1)
+                .unwrap(),
+            1
+        );
+        assert_eq!(bus.question(q.id).unwrap().unwrap().state, "expired");
+        let q = bus.ask("a", "again?", &[]).unwrap();
+        assert_eq!(bus.expire_questions(&HashSet::new(), now).unwrap(), 1);
+        assert_eq!(bus.question(q.id).unwrap().unwrap().state, "expired");
+        assert_eq!(bus.expire_questions(&HashSet::new(), now).unwrap(), 0);
     }
 }

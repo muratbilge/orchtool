@@ -142,6 +142,7 @@ impl Daemon {
             .lock()
             .unwrap()
             .retain(|_, p| !Arc::ptr_eq(p, &pane));
+        self.expire_questions().map_err(bus_err)?;
         Ok(())
     }
 
@@ -150,6 +151,20 @@ impl Daemon {
             pane.kill();
             pane.signal_group(libc::SIGTERM);
         }
+    }
+
+    pub fn expire_questions(&self) -> anyhow::Result<usize> {
+        let live = self
+            .all_panes()
+            .iter()
+            .filter(|p| p.exit_code().is_none())
+            .map(|p| format!("orch:{}", p.id))
+            .collect();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+        self.bus.expire_questions(&live, now)
     }
 
     async fn handle(&self, req: Request) -> Result<Value, ApiError> {
@@ -310,6 +325,9 @@ impl Daemon {
                     return Err(err("no_question", format!("no question #{id}")));
                 }
                 let (won, q) = self.bus.answer(id, &answer, &by).map_err(bus_err)?;
+                if q.state == "expired" {
+                    return Err(err("no_question", format!("question #{id} expired")));
+                }
 
                 if won {
                     let _ = self.bus.set_status(&q.from, "working", Some("answered"));
@@ -317,9 +335,17 @@ impl Daemon {
                 Ok(json!({ "won": won, "question": q }))
             }
             Request::ListQuestions { all } => {
+                self.expire_questions().map_err(bus_err)?;
                 let rows = self.bus.questions(all).map_err(bus_err)?;
                 Ok(json!({ "questions": rows }))
             }
+            Request::CloseQuestion { id } => match self.bus.close_question(id).map_err(bus_err)? {
+                Some((true, q)) => Ok(json!({ "question": q })),
+                Some((false, q)) if q.state == "answered" => {
+                    Err(err("answered", format!("question #{id} already answered")))
+                }
+                _ => Err(err("no_question", format!("question #{id} is gone"))),
+            },
             Request::Subscribe {}
             | Request::Attach(_)
             | Request::Input { .. }

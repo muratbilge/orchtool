@@ -96,6 +96,9 @@ pub enum Request {
     /// First answer wins; later answers get `won: false` and the existing answer.
     #[serde(rename = "ask.answer")]
     Answer { id: i64, answer: String, by: String },
+    /// Dismiss an open question without manufacturing a human answer.
+    #[serde(rename = "ask.close")]
+    CloseQuestion { id: i64 },
     #[serde(rename = "ask.list")]
     ListQuestions {
         #[serde(default)]
