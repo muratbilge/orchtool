@@ -1863,6 +1863,16 @@ impl App {
         );
         let focused = self.focused();
         let mut cursor = None;
+        if let Some(tab) = self.current_tab().filter(|t| !t.zoomed) {
+            for border in tab.root.vertical_borders(to_lrect(main)) {
+                let rect = to_rect(border);
+                f.render_widget(
+                    Paragraph::new(vec![Line::from("│"); rect.height as usize])
+                        .style(Style::default().fg(Color::DarkGray)),
+                    rect,
+                );
+            }
+        }
         for (pane, rect) in self.pane_rects() {
             let is_focus = focused.as_deref() == Some(pane.as_str());
             let info = self.panes.get(&pane);
@@ -2920,6 +2930,52 @@ mod tests {
             tx,
             (80, 24),
         )
+    }
+
+    #[test]
+    fn split_border_is_visible_only_between_side_by_side_panes() {
+        use orch_proto::layout::{Node, Tab, Workspace};
+        let mut app = test_app();
+        app.size = (40, 12);
+        app.sidebar = false;
+        app.session.workspaces.push(Workspace {
+            id: "w1".into(),
+            label: "test".into(),
+            cwd: "/tmp".into(),
+            active_tab: 0,
+            tabs: vec![Tab {
+                id: "t1".into(),
+                label: "one".into(),
+                focus: "p1".into(),
+                zoomed: false,
+                root: Node::Split {
+                    dir: Dir::Right,
+                    ratio: 0.5,
+                    a: Box::new(Node::leaf("p1")),
+                    b: Box::new(Node::leaf("p2")),
+                },
+            }],
+        });
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(40, 12)).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let rects = app.pane_rects();
+        let gap = rects[0].1.right();
+        for y in 0..11 {
+            assert_eq!(terminal.backend().buffer()[(gap, y)].symbol(), "│");
+        }
+        app.session.workspaces[0].tabs[0].zoomed = true;
+        terminal.draw(|f| app.draw(f)).unwrap();
+        assert_ne!(terminal.backend().buffer()[(gap, 5)].symbol(), "│");
+        let tab = &mut app.session.workspaces[0].tabs[0];
+        tab.zoomed = false;
+        if let Node::Split { dir, .. } = &mut tab.root {
+            *dir = Dir::Down;
+        }
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let gap = app.pane_rects()[0].1.bottom();
+        for x in 0..40 {
+            assert_eq!(terminal.backend().buffer()[(x, gap)].symbol(), " ");
+        }
     }
 
     #[test]

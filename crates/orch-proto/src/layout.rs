@@ -184,6 +184,25 @@ impl Node {
         out
     }
 
+    /// Side-by-side split gaps, using exactly the same geometry as pane placement.
+    pub fn vertical_borders(&self, area: Rect) -> Vec<Rect> {
+        let mut out = Vec::new();
+        if let Node::Split { dir, ratio, a, b } = self {
+            let (ra, rb) = split_rect(area, *dir, *ratio);
+            if *dir == Dir::Right && ra.w > 0 && rb.w > 0 {
+                out.push(Rect {
+                    x: rb.x - 1,
+                    y: area.y,
+                    w: 1,
+                    h: area.h,
+                });
+            }
+            out.extend(a.vertical_borders(ra));
+            out.extend(b.vertical_borders(rb));
+        }
+        out
+    }
+
     fn layout_into(&self, r: Rect, out: &mut Vec<(String, Rect)>) {
         match self {
             Node::Pane { pane } => out.push((pane.clone(), r)),
