@@ -278,3 +278,82 @@ async fn event_stream_reports_layout_panes_and_status() {
         }
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn close_tab_and_workspace_kill_their_panes() {
+    let d = daemon("close").await;
+    let v = op(
+        &d,
+        UiOp::NewWorkspace {
+            label: Some("a".into()),
+            spawn: spawn(&["cat"]),
+        },
+    )
+    .await;
+    let ws = session(&v).workspaces[0].id.clone();
+    let p1 = v["pane"]["id"].as_str().unwrap().to_string();
+    let v = op(
+        &d,
+        UiOp::NewTab {
+            workspace: ws.clone(),
+            spawn: spawn(&["cat"]),
+        },
+    )
+    .await;
+    let p2 = v["pane"]["id"].as_str().unwrap().to_string();
+    op(
+        &d,
+        UiOp::Split {
+            pane: p2.clone(),
+            dir: Dir::Right,
+            spawn: spawn(&["cat"]),
+        },
+    )
+    .await;
+    op(
+        &d,
+        UiOp::NewWorkspace {
+            label: Some("b".into()),
+            spawn: spawn(&["cat"]),
+        },
+    )
+    .await;
+    let list = || async {
+        let v = Conn::unix(&d.socket)
+            .await
+            .unwrap()
+            .request(&Request::ListPanes {})
+            .await
+            .unwrap();
+        v["panes"].as_array().unwrap().len()
+    };
+    assert_eq!(list().await, 4);
+
+    // Closing tab 2 of "a" kills both panes of its split; tab 1 stays.
+    let v = op(
+        &d,
+        UiOp::CloseTab {
+            workspace: ws.clone(),
+            index: 1,
+        },
+    )
+    .await;
+    let s = session(&v);
+    let a = s.workspace(&ws).unwrap();
+    assert_eq!(a.tabs.len(), 1);
+    assert_eq!(a.tabs[0].root.panes(), vec![p1]);
+    assert_eq!(list().await, 2);
+
+    // Closing workspace "a" (by label) removes it and its pane; "b" is untouched.
+    let v = op(
+        &d,
+        UiOp::CloseWorkspace {
+            workspace: "a".into(),
+        },
+    )
+    .await;
+    let s = session(&v);
+    assert_eq!(s.workspaces.len(), 1);
+    assert_eq!(s.workspaces[0].label, "b");
+    assert_eq!(list().await, 1);
+}

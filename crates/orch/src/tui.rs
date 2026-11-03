@@ -68,8 +68,17 @@ struct Scroll {
     offset: usize,
 }
 
-/// Rows under the workspaces in the workspace list (tappable on a phone).
-const WS_ACTIONS: [&str; 3] = ["+ new workspace…", "+ new tab (shell)", "+ new agent tab…"];
+/// What a close confirmation closes (ids; names are looked up when drawing).
+#[derive(Clone)]
+enum Closing {
+    Pane(String),
+    /// (workspace id, tab index)
+    Tab(String, usize),
+    Workspace(String),
+}
+
+const CLOSE_YES: &str = " Yes, close (y) ";
+const CLOSE_NO: &str = " Cancel (n) ";
 
 /// Lines one wheel step moves (the phone sends one step per three rows dragged).
 const WHEEL_LINES: usize = 3;
@@ -104,7 +113,7 @@ enum Prompt {
     NewAgent,
     RenameTab,
     RenameWorkspace,
-    ConfirmClose(String),
+    ConfirmClose(Closing),
     Answer(i64),
 }
 
@@ -1280,13 +1289,29 @@ impl App {
             return;
         }
         let row = (m.y - inner.y) as usize;
+        if let Mode::Prompt(Prompt::ConfirmClose(c), _) = &self.mode {
+            // The buttons on the last row.
+            if m.y + 1 == inner.y + inner.height {
+                let x = (m.x - inner.x) as usize;
+                let yes = CLOSE_YES.chars().count();
+                let no_at = yes + 3;
+                if x < yes {
+                    let c = c.clone();
+                    self.mode = Mode::Normal;
+                    self.close(c);
+                } else if x >= no_at && x < no_at + CLOSE_NO.chars().count() {
+                    self.mode = Mode::Normal;
+                }
+            }
+            return;
+        }
         match self.mode {
             Mode::Workspaces(_) => {
                 // Workspaces, a blank row, then the action rows.
                 let n = self.session.workspaces.len();
                 let sel = match row {
                     r if r < n => Some(r),
-                    r if r > n && r <= n + WS_ACTIONS.len() => Some(r - 1),
+                    r if r > n && r <= n + self.ws_actions().len() => Some(r - 1),
                     _ => None,
                 };
                 if let Some(sel) = sel {
@@ -1345,11 +1370,19 @@ impl App {
         }
         match key {
             b"c" => self.new_tab(),
+            b"&" => {
+                if let Some(w) = self.current_ws() {
+                    self.mode = Mode::Prompt(
+                        Prompt::ConfirmClose(Closing::Tab(w.id.clone(), w.active_tab)),
+                        String::new(),
+                    );
+                }
+            }
             b"v" | b"%" => self.split(Dir::Right, Vec::new()),
             b"s" | b"\"" => self.split(Dir::Down, Vec::new()),
             b"x" => {
                 if let Some(p) = focused {
-                    self.mode = Mode::Prompt(Prompt::ConfirmClose(p), String::new());
+                    self.mode = Mode::Prompt(Prompt::ConfirmClose(Closing::Pane(p)), String::new());
                 }
             }
             b"z" => {
@@ -1532,7 +1565,7 @@ impl App {
                 } else if up {
                     Mode::Workspaces(sel.saturating_sub(1))
                 } else if down {
-                    Mode::Workspaces((sel + 1).min(n + WS_ACTIONS.len() - 1))
+                    Mode::Workspaces((sel + 1).min(n + self.ws_actions().len() - 1))
                 } else if let [d @ b'1'..=b'9'] = key {
                     if let Some(w) = self.session.workspaces.get((d - b'1') as usize) {
                         self.ws_id = Some(w.id.clone());
@@ -1601,9 +1634,9 @@ impl App {
             Mode::Prompt(p, mut input) => {
                 if esc {
                     Mode::Normal
-                } else if let Prompt::ConfirmClose(pane) = &p {
-                    if key == b"y" || key == b"Y" {
-                        self.ui("close", UiOp::ClosePane { pane: pane.clone() });
+                } else if let Prompt::ConfirmClose(c) = &p {
+                    if key == b"y" || key == b"Y" || enter {
+                        self.close(c.clone());
                     }
                     Mode::Normal
                 } else if enter {
@@ -2102,7 +2135,7 @@ impl App {
     }
 
     fn workspaces_popup(&self) -> (Rect, Rect) {
-        let rows = self.session.workspaces.len() + 1 + WS_ACTIONS.len();
+        let rows = self.session.workspaces.len() + 1 + self.ws_actions().len();
         self.popup_rect(60, (rows as u16 + 2).max(6))
     }
 
@@ -2134,7 +2167,8 @@ impl App {
              c      new tab (shell)          A   new agent tab (claude, codex, …)\n\
              v / %  split right              s / \"  split down\n\
              h j k l / arrows  move focus    H J K L   resize\n\
-             z      zoom pane                x   close pane (kills it)\n\
+             z      zoom pane                x   close pane (kills it)
+             &      close tab                (workspaces: close from the w list)\n\
              n / p  next / previous tab      1-9 go to tab\n\
              w      workspaces               ( / )  previous / next workspace\n\
              N      new workspace (cwd)      $   rename workspace   ,  rename tab\n\
@@ -2187,9 +2221,11 @@ impl App {
         let n = self.session.workspaces.len();
         let mut lines = lines;
         lines.push(Line::from(""));
-        for (i, label) in WS_ACTIONS.iter().enumerate() {
+        for (i, label) in self.ws_actions().iter().enumerate() {
             let style = if sel == n + i {
                 Style::default().bg(Color::Blue).fg(Color::White)
+            } else if label.starts_with('×') {
+                Style::default().fg(Color::Red)
             } else {
                 Style::default().fg(Color::Cyan)
             };
@@ -2198,7 +2234,72 @@ impl App {
         f.render_widget(Paragraph::new(lines), r);
     }
 
-    /// Runs a workspace-list row: a workspace, or one of [`WS_ACTIONS`] below them.
+    /// The action rows under the workspaces in the workspace list (tappable on a phone);
+    /// the close rows act on the workspace / tab on screen.
+    fn ws_actions(&self) -> Vec<String> {
+        let mut v = vec![
+            "+ new workspace…".to_string(),
+            "+ new tab (shell)".to_string(),
+            "+ new agent tab…".to_string(),
+        ];
+        if let Some(w) = self.current_ws() {
+            if let Some(t) = w.tabs.get(w.active_tab) {
+                v.push(format!("× close tab {}…", t.label));
+            }
+            v.push(format!("× close workspace {}…", w.label));
+        }
+        v
+    }
+
+    fn closing_text(&self, c: &Closing) -> String {
+        let n = |panes: usize| {
+            if panes == 1 {
+                "its pane is".to_string()
+            } else {
+                format!("its {panes} panes are")
+            }
+        };
+        match c {
+            Closing::Pane(p) => format!("Kill {p} and close it?"),
+            Closing::Tab(ws, i) => match self
+                .session
+                .workspace(ws)
+                .and_then(|w| Some((w, w.tabs.get(*i)?)))
+            {
+                Some((w, t)) => format!(
+                    "Close tab {} of {}?\n{} killed.",
+                    t.label,
+                    w.label,
+                    cap(n(t.root.panes().len()))
+                ),
+                None => "That tab is gone already.".into(),
+            },
+            Closing::Workspace(ws) => match self.session.workspace(ws) {
+                Some(w) => format!(
+                    "Close workspace {}?\nAll {} tab(s) close, {} killed.",
+                    w.label,
+                    w.tabs.len(),
+                    n(w.tabs.iter().map(|t| t.root.panes().len()).sum())
+                ),
+                None => "That workspace is gone already.".into(),
+            },
+        }
+    }
+
+    fn close(&mut self, c: Closing) {
+        self.scroll = None;
+        match c {
+            Closing::Pane(pane) => self.ui("close", UiOp::ClosePane { pane }),
+            Closing::Tab(workspace, index) => {
+                self.ui("close tab", UiOp::CloseTab { workspace, index })
+            }
+            Closing::Workspace(workspace) => {
+                self.ui("close workspace", UiOp::CloseWorkspace { workspace })
+            }
+        }
+    }
+
+    /// Runs a workspace-list row: a workspace, or one of [`Self::ws_actions`] below them.
     fn workspace_row(&mut self, sel: usize) -> Mode {
         let n = self.session.workspaces.len();
         if let Some(w) = self.session.workspaces.get(sel) {
@@ -2216,6 +2317,20 @@ impl App {
                 Mode::Normal
             }
             Some(2) => Mode::Prompt(Prompt::NewAgent, "claude".into()),
+            Some(3) => match self.current_ws() {
+                Some(w) => Mode::Prompt(
+                    Prompt::ConfirmClose(Closing::Tab(w.id.clone(), w.active_tab)),
+                    String::new(),
+                ),
+                None => Mode::Normal,
+            },
+            Some(4) => match self.current_ws() {
+                Some(w) => Mode::Prompt(
+                    Prompt::ConfirmClose(Closing::Workspace(w.id.clone())),
+                    String::new(),
+                ),
+                None => Mode::Normal,
+            },
             _ => Mode::Normal,
         }
     }
@@ -2329,9 +2444,7 @@ impl App {
             Prompt::NewAgent => ("new agent tab", "command (claude, codex, …):".to_string()),
             Prompt::RenameTab => ("rename tab", "name:".to_string()),
             Prompt::RenameWorkspace => ("rename workspace", "name:".to_string()),
-            Prompt::ConfirmClose(pane) => {
-                ("close pane", format!("Kill {pane} and close it? y / n"))
-            }
+            Prompt::ConfirmClose(c) => ("close", self.closing_text(c)),
             Prompt::Answer(id) => {
                 let q = self.questions.iter().find(|q| q.id == *id);
                 let opts = q
@@ -2357,7 +2470,20 @@ impl App {
         };
         let r = self.popup(f, title, 76, 8);
         let mut lines: Vec<Line> = hint.lines().map(|l| Line::from(l.to_string())).collect();
-        if !matches!(p, Prompt::ConfirmClose(_)) {
+        if matches!(p, Prompt::ConfirmClose(_)) {
+            // Buttons on the last row (tappable; y / Enter and n / Esc work too).
+            f.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled(CLOSE_YES, Style::default().bg(Color::Red).fg(Color::White)),
+                    Span::raw("   "),
+                    Span::styled(
+                        CLOSE_NO,
+                        Style::default().bg(Color::Indexed(238)).fg(Color::White),
+                    ),
+                ])),
+                Rect::new(r.x, r.y + r.height.saturating_sub(1), r.width, 1),
+            );
+        } else {
             lines.push(Line::from(vec![
                 Span::styled("› ", Style::default().fg(Color::Blue)),
                 Span::raw(input.to_string()),
@@ -2366,6 +2492,14 @@ impl App {
             f.set_cursor_position((r.x + 2 + input.chars().count() as u16, y));
         }
         f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), r);
+    }
+}
+
+fn cap(s: String) -> String {
+    let mut c = s.chars();
+    match c.next() {
+        Some(f) => f.to_uppercase().chain(c).collect(),
+        None => s,
     }
 }
 

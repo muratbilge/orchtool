@@ -154,6 +154,15 @@ pub enum UiOp {
     ClosePane {
         pane: String,
     },
+    /// Kill every pane of one tab and remove the tab (the workspace goes with its last tab).
+    CloseTab {
+        workspace: String,
+        index: usize,
+    },
+    /// Kill every pane of a workspace and remove it.
+    CloseWorkspace {
+        workspace: String,
+    },
     Focus {
         pane: String,
     },

@@ -136,6 +136,20 @@ impl Daemon {
         let _ = self.ui_events.send(UiEvent::Panes);
     }
 
+    /// Kills panes (already gone is fine) and takes them out of the layout; empty tabs and
+    /// workspaces collapse with them.
+    async fn close_panes(&self, panes: Vec<String>) -> Result<(), ApiError> {
+        for id in panes {
+            match self.kill(&id).await {
+                Ok(_) => {}
+                Err(e) if e.code == "no_pane" => {}
+                Err(e) => return Err(e),
+            }
+            self.unplace(&id);
+        }
+        Ok(())
+    }
+
     pub async fn ui_op(&self, op: UiOp) -> Result<Value, ApiError> {
         let mut created: Option<PaneInfo> = None;
         match op {
@@ -195,6 +209,30 @@ impl Daemon {
                     }
                 })?;
                 self.unplace(&id);
+            }
+            UiOp::CloseTab { workspace, index } => {
+                let panes = {
+                    let s = self.session.lock().unwrap();
+                    let w = s
+                        .workspace(&workspace)
+                        .ok_or_else(|| err("no_workspace", format!("no workspace {workspace}")))?;
+                    w.tabs
+                        .get(index)
+                        .ok_or_else(|| err("no_tab", format!("no tab {index} in {workspace}")))?
+                        .root
+                        .panes()
+                };
+                self.close_panes(panes).await?;
+            }
+            UiOp::CloseWorkspace { workspace } => {
+                let panes: Vec<String> = {
+                    let s = self.session.lock().unwrap();
+                    let w = s
+                        .workspace(&workspace)
+                        .ok_or_else(|| err("no_workspace", format!("no workspace {workspace}")))?;
+                    w.tabs.iter().flat_map(|t| t.root.panes()).collect()
+                };
+                self.close_panes(panes).await?;
             }
             UiOp::Focus { pane } => self.edit(|s| {
                 let (wi, ti) = s
