@@ -61,6 +61,7 @@ with `readLine()`. Closing the channel closes `orch`'s stdin and ends it at once
 |--------|------------------------|--------|
 | re-read before answering a dialog | `"$O" read <pane> --lines 60 --hash` | line 1 `hash:<16 hex>` (FNV-1a 64 of the text), then the text |
 | answer a dialog | `"$O" send <pane> <key> --expect <hash> --lines 60` | nothing |
+| Esc on a dialog (the reply chips' Esc) | `"$O" send <pane> --key Escape --expect <hash> --lines 60` | nothing |
 | answer a bus question | `"$O" answer --by kabuk --literal <id> -- <text>` | `answered #<id> → <agent>` |
 | message an agent / everyone | `"$O" msg -- <to> <text>` | `sent #<id>` |
 | start an agent | `cd <dir> 2>/dev/null \|\| exit 4; P=$("$O" new --cwd "$PWD" -- <tool>) \|\| exit 1; "$O" focus "$P"` | — |
