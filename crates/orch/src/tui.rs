@@ -154,6 +154,7 @@ struct App {
     raise_seq: u64,
     views: HashMap<String, PaneView>,
     mode: Mode,
+    help_scroll: u16,
     prefix_pending: bool,
     sidebar: bool,
     status: Option<(String, Instant)>,
@@ -455,6 +456,7 @@ impl App {
             raise_seq: 0,
             views: HashMap::new(),
             mode: Mode::Normal,
+            help_scroll: 0,
             prefix_pending: false,
             sidebar: cols >= 100,
             status: None,
@@ -1226,7 +1228,10 @@ impl App {
                 self.focus_local(&p);
             }
             Hit::NeedsYou => self.mode = Mode::NeedsYou(0),
-            Hit::Help => self.mode = Mode::Help,
+            Hit::Help => {
+                self.help_scroll = 0;
+                self.mode = Mode::Help;
+            }
             Hit::NewTab => self.new_tab(),
         }
     }
@@ -1375,7 +1380,12 @@ impl App {
 
     fn overlay_mouse(&mut self, m: Mouse) {
         if let Some(up) = m.wheel() {
-            if m.press && matches!(self.mode, Mode::Workspaces(_) | Mode::NeedsYou(_)) {
+            if m.press
+                && matches!(
+                    self.mode,
+                    Mode::Workspaces(_) | Mode::NeedsYou(_) | Mode::Help
+                )
+            {
                 self.overlay_key(if up { b"\x1b[A" } else { b"\x1b[B" });
             }
             return;
@@ -1588,7 +1598,10 @@ impl App {
                 }
             }
             b"d" | b"q" => self.quit = true,
-            b"?" => self.mode = Mode::Help,
+            b"?" => {
+                self.help_scroll = 0;
+                self.mode = Mode::Help;
+            }
             _ => {}
         }
     }
@@ -1666,7 +1679,20 @@ impl App {
         let down = key == b"\x1b[B" || key == b"j";
         let mode = std::mem::replace(&mut self.mode, Mode::Normal);
         self.mode = match mode {
-            Mode::Help => Mode::Normal,
+            Mode::Help => {
+                if up || down {
+                    let max = self.help_max_scroll();
+                    self.help_scroll = if up {
+                        self.help_scroll.saturating_sub(1)
+                    } else {
+                        self.help_scroll.saturating_add(1)
+                    }
+                    .min(max);
+                    Mode::Help
+                } else {
+                    Mode::Normal
+                }
+            }
             Mode::Workspaces(sel) => {
                 let n = self.session.workspaces.len();
                 if esc {
@@ -2327,9 +2353,12 @@ impl App {
         inner
     }
 
-    fn draw_help(&self, f: &mut ratatui::Frame) {
+    fn help_text(&self) -> String {
         let p = prefix_name(self.prefix);
-        let text = format!(
+        if self.size.0 < 72 {
+            return format!("Prefix: {p}, then a key\n↑/↓ or wheel: scroll\nEsc or tap: close\n\nw  workspaces / close\nc  new shell tab\nA  new agent tab\na  questions for you\nm  messages\nn/p  next/previous tab\n1-9  select tab\nv  split right\ns  split down\nh/j/k/l  move focus\nz  zoom pane\nx  close pane\n&  close tab\nN  new workspace\n( / )  next workspace\n$  rename workspace\n,  rename tab\nH/J/K/L  resize split\nb  toggle sidebar\nt  take control\nd  detach (keep running)\n{p} {p}  send prefix");
+        }
+        format!(
             "All commands: {p} then the key.\n\n\
              c      new tab (shell)          A   new agent tab (claude, codex, …)\n\
              v / %  split right              s / \"  split down\n\
@@ -2344,10 +2373,45 @@ impl App {
              b      sidebar                  t   take control of the pane\n\
              d      detach (everything keeps running)\n\
              {p} {p}  send {p} to the pane\n\n\
-             Any key closes this help."
+             ↑/↓ scroll; Esc or any other key closes."
+        )
+    }
+
+    fn help_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let width = usize::from(width.max(1));
+        let mut lines = Vec::new();
+        for source in self.help_text().lines() {
+            let mut row = String::new();
+            let mut used = 0;
+            for c in source.chars() {
+                let n = Span::raw(c.to_string()).width();
+                if used + n > width && !row.is_empty() {
+                    lines.push(Line::from(std::mem::take(&mut row)));
+                    used = 0;
+                }
+                row.push(c);
+                used += n;
+            }
+            lines.push(Line::from(row));
+        }
+        lines
+    }
+
+    fn help_max_scroll(&self) -> u16 {
+        let (_, inner) = self.popup_rect(72, 22);
+        self.help_lines(inner.width)
+            .len()
+            .saturating_sub(inner.height as usize)
+            .min(u16::MAX as usize) as u16
+    }
+
+    fn draw_help(&self, f: &mut ratatui::Frame) {
+        let r = self.popup(f, "help ↑↓ / Esc", 72, 22);
+        f.render_widget(
+            Paragraph::new(self.help_lines(r.width))
+                .scroll((self.help_scroll.min(self.help_max_scroll()), 0)),
+            r,
         );
-        let r = self.popup(f, "orch — keys", 72, 22);
-        f.render_widget(Paragraph::new(text), r);
     }
 
     fn draw_workspaces(&self, f: &mut ratatui::Frame, sel: usize) {
@@ -2930,6 +2994,42 @@ mod tests {
             tx,
             (80, 24),
         )
+    }
+
+    #[test]
+    fn phone_help_is_one_column_and_scrolls_to_the_last_command() {
+        let mut app = test_app();
+        app.size = (36, 16);
+        app.mode = Mode::Help;
+        assert!(app
+            .help_text()
+            .contains("w  workspaces / close\nc  new shell tab"));
+        assert!(app.help_max_scroll() > 0);
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(36, 16)).unwrap();
+        terminal.draw(|f| app.draw_help(f)).unwrap();
+        for _ in 0..100 {
+            app.overlay_key(b"\x1b[B");
+        }
+        assert!(matches!(app.mode, Mode::Help));
+        assert_eq!(app.help_scroll, app.help_max_scroll());
+        terminal.draw(|f| app.draw_help(f)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("send prefix"));
+        app.overlay_mouse(Mouse {
+            btn: 64,
+            x: 5,
+            y: 5,
+            press: true,
+        });
+        assert_eq!(app.help_scroll, app.help_max_scroll() - 1);
+        app.overlay_key(b"\x1b");
+        assert!(matches!(app.mode, Mode::Normal));
     }
 
     #[test]
