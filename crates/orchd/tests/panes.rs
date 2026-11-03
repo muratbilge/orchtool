@@ -566,3 +566,74 @@ async fn attached_client_sees_last_output_before_exit() {
     assert!(a.screen.screen().contents().contains("LAST-LINE"));
     assert_eq!(a.exited, Some(Some(0)));
 }
+
+#[tokio::test]
+async fn send_enter_reaches_shell_and_claude_classified_input() {
+    // The Claude case exercises orchd's classification, not the actual Claude executable.
+    let d = daemon().await;
+    let mut c = Conn::unix(&d.socket).await.unwrap();
+    for kind in ["shell", "claude", "codex"] {
+        let pane = c
+            .request(&Request::NewPane(NewPane {
+                argv: vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "printf 'READY\\n'; IFS= read -r line; printf 'GOT:%s\\n' \"$line\"; sleep 2"
+                        .into(),
+                ],
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        let id = pane["id"].as_str().unwrap().to_string();
+        c.request(&Request::RegisterAgent(orch_proto::api::RegisterAgent {
+            kind: kind.into(),
+            pane: Some(format!("orch:{id}")),
+            name: None,
+            cwd: None,
+            instance: None,
+        }))
+        .await
+        .unwrap();
+        for _ in 0..100 {
+            let v = c
+                .request(&Request::Read(ReadPane {
+                    pane: id.clone(),
+                    lines: Some(20),
+                    source: ReadSource::Recent,
+                }))
+                .await
+                .unwrap();
+            if v["text"].as_str().unwrap().contains("READY") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        c.request(&Request::Send(SendPane {
+            pane: id.clone(),
+            text: "hello".into(),
+            enter: true,
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+        let mut received = false;
+        for _ in 0..100 {
+            let v = c
+                .request(&Request::Read(ReadPane {
+                    pane: id.clone(),
+                    lines: Some(20),
+                    source: ReadSource::Recent,
+                }))
+                .await
+                .unwrap();
+            if v["text"].as_str().unwrap().contains("GOT:hello") {
+                received = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(received, "{kind} classified pane did not receive Enter");
+        c.request(&Request::Kill { pane: id }).await.unwrap();
+    }
+}

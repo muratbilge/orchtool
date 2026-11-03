@@ -19,6 +19,15 @@ use tokio::time::Instant;
 pub const FRAME_INTERVAL: Duration = Duration::from_millis(40);
 /// Pause between typed text and the Enter key in `pane.send` (and nudges).
 pub const ENTER_DELAY_MS: u64 = 250;
+/// Codex paste detection and multi-line pastes need the longer gap. Other single-line
+/// input only needs Enter to arrive in a separate burst. Nudges retain their safety delay.
+fn send_enter_delay(kind: Option<&str>, text: &str) -> Duration {
+    Duration::from_millis(if kind == Some("codex") || text.contains(['\n', '\r']) {
+        ENTER_DELAY_MS
+    } else {
+        20
+    })
+}
 /// How long a conditional send's screen state counts as answered.
 const ANSWERED_FOR: Duration = Duration::from_secs(30);
 
@@ -201,6 +210,7 @@ impl Daemon {
             }
             Request::Send(s) => {
                 let pane = self.find(&s.pane)?;
+                let enter_delay = send_enter_delay(pane.kind().as_deref(), &s.text);
                 if pane.exit_code().is_some() {
                     return Err(err("exited", "pane has exited"));
                 }
@@ -228,7 +238,7 @@ impl Daemon {
                 if s.enter {
                     // A separate, later CR is an Enter key press, not part of a paste. Codex's
                     // paste-burst detection swallowed a CR sent 60 ms after the text.
-                    tokio::time::sleep(Duration::from_millis(ENTER_DELAY_MS)).await;
+                    tokio::time::sleep(enter_delay).await;
                     if !pane.write(b"\r".to_vec()) {
                         return Err(full());
                     }
@@ -772,4 +782,29 @@ async fn send_frame(
         alt,
     };
     writer.send_body(id, stream_body(&s)).await
+}
+
+#[cfg(test)]
+mod enter_delay_tests {
+    use super::*;
+
+    #[test]
+    fn long_gap_is_reserved_for_codex_and_multiline_text() {
+        for kind in [None, Some("claude"), Some("shell")] {
+            assert_eq!(send_enter_delay(kind, "hello"), Duration::from_millis(20));
+            assert_eq!(send_enter_delay(kind, ""), Duration::from_millis(20));
+            assert_eq!(
+                send_enter_delay(kind, "one\ntwo"),
+                Duration::from_millis(250)
+            );
+            assert_eq!(
+                send_enter_delay(kind, "one\rtwo"),
+                Duration::from_millis(250)
+            );
+        }
+        assert_eq!(
+            send_enter_delay(Some("codex"), "hello"),
+            Duration::from_millis(250)
+        );
+    }
 }
