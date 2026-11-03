@@ -38,6 +38,13 @@ pub enum Request {
     Resnapshot {},
     /// Stop orchd (every pane dies). With `restart`, the layout is saved and the next orchd
     /// recreates it (fresh panes in the same folders; agents continue their conversation).
+    /// Auto-continue after a usage-limit reset for one pane: set it (`on`) and/or read it.
+    #[serde(rename = "pane.auto_continue")]
+    AutoContinue {
+        pane: String,
+        #[serde(default)]
+        on: Option<bool>,
+    },
     #[serde(rename = "daemon.stop")]
     StopDaemon {
         #[serde(default)]
@@ -462,9 +469,19 @@ pub struct PaneInfo {
     /// "claude" / "codex" when the pane runs a known agent.
     #[serde(default)]
     pub agent: Option<String>,
-    /// From the screen: "working", "blocked", "idle", "done" (agents only).
+    /// From the screen: "working", "blocked", "idle", "done", "limited" (agents only).
     #[serde(default)]
     pub agent_status: Option<String>,
+    /// While `limited`: when the limit resets (unix seconds, if the screen says).
+    #[serde(default)]
+    pub limit_reset: Option<i64>,
+    /// orchd types "continue" into this pane after a limit reset (default on).
+    #[serde(default = "yes")]
+    pub auto_continue: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -2,6 +2,7 @@
 
 pub mod bus;
 pub mod detect;
+pub mod limits;
 pub mod pane;
 pub mod render;
 pub mod restore;

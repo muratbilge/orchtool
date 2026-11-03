@@ -47,7 +47,13 @@ with `readLine()`. Closing the channel closes `orch`'s stdin and ends it at once
   `status_text` (string/null), `pane` (`orch:pN`, `herdr:ID`, or null), `cwd`, `workspace` (label, "" when not
   placed), `workspace_number` (1-based, 0 when not placed), `focused` (bool: the pane is the focus of the active
   tab of the workspace last raised by `orch focus` — not what any particular TUI shows), `seen_ms` (int/null),
-  `registered` (bool).
+  `registered` (bool),
+  `limit_reset` (ms/null) and `auto_continue` (bool) — since 2026-11-03, additive: status **`limited`** means the
+  agent's screen ends with its usage-limit notice; `limit_reset` is the reset time read from it, `status_text`
+  says "usage limit · continues HH:MM" (or "… resets HH:MM (auto-continue off)", "… no reset time on screen").
+  orchd types a continue message into the pane one minute after the reset, once per pause, and posts a `msg`
+  to murat (thread "limits") when the limit is hit and when it continued. Switch per pane:
+  `orch auto-continue <pane> on|off` (without on/off: prints the state; exit 14 for an unknown pane).
 - **Who is listed:** registered agents whose orch pane is running; herdr-pane agents whose pane herdr reports alive
   (when herdr cannot be asked they stay listed); pane-less agents (MCP only) seen within **6 h**; plus unregistered
   running agent panes. Everything else is dropped silently (no "gone" marker).

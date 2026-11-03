@@ -69,6 +69,7 @@ async fn main() -> anyhow::Result<()> {
     let daemon = Daemon::new(scrollback, Arc::clone(&bus));
     start_nudger(Arc::clone(&daemon));
     orchd::ui::start_detector(Arc::clone(&daemon));
+    orchd::limits::start(Arc::clone(&daemon));
     // After a restart: the layout the previous orchd saved, with fresh panes.
     let restore = dir.join("restore.json");
     let _ = daemon.restore_path.set(restore.clone());
