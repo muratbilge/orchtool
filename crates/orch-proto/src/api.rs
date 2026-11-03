@@ -324,6 +324,50 @@ pub struct NewPane {
     pub cols: Option<u16>,
 }
 
+/// Glyphs agents blink or spin at the start of a line while they wait (Claude Code pulses the
+/// bullet of a pending tool line about once a second; spinners cycle).
+fn is_pulse_glyph(c: char) -> bool {
+    matches!(
+        c,
+        '●' | '○' | '◉' | '◯' | '⏺' | '✻' | '✽' | '✶' | '✳' | '✢' | '·' | '*' | '∗'
+    ) || ('\u{2800}'..='\u{28ff}').contains(&c) // braille spinners
+}
+
+/// A spinner status line such as "Mustering… (11s · ↓ 557 tokens)": "(<n>s|m|h" up to a
+/// closing ")" at the end. Its counter changes every second.
+fn is_spinner_status(line: &str) -> bool {
+    let Some(open) = line.rfind('(') else {
+        return false;
+    };
+    if !line.ends_with(')') {
+        return false;
+    }
+    let inner = &line[open + 1..];
+    let digits = inner.chars().take_while(char::is_ascii_digit).count();
+    digits > 0 && matches!(inner[digits..].chars().next(), Some('s' | 'm' | 'h'))
+}
+
+/// What the screen hash covers: per line without leading/trailing blanks and without one
+/// leading pulse glyph; spinner status lines and empty lines are left out. Only for identity
+/// (is this still the same dialog?), never shown.
+pub fn hash_normalize(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for line in text.lines() {
+        let mut l = line.trim();
+        if let Some(c) = l.chars().next() {
+            if is_pulse_glyph(c) {
+                l = l[c.len_utf8()..].trim_start();
+            }
+        }
+        if l.is_empty() || is_spinner_status(l) {
+            continue;
+        }
+        out.push_str(l);
+        out.push('\n');
+    }
+    out
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReadSource {
@@ -361,8 +405,10 @@ pub struct SendPane {
     pub expect_lines: Option<usize>,
 }
 
-/// The hash `pane.read` reports and `pane.send` `expect` checks (FNV-1a 64, hex).
+/// The hash `pane.read` reports and `pane.send` `expect` checks (FNV-1a 64, hex), over the
+/// [`hash_normalize`]d text: a dialog that waits keeps one hash although agents animate around it.
 pub fn text_hash(text: &str) -> String {
+    let text = hash_normalize(text);
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in text.bytes() {
         h ^= b as u64;

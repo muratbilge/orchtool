@@ -81,6 +81,26 @@ fn invalid(error: impl ToString) -> io::Error {
 
 #[cfg(test)]
 mod tests {
+    use crate::api::text_hash;
+
+    #[test]
+    fn a_waiting_dialog_keeps_its_hash_while_the_agent_animates() {
+        let a = "  Listing first three entries in /tmp\n\u{2733} Mustering\u{2026} (11s \u{b7} \u{2193} 557 tokens)\n Do you want to proceed?\n \u{276f} 1. Yes\n   2. No\n";
+        let b = "\u{25cf} Listing first three entries in /tmp\n\u{2736} Mustering\u{2026} (12s \u{b7} \u{2193} 601 tokens)\n Do you want to proceed?\n \u{276f} 1. Yes\n   2. No\n\n";
+        assert_eq!(
+            text_hash(a),
+            text_hash(b),
+            "pulse, spinner counter, blank lines"
+        );
+        let c = "\u{25cf} Listing first three entries in /tmp\n Do you want to proceed?\n \u{276f} 1. Yes\n   2. No, and tell Claude\n";
+        assert_ne!(text_hash(a), text_hash(c), "a different dialog differs");
+        assert_ne!(
+            text_hash("Run rm -rf build? (5s)x"),
+            text_hash("Run rm -rf dist? (5s)x"),
+            "not a spinner line: kept"
+        );
+    }
+
     use super::*;
     use serde_json::json;
 
