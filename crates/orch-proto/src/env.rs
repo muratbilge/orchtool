@@ -10,6 +10,31 @@ use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+/// Variables that belong to the session a command was started from (an agent's Claude Code,
+/// a herdr / tmux / screen pane, an orch pane), never to a new pane or to orchd. A Claude Code
+/// that inherits `CLAUDE_CODE_CHILD_SESSION` & co. takes itself for a sub-session of another
+/// one (no transcript saving, wrong session id).
+pub const SESSION_VARS: &[&str] = &[
+    "ORCH_PANE",
+    "STY",
+    "CLAUDECODE",
+    "CLAUDE_CODE_ENTRYPOINT",
+    "CLAUDE_CODE_CHILD_SESSION",
+    "CLAUDE_CODE_SSE_PORT",
+    "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_CODE_SESSION_ATTENDED",
+    "CLAUDE_CODE_EXECPATH",
+    "CLAUDE_CODE_MESSAGING_SOCKET",
+    "CLAUDE_CODE_MESSAGING_TOKEN",
+    "CLAUDE_PID",
+    "CLAUDE_EFFORT",
+    "AI_AGENT",
+];
+
+pub fn is_session_var(k: &str) -> bool {
+    k.starts_with("HERDR_") || k.starts_with("TMUX") || SESSION_VARS.contains(&k)
+}
+
 /// The login shell's environment (`$SHELL -lc 'env -0'`, 3 s at most), once per process.
 fn login_vars() -> &'static Option<HashMap<String, String>> {
     static VARS: OnceLock<Option<HashMap<String, String>>> = OnceLock::new();
@@ -84,7 +109,10 @@ pub fn merge(
     keys.sort();
     for k in keys {
         // Shell-internal and per-invocation values of the login shell are not ours.
-        if matches!(k.as_str(), "PWD" | "OLDPWD" | "SHLVL" | "_") || has(&out, k) {
+        if matches!(k.as_str(), "PWD" | "OLDPWD" | "SHLVL" | "_")
+            || is_session_var(k)
+            || has(&out, k)
+        {
             continue;
         }
         out.push((k.clone(), login[k].clone()));
@@ -94,7 +122,11 @@ pub fn merge(
 
 /// This process's environment, completed from the login shell's (see [`merge`]).
 pub fn full_env() -> Vec<(String, String)> {
-    let current: Vec<(String, String)> = std::env::vars().collect();
+    // Without the calling session's own variables (orchd may have been started from inside an
+    // agent; its panes must not look like that agent's children).
+    let current: Vec<(String, String)> = std::env::vars()
+        .filter(|(k, _)| !is_session_var(k))
+        .collect();
     match login_vars() {
         Some(login) => merge(current, login),
         None => current,
@@ -125,5 +157,18 @@ mod tests {
         assert_eq!(m["JAVA_HOME"], "/jdk");
         assert_eq!(m["LANG"], "C.UTF-8", "set values are kept");
         assert!(!m.contains_key("PWD"));
+    }
+
+    #[test]
+    fn agent_session_vars_never_reach_panes() {
+        let login: HashMap<String, String> = [("CLAUDE_CODE_CHILD_SESSION", "1"), ("X", "y")]
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let m: HashMap<_, _> = merge(Vec::new(), &login).into_iter().collect();
+        assert!(!m.contains_key("CLAUDE_CODE_CHILD_SESSION"));
+        assert_eq!(m["X"], "y");
+        assert!(is_session_var("CLAUDECODE") && is_session_var("HERDR_PANE_ID"));
+        assert!(!is_session_var("PATH"));
     }
 }

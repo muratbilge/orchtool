@@ -205,8 +205,13 @@ fn start_daemon(socket: &std::path::Path) -> io::Result<()> {
         .arg(socket)
         .stdin(std::process::Stdio::null())
         .stdout(log.try_clone()?)
-        .stderr(log)
-        .env_remove("ORCH_PANE");
+        .stderr(log);
+    // orchd outlives whoever started it: no agent-session variables (see env::SESSION_VARS).
+    for (k, _) in std::env::vars() {
+        if crate::env::is_session_var(&k) {
+            cmd.env_remove(k);
+        }
+    }
     // SAFETY: setsid is async-signal-safe; detaches orchd from our terminal/session.
     unsafe {
         cmd.pre_exec(|| {

@@ -491,35 +491,13 @@ fn strip_orch(pane: String) -> String {
     }
 }
 
-/// Variables that describe the *calling* session, not the new pane: another multiplexer, or
-/// a Claude Code session (its child-session marker would switch off transcripts in the pane).
-const SESSION_VARS: &[&str] = &[
-    "ORCH_PANE",
-    "STY",
-    "CLAUDECODE",
-    "CLAUDE_CODE_ENTRYPOINT",
-    "CLAUDE_CODE_CHILD_SESSION",
-    "CLAUDE_CODE_SSE_PORT",
-    "CLAUDE_CODE_SESSION_ID",
-    "CLAUDE_CODE_SESSION_ATTENDED",
-    "CLAUDE_CODE_EXECPATH",
-    "CLAUDE_CODE_MESSAGING_SOCKET",
-    "CLAUDE_CODE_MESSAGING_TOKEN",
-    "CLAUDE_PID",
-    "CLAUDE_EFFORT",
-];
-
 /// This shell's environment minus variables that belong to the calling session.
 pub(crate) fn client_env(extra: &[String]) -> Result<Vec<(String, String)>> {
     // Completed from the login shell: started from a bare SSH command (the phone), PATH and
     // the profile's variables would be missing in the pane.
     let mut env: Vec<(String, String)> = orch_proto::env::full_env()
         .into_iter()
-        .filter(|(k, _)| {
-            !(k.starts_with("HERDR_")
-                || k.starts_with("TMUX")
-                || SESSION_VARS.contains(&k.as_str()))
-        })
+        .filter(|(k, _)| !orch_proto::env::is_session_var(k))
         .collect();
     for kv in extra {
         let (k, v) = kv.split_once('=').context("--env needs KEY=VALUE")?;
