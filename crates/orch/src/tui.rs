@@ -271,34 +271,7 @@ pub async fn run(connector: Connector) -> Result<()> {
     let backend = CrosstermBackend::new(std::io::stdout());
     let mut term = Terminal::new(backend)?;
     let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
-    let mut app = App {
-        connector,
-        tx: tx.clone(),
-        session: Session::default(),
-        panes: HashMap::new(),
-        agents: Vec::new(),
-        questions: Vec::new(),
-        messages: VecDeque::new(),
-        ws_id: None,
-        raise_seq: 0,
-        views: HashMap::new(),
-        mode: Mode::Normal,
-        prefix_pending: false,
-        sidebar: cols >= 100,
-        status: None,
-        size: (cols, rows),
-        prefix: prefix_byte(),
-        quit: false,
-        started_ws: false,
-        outer_modes: String::new(),
-        pending: Vec::new(),
-        hold_input: None,
-        held: Vec::new(),
-        scroll: None,
-        mouse_down: None,
-        restarting: false,
-        restart: false,
-    };
+    let mut app = App::new(connector, tx.clone(), (cols, rows));
     let mut winch = signal(SignalKind::window_change())?;
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     let mut dirty = true;
@@ -324,12 +297,11 @@ pub async fn run(connector: Connector) -> Result<()> {
         tokio::select! {
             m = rx.recv() => {
                 let Some(m) = m else { break Ok(()) };
-                if let Err(e) = app.handle(m) { break Err(e) }
+                match app.handle(m) { Ok(changed) => dirty |= changed, Err(e) => break Err(e) }
                 // Drain whatever else is queued before drawing (one frame per burst).
                 while let Ok(m) = rx.try_recv() {
-                    if let Err(e) = app.handle(m) { return finish(guard, Err(e)); }
+                    match app.handle(m) { Ok(changed) => dirty |= changed, Err(e) => return finish(guard, Err(e)) }
                 }
-                dirty = true;
             }
             _ = winch.recv() => {
                 if let Ok((c, r)) = crossterm::terminal::size() {
@@ -470,6 +442,37 @@ impl Widget for ScreenWidget<'_> {
 }
 
 impl App {
+    fn new(connector: Connector, tx: mpsc::UnboundedSender<Msg>, (cols, rows): (u16, u16)) -> Self {
+        Self {
+            connector,
+            tx,
+            session: Session::default(),
+            panes: HashMap::new(),
+            agents: Vec::new(),
+            questions: Vec::new(),
+            messages: VecDeque::new(),
+            ws_id: None,
+            raise_seq: 0,
+            views: HashMap::new(),
+            mode: Mode::Normal,
+            prefix_pending: false,
+            sidebar: cols >= 100,
+            status: None,
+            size: (cols, rows),
+            prefix: prefix_byte(),
+            quit: false,
+            started_ws: false,
+            outer_modes: String::new(),
+            pending: Vec::new(),
+            hold_input: None,
+            held: Vec::new(),
+            scroll: None,
+            mouse_down: None,
+            restarting: false,
+            restart: false,
+        }
+    }
+
     fn current_ws(&self) -> Option<&orch_proto::layout::Workspace> {
         self.ws_id
             .as_deref()
@@ -825,7 +828,7 @@ impl App {
 
     // ---------- messages ----------
 
-    fn handle(&mut self, m: Msg) -> Result<()> {
+    fn handle(&mut self, m: Msg) -> Result<bool> {
         match m {
             Msg::Snapshot(s) => {
                 self.session = s.session;
@@ -896,7 +899,7 @@ impl App {
             }
             Msg::Frame { pane, stream } => {
                 let Some(v) = self.views.get_mut(&pane) else {
-                    return Ok(());
+                    return Ok(false);
                 };
                 match stream {
                     Stream::Screen {
@@ -942,8 +945,8 @@ impl App {
                     }
                 }
             }
-            Msg::Keys(bytes) => self.keys(bytes),
-            Msg::KeysFlush => self.flush_pending_keys(),
+            Msg::Keys(bytes) => return Ok(self.keys(bytes)),
+            Msg::KeysFlush => return Ok(self.flush_pending_keys()),
             Msg::Reply { what, result } => {
                 let creates = matches!(
                     what.as_str(),
@@ -955,7 +958,7 @@ impl App {
                 }
             }
         }
-        Ok(())
+        Ok(true)
     }
 
     fn reply(&mut self, what: &str, result: Result<Value, String>) {
@@ -1024,7 +1027,7 @@ impl App {
     /// Keys arrive in arbitrary chunks: an incomplete escape sequence, UTF-8 character or
     /// bracketed paste is kept until the rest arrives (a lone ESC becomes the Escape key after
     /// a short timeout).
-    fn keys(&mut self, bytes: Vec<u8>) {
+    fn keys(&mut self, bytes: Vec<u8>) -> bool {
         let mut data = std::mem::take(&mut self.pending);
         data.extend_from_slice(&bytes);
         let mut i = 0;
@@ -1048,20 +1051,23 @@ impl App {
                 }
             }
         }
-        self.dispatch(tokens);
+        self.dispatch(tokens)
     }
 
-    fn flush_pending_keys(&mut self) {
+    fn flush_pending_keys(&mut self) -> bool {
         if self.pending == [0x1b] {
             self.pending.clear();
-            self.dispatch(vec![Token::Key(vec![0x1b])]);
+            return self.dispatch(vec![Token::Key(vec![0x1b])]);
         }
+        false
     }
 
-    fn dispatch(&mut self, tokens: Vec<Token>) {
+    fn dispatch(&mut self, tokens: Vec<Token>) -> bool {
+        let mut dirty = false;
         let mut forward: Vec<u8> = Vec::new();
         for t in tokens {
             if let Token::Mouse(m) = t {
+                dirty = true;
                 if !forward.is_empty() {
                     self.send_input(std::mem::take(&mut forward));
                 }
@@ -1072,19 +1078,25 @@ impl App {
             match (t, &self.mode) {
                 // A paste goes to the pane as-is (with its markers, which the pane asked for).
                 (Token::Paste(raw, _), Mode::Normal) => {
+                    dirty |= self.prefix_pending;
                     self.prefix_pending = false;
                     forward.extend_from_slice(&raw);
                 }
                 // In an overlay a paste is text for the input line — never a submit.
-                (Token::Paste(_, text), _) => self.overlay_paste(&text),
+                (Token::Paste(_, text), _) => {
+                    dirty = true;
+                    self.overlay_paste(&text);
+                }
                 (Token::Key(key), Mode::Normal) if !self.prefix_pending => {
                     if key == [self.prefix] {
+                        dirty = true;
                         self.prefix_pending = true;
                     } else {
                         forward.extend_from_slice(&key);
                     }
                 }
                 (Token::Key(key), Mode::Normal) => {
+                    dirty = true;
                     self.prefix_pending = false;
                     if !forward.is_empty() {
                         self.send_input(std::mem::take(&mut forward));
@@ -1096,6 +1108,7 @@ impl App {
                     }
                 }
                 (Token::Key(key), _) => {
+                    dirty = true;
                     if !forward.is_empty() {
                         self.send_input(std::mem::take(&mut forward));
                     }
@@ -1105,8 +1118,11 @@ impl App {
             }
         }
         if !forward.is_empty() {
+            dirty |= self.scroll.is_some();
+            dirty |= self.focused().is_some_and(|p| !self.views.contains_key(&p));
             self.send_input(forward);
         }
+        dirty
     }
 
     // ---------- mouse (taps and the wheel from the phone or a desktop terminal) ----------
@@ -2896,6 +2912,45 @@ fn complete_key_len(b: &[u8]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_app() -> App {
+        let (tx, _) = mpsc::unbounded_channel();
+        App::new(
+            Connector::new("/tmp/orch-unit-test-unused.sock".into(), None),
+            tx,
+            (80, 24),
+        )
+    }
+
+    #[test]
+    fn forwarded_keys_wait_for_echo_but_local_ui_edits_redraw() {
+        let mut app = test_app();
+        // Hold pane input so the test can inspect it without any daemon or PTY.
+        app.hold_input = Some((Instant::now(), false));
+        assert!(!app.handle(Msg::Keys(b"hello".to_vec())).unwrap());
+        assert_eq!(app.held, b"hello");
+        assert!(!app
+            .handle(Msg::Keys(b"\x1b[200~paste\x1b[201~".to_vec()))
+            .unwrap());
+        assert!(app.held.ends_with(b"\x1b[200~paste\x1b[201~"));
+        assert!(app.handle(Msg::Keys(vec![app.prefix])).unwrap());
+        assert!(app.handle(Msg::Keys(b"?".to_vec())).unwrap());
+        assert!(matches!(app.mode, Mode::Help));
+        app.mode = Mode::Comms(String::new());
+        assert!(app.handle(Msg::Keys(b"edit".to_vec())).unwrap());
+        assert!(matches!(&app.mode, Mode::Comms(s) if s == "edit"));
+        app.mode = Mode::Normal;
+        app.scroll = Some(Scroll {
+            pane: "p1".into(),
+            lines: Some(vec!["old".into()]),
+            offset: 1,
+        });
+        assert!(app.handle(Msg::Keys(b"x".to_vec())).unwrap());
+        assert!(app.scroll.is_none());
+        assert!(!app.handle(Msg::Keys(vec![0xe7])).unwrap());
+        assert!(!app.handle(Msg::Keys(vec![0x95, 0x8c])).unwrap());
+        assert!(app.held.ends_with("界".as_bytes()));
+    }
 
     #[test]
     fn decoder_waits_for_split_sequences_and_pastes() {
