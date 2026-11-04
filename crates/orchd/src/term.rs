@@ -126,6 +126,15 @@ impl Term {
 
     /// Scrollback + screen; the last `lines` lines (trailing blank lines dropped first).
     pub fn recent_text(&mut self, lines: usize) -> String {
+        self.recent_text_mode(lines, false)
+    }
+
+    /// Logical lines for copying: only soft wraps are joined, hard newlines remain.
+    pub fn recent_text_unwrapped(&mut self, lines: usize) -> String {
+        self.recent_text_mode(lines, true)
+    }
+
+    fn recent_text_mode(&mut self, lines: usize, unwrapped: bool) -> String {
         let (rows, cols) = self.size();
         let rows = rows as usize;
         let screen = self.parser.screen_mut();
@@ -135,15 +144,27 @@ impl Term {
                                          // We need combined lines from max(0, total + rows - lines - slack); fetch a page more
                                          // than needed because trailing blank lines are trimmed afterwards.
         let want = lines.saturating_add(rows);
-        let mut offset = total.min(want.saturating_sub(rows));
+        // A logical line can span any number of rows. Start at the oldest retained row so
+        // --lines never cuts a soft-wrapped line just because the pane is narrow.
+        let mut offset = if unwrapped {
+            total
+        } else {
+            total.min(want.saturating_sub(rows))
+        };
         let mut out: Vec<String> = Vec::new();
+        let mut continued = false;
         let mut next = total - offset;
         loop {
             screen.set_scrollback(offset);
             let start = total - offset;
             for (i, row) in screen.rows(0, cols).enumerate() {
                 if start + i >= next {
-                    out.push(row);
+                    if unwrapped && continued {
+                        out.last_mut().expect("previous wrapped row").push_str(&row);
+                    } else {
+                        out.push(row);
+                    }
+                    continued = screen.row_wrapped(i as u16);
                     next = start + i + 1;
                 }
             }
@@ -194,6 +215,37 @@ mod tests {
         let mut t = Term::new(5, 20, 0);
         t.process(b"\x1b]2;hello title\x07");
         assert_eq!(t.title(), "hello title");
+    }
+
+    #[test]
+    fn unwrapped_joins_soft_rows_across_scrollback_pages_and_preserves_hard_lines() {
+        let mut t = Term::new(3, 8, 100);
+        let long = "abcdefghijklmnopqrstuvwxyz0123456789";
+        t.process(format!("first\r\n{long}\r\n\r\nlast").as_bytes());
+        assert_eq!(
+            t.recent_text_unwrapped(100),
+            format!("first\n{long}\n\nlast")
+        );
+        assert_eq!(t.recent_text_unwrapped(3), format!("{long}\n\nlast"));
+        assert_eq!(t.recent_text_unwrapped(1), "last");
+        assert_eq!(t.recent_text_unwrapped(0), "");
+        assert_eq!(t.screen().scrollback(), 0);
+        assert!(t.recent_text(100).contains("abcdefgh\nijklmnop"));
+    }
+
+    #[test]
+    fn unwrapped_keeps_spaces_unicode_and_exact_width_hard_breaks() {
+        let mut t = Term::new(6, 6, 100);
+        t.process("ab  界cd\r\n123456\r\nZ".as_bytes());
+        assert_eq!(t.recent_text_unwrapped(100), "ab  界cd\n123456\nZ");
+        assert_eq!(t.screen().scrollback(), 0);
+        let mut t = Term::new(4, 5, 10);
+        t.process("abcd界e".as_bytes());
+        // This vt100 version does not mark the early wrap caused by a wide character
+        // that cannot fit in the final column. Preserve the break rather than guessing
+        // and accidentally joining a real newline with the same screen contents.
+        assert!(!t.screen().row_wrapped(0));
+        assert_eq!(t.recent_text_unwrapped(100), "abcd\n界e");
     }
 
     #[test]

@@ -97,6 +97,9 @@ enum Cmd {
         /// Only the visible screen
         #[arg(long)]
         visible: bool,
+        /// Join soft-wrapped rows; --lines counts logical lines (orch panes only)
+        #[arg(long, conflicts_with_all = ["visible", "hash"])]
+        unwrapped: bool,
         /// First line `hash:<h>` for a later `orch send --expect <h>`
         #[arg(long)]
         hash: bool,
@@ -269,8 +272,16 @@ async fn run(cli: Cli) -> Result<()> {
     // herdr panes (as agents on the bus name them) are read and typed into through herdr.
     match &cli.cmd {
         Cmd::Read {
-            pane, lines, hash, ..
+            pane,
+            lines,
+            hash,
+            unwrapped,
+            ..
         } if pane.starts_with("herdr:") => {
+            anyhow::ensure!(
+                !unwrapped,
+                "--unwrapped requires an orch pane (herdr does not expose wrap metadata)"
+            );
             let id = &pane["herdr:".len()..];
             let text = watch::herdr_read(id, *lines)
                 .await
@@ -433,6 +444,7 @@ async fn run(cli: Cli) -> Result<()> {
             pane,
             lines,
             visible,
+            unwrapped,
             hash,
         } => {
             let v = conn
@@ -441,6 +453,8 @@ async fn run(cli: Cli) -> Result<()> {
                     lines: Some(lines),
                     source: if visible {
                         ReadSource::Visible
+                    } else if unwrapped {
+                        ReadSource::RecentUnwrapped
                     } else {
                         ReadSource::Recent
                     },

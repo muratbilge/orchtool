@@ -204,6 +204,9 @@ impl Daemon {
                 let text = match r.source {
                     ReadSource::Visible => term.visible_text(),
                     ReadSource::Recent => term.recent_text(r.lines.unwrap_or(200)),
+                    ReadSource::RecentUnwrapped => {
+                        term.recent_text_unwrapped(r.lines.unwrap_or(200))
+                    }
                 };
                 let hash = orch_proto::api::text_hash(&text);
                 Ok(json!({ "pane": pane.id, "text": text, "hash": hash }))

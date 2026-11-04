@@ -410,6 +410,8 @@ pub enum ReadSource {
     /// Scrollback + screen, last `lines` lines.
     #[default]
     Recent,
+    /// Scrollback + screen, joining soft wraps; `lines` counts logical lines.
+    RecentUnwrapped,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -677,3 +677,39 @@ async fn question_close_cli_exit_codes_and_pane_exit_expiration() {
     }
     panic!("exit did not expire the question");
 }
+
+#[tokio::test]
+async fn read_unwrapped_cli_copies_logical_lines() {
+    let mut env = Env::new("unwrapped");
+    env.start().await;
+    let mut c = env.conn().await;
+    let pane = c
+        .request(&Request::NewPane(orch_proto::api::NewPane {
+            argv: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "printf 'abcdefghijklmnop\\r\\nEND'; sleep 10".into(),
+            ],
+            rows: Some(4),
+            cols: Some(6),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    let id = pane["id"].as_str().unwrap();
+    for _ in 0..100 {
+        let output = Command::new(bin("orch"))
+            .arg("--socket")
+            .arg(&env.socket)
+            .args(["read", id, "--unwrapped", "--lines", "2"])
+            .env("HOME", &env.dir)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        if String::from_utf8(output.stdout).unwrap() == "abcdefghijklmnop\nEND\n" {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("unwrapped copy never matched logical lines");
+}
