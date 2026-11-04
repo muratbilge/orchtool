@@ -1,5 +1,11 @@
 # Status
 
+## 2026-11-04 — P5A implemented; full validation blocked — Codex
+
+Part A review/fixes and all six polish items are implemented; see `CODEX-REVIEW-P5A-RESULT.md` for commits, tests and open issues. Formatting/clippy/build pass, and 49 unit tests pass. Full `scripts/check.sh` is **not GREEN**: this sandbox rejects Unix-socket creation, preventing mux/integration tests and the real Claude/shell smoke check. The reported inbox/ACK test flake is listed, not suppressed.
+
+`.git` is read-only here. Separate `[codex]` commits were preserved in `/tmp/orch-p5a-commits.yhmUjF`; `/tmp/orch-p5a-series.patch` exports them for a clean checkout at `860d4bc`. The main branch is unchanged and its working tree contains the implementation. Live orchd and Kabuk were not touched.
+
 ## 2026-11-03 (evening) — Touch TUI, restart with layout, review council — Claude (orchtool session)
 
 Handover state for whichever session continues. Everything below is committed, `scripts/check.sh` green (65 tests),
