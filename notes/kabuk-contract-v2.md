@@ -139,3 +139,15 @@ regenerate the fixture in orchtool on every stream change, copy it into Kabuk th
 No screen text, question text or message text in logs on either side. orchtool logs nothing about `send`/`answer`
 contents; Kabuk logs pane + key + outcome (exit code) only, and a malformed watch line as its class and length —
 never the throwable (Android's `org.json` puts the whole input into the exception message).
+
+## 8. Additions 2026-11-04
+
+- `orch question close <id>`: dismiss an open question from the phone. Exit 0 closed, 14 gone, 11 already
+  answered. Questions whose asker's pane exited (or killed, or bus agent stale > 6 h) now expire by themselves;
+  watch keeps listing only open ones.
+- `orch read <pane> --unwrapped [--lines N]`: soft-wrapped rows joined into real lines (N counts logical
+  lines); for "Copy text…". orch panes only; not combinable with `--hash`/`--visible`.
+- Codex's "Approaching rate limits / switch to <model>?" menu: orchd answers "2. Keep current model" by
+  itself (same per-pane switch as auto-continue); the pane shows `blocked` for the few seconds before that.
+- After `orch stop-daemon --restart`, agents that were working get a note typed in once they are back at
+  their prompt; Murat gets "restart: resumed N agents, nudged M …" on the bus (thread "restart", from orchd).
