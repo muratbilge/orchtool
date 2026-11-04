@@ -48,6 +48,7 @@ async fn daemon() -> Daemon {
         .arg("--db")
         .arg(dir.join("bus.db"))
         .env("HOME", &dir)
+        .env("ORCHD_LIMIT_CHECK_MS", "150")
         .spawn()
         .unwrap();
     for _ in 0..100 {
@@ -636,4 +637,111 @@ async fn send_enter_reaches_shell_and_claude_classified_input() {
         assert!(received, "{kind} classified pane did not receive Enter");
         c.request(&Request::Kill { pane: id }).await.unwrap();
     }
+}
+
+/// "3:07 PM" for `secs` from now, as Codex writes its reset time.
+fn codex_clock(secs: i64) -> String {
+    let t = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+        + secs) as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    unsafe { libc::localtime_r(&t, &mut tm) };
+    let h = tm.tm_hour % 12;
+    format!(
+        "{}:{:02} {}",
+        if h == 0 { 12 } else { h },
+        tm.tm_min,
+        if tm.tm_hour < 12 { "AM" } else { "PM" }
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_limited_codex_is_continued_once_after_its_reset() {
+    let d = daemon().await;
+    let mut c = Conn::unix(&d.socket).await.unwrap();
+    let screen = |at: &str| {
+        format!(
+            "printf '• Ran cargo test\\n\\n■ You have hit your usage limit. Upgrade or try again at {at}.\\n\\n› Ask Codex to do anything\\n\\n  GPT-6-Astra medium · /tmp\\n'; cat"
+        )
+    };
+    // Reset three minutes ago: due now. A second one, the same, with auto-continue off; a third
+    // whose reset is still an hour away.
+    let due = new_pane(&mut c, &["sh", "-c", &screen(&codex_clock(-180))], 24, 100).await;
+    let off_script = format!("sleep 0.6; {}", screen(&codex_clock(-180)));
+    let off = new_pane(&mut c, &["sh", "-c", &off_script], 24, 100).await;
+    let v = c
+        .request(&Request::AutoContinue {
+            pane: off.clone(),
+            on: Some(false),
+        })
+        .await
+        .unwrap();
+    assert_eq!(v["auto_continue"], false);
+    let later = new_pane(&mut c, &["sh", "-c", &screen(&codex_clock(3600))], 24, 100).await;
+
+    let text = wait_for_text(&mut c, &due, "Your usage limit has reset").await;
+    // Typed once (cat echoes it: the tty echo plus cat's own copy), not again on later checks.
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    let text2 = read(&mut c, &due, ReadSource::Recent).await;
+    assert_eq!(
+        text2.matches("Your usage limit has reset").count(),
+        text.matches("Your usage limit has reset").count().max(2),
+        "{text2}"
+    );
+    for p in [&off, &later] {
+        let t = read(&mut c, p, ReadSource::Recent).await;
+        assert!(t.contains("usage limit"), "{t}");
+        assert!(
+            !t.contains("Your usage limit has reset"),
+            "{p} must not be continued: {t}"
+        );
+    }
+    // The pane info says so, and Murat got told for each pause.
+    let panes = c.request(&Request::ListPanes {}).await.unwrap();
+    let info = |id: &str| {
+        panes["panes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["id"] == id)
+            .cloned()
+            .unwrap()
+    };
+    assert_eq!(info(&later)["agent_status"], "limited");
+    assert_eq!(info(&later)["agent"], "codex", "known from its screen");
+    assert!(info(&later)["limit_reset"].as_i64().is_some());
+    assert_eq!(info(&off)["auto_continue"], false);
+    let log = c
+        .request(&Request::Log {
+            after: None,
+            limit: Some(50),
+            follow: false,
+        })
+        .await
+        .unwrap();
+    let texts: Vec<String> = log["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["to"] == "murat")
+        .map(|m| m["text"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        texts
+            .iter()
+            .filter(|t| t.contains("hit its usage limit"))
+            .count(),
+        3,
+        "{texts:?}"
+    );
+    assert_eq!(
+        texts
+            .iter()
+            .filter(|t| t.contains("typed 'continue'"))
+            .count(),
+        1,
+        "{texts:?}"
+    );
 }

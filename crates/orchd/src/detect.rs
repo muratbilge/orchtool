@@ -17,23 +17,220 @@ pub enum Detected {
     Unknown,
     /// The program has exited.
     Done,
+    /// Stopped on a usage limit ("hit your usage limit … try again at 5:03 AM"): waiting for
+    /// the reset (orchd types "continue" then, see limits.rs).
+    Limited,
 }
 
-/// "claude" / "codex" from the pane's command line.
+/// "claude" / "codex" from the pane's command line — also when a shell runs it
+/// (`bash -lc 'claude --continue; exec bash'`, as restored and phone-started agents do).
 pub fn agent_kind(argv: &[String]) -> Option<&'static str> {
-    let prog = argv.first().map(|a| {
+    let base = |a: &str| {
         std::path::Path::new(a)
             .file_name()
             .map(|f| f.to_string_lossy().to_lowercase())
             .unwrap_or_default()
-    })?;
-    if prog.contains("claude") {
-        Some("claude")
-    } else if prog.contains("codex") {
+    };
+    let named = |prog: &str| {
+        if prog.contains("claude") {
+            Some("claude")
+        } else if prog.contains("codex") {
+            Some("codex")
+        } else {
+            None
+        }
+    };
+    let prog = base(argv.first()?);
+    if let Some(k) = named(&prog) {
+        return Some(k);
+    }
+    // A shell with a script: the first command of the script (after VAR=value words).
+    if matches!(prog.as_str(), "bash" | "sh" | "zsh" | "dash" | "fish") {
+        let i = argv
+            .iter()
+            .position(|a| a.starts_with('-') && a.ends_with('c'))?;
+        let script = argv.get(i + 1)?;
+        let first = script
+            .split_whitespace()
+            .find(|w| !w.contains('=') || w.starts_with('-'))?;
+        return named(&base(first.trim_matches(|c| c == '\'' || c == '"')));
+    }
+    None
+}
+
+/// The agent from its screen, for a pane whose command doesn't say (an agent typed into a
+/// shell): the input-prompt footers are specific enough.
+pub fn screen_kind(screen: &str) -> Option<&'static str> {
+    let tail = tail_lines(screen, 8).to_lowercase();
+    if tail.contains("ask codex") || tail.contains("gpt-") && tail.contains("for shortcuts") {
         Some("codex")
+    } else if tail.contains("⏵⏵") || tail.contains("shift+tab to cycle") {
+        Some("claude")
     } else {
         None
     }
+}
+
+fn tail_lines(screen: &str, n: usize) -> String {
+    let lines: Vec<&str> = screen.lines().filter(|l| !l.trim().is_empty()).collect();
+    lines[lines.len().saturating_sub(n)..].join("\n")
+}
+
+/// A usage-limit notice in these words (Codex, Claude Code).
+const LIMIT: &[&str] = &[
+    "hit your usage limit",
+    "usage limit reached",
+    "hit your limit",
+    "limit reached",
+    "limit will reset",
+];
+
+/// The screen ends with a usage-limit notice (nothing has run since): the agent waits for its
+/// reset. Returns the reset time as written ("5:03 AM", "Oct 28th, 2026 3:17 AM", "3am"), or
+/// an empty string when the notice gives none.
+pub fn limit_notice(screen: &str) -> Option<String> {
+    let lines: Vec<&str> = screen.lines().filter(|l| !l.trim().is_empty()).collect();
+    let tail = &lines[lines.len().saturating_sub(14)..];
+    let at = tail
+        .iter()
+        .rposition(|l| LIMIT.iter().any(|p| l.to_lowercase().contains(p)))?;
+    // Something ran after the notice: not waiting any more.
+    let after = tail[at + 1..].join("\n").to_lowercase();
+    if after.contains("esc to interrupt") || after.contains("working (") || after.contains("• ran ")
+    {
+        return None;
+    }
+    // The notice may wrap: its line plus the next two.
+    let text = tail[at..(at + 3).min(tail.len())].join(" ");
+    Some(reset_words(&text).unwrap_or_default())
+}
+
+/// "try again at X." / "resets X" / "reset at X" → "X".
+fn reset_words(text: &str) -> Option<String> {
+    let lower = text.to_lowercase();
+    let (i, n) = ["try again at ", "resets at ", "reset at ", "resets "]
+        .iter()
+        .find_map(|k| lower.find(k).map(|i| (i, k.len())))?;
+    let rest = &text[i + n..];
+    // Up to the sentence end or the bracketed timezone.
+    let end = rest
+        .char_indices()
+        .find(|(j, c)| {
+            *c == '('
+                || *c == '∙'
+                || *c == '·'
+                || *c == '\n'
+                || *c == '.' && !rest[j + 1..].starts_with(char::is_numeric)
+        })
+        .map_or(rest.len(), |(j, _)| j);
+    // Only the words of a time (month, day, year, hour, am/pm): the next screen line is joined on.
+    let timeish = |t: &str| {
+        let t = t.trim_end_matches(',').to_lowercase();
+        let digits = t.trim_end_matches(|c: char| c.is_ascii_alphabetic());
+        let suffix = &t[digits.len()..];
+        (!digits.is_empty()
+            && digits.chars().all(|c| c.is_ascii_digit() || c == ':')
+            && matches!(suffix, "" | "am" | "pm" | "st" | "nd" | "rd" | "th"))
+            || matches!(t.as_str(), "am" | "pm")
+            || t.len() >= 3
+                && [
+                    "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov",
+                    "dec",
+                ]
+                .iter()
+                .any(|m| t.starts_with(m) && t.chars().all(|c| c.is_ascii_alphabetic()))
+    };
+    let w = rest[..end]
+        .split_whitespace()
+        .take_while(|t| timeish(t))
+        .collect::<Vec<_>>()
+        .join(" ");
+    (!w.is_empty()).then_some(w)
+}
+
+/// The next moment the reset time `when` (local time, as an agent writes it) names, after
+/// `now` minus 12 h (a time of day already past by more than that is tomorrow's). Unix secs.
+pub fn reset_unix(when: &str, now: i64) -> Option<i64> {
+    let w = when.to_lowercase().replace(',', " ");
+    let mut month: Option<i32> = None;
+    let mut day: Option<i32> = None;
+    let mut year: Option<i32> = None;
+    let (mut hour, mut minute): (Option<i32>, i32) = (None, 0);
+    let mut pm: Option<bool> = None;
+    const MONTHS: [&str; 12] = [
+        "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
+    ];
+    for tok in w.split_whitespace() {
+        if let Some(m) = MONTHS.iter().position(|m| tok.starts_with(m)) {
+            month = Some(m as i32);
+            continue;
+        }
+        if tok == "am" || tok == "pm" {
+            pm = Some(tok == "pm");
+            continue;
+        }
+        let (core, suffix) = tok.split_at(
+            tok.find(|c: char| !c.is_ascii_digit() && c != ':')
+                .unwrap_or(tok.len()),
+        );
+        if core.is_empty() {
+            continue;
+        }
+        match suffix {
+            "am" | "pm" => pm = Some(suffix == "pm"),
+            "st" | "nd" | "rd" | "th" => {
+                day = core.parse().ok();
+                continue;
+            }
+            _ => {}
+        }
+        if let Some((h, m)) = core.split_once(':') {
+            hour = h.parse().ok();
+            minute = m.parse().ok()?;
+        } else if suffix == "am" || suffix == "pm" {
+            hour = core.parse().ok();
+        } else if let Ok(n) = core.parse::<i32>() {
+            if n > 1900 {
+                year = Some(n);
+            } else if month.is_some() && day.is_none() {
+                day = Some(n);
+            }
+        }
+    }
+    let mut hour = hour?;
+    match pm {
+        Some(true) if hour < 12 => hour += 12,
+        Some(false) if hour == 12 => hour = 0,
+        _ => {}
+    }
+    if !(0..24).contains(&hour) || !(0..60).contains(&minute) {
+        return None;
+    }
+    // SAFETY: plain libc time conversion on stack values.
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    let t = now as libc::time_t;
+    unsafe { libc::localtime_r(&t, &mut tm) };
+    if let Some(m) = month {
+        tm.tm_mon = m;
+    }
+    if let Some(d) = day {
+        tm.tm_mday = d;
+    }
+    if let Some(y) = year {
+        tm.tm_year = y - 1900;
+    }
+    tm.tm_hour = hour;
+    tm.tm_min = minute;
+    tm.tm_sec = 0;
+    tm.tm_isdst = -1;
+    let mut at = unsafe { libc::mktime(&mut tm) } as i64;
+    if at < 0 {
+        return None;
+    }
+    if month.is_none() && day.is_none() && at < now - 12 * 3600 {
+        at += 24 * 3600;
+    }
+    Some(at)
 }
 
 const BLOCKED: &[&str] = &[
@@ -71,6 +268,9 @@ pub fn detect(screen: &str, kind: Option<&str>) -> Detected {
     }
     if tail.contains("esc to interrupt") || tail.contains("ctrl+c to interrupt") {
         return Detected::Working;
+    }
+    if limit_notice(screen).is_some() {
+        return Detected::Limited;
     }
     // Idle only on a positive sign of the agent's own prompt footer — never "by elimination"
     // (an unrecognised dialog or a shell after the agent exited must not count as idle).
@@ -129,6 +329,94 @@ mod tests {
         }
         s.push_str("❯ \n  ⏵⏵ auto mode on");
         assert_eq!(detect(&s, Some("claude")), Detected::Idle);
+    }
+
+    fn v(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn agents_run_by_a_shell_and_agents_seen_on_screen() {
+        assert_eq!(
+            agent_kind(&v(&["/bin/bash", "-lc", "claude --continue; exec bash"])),
+            Some("claude")
+        );
+        assert_eq!(
+            agent_kind(&v(&[
+                "bash",
+                "-lc",
+                "ORCH_AGENT='x-codex' codex resume --last; exec '/bin/bash'"
+            ])),
+            Some("codex")
+        );
+        assert_eq!(
+            agent_kind(&v(&["bash", "-lc", "ls; claude"])),
+            None,
+            "only the first command"
+        );
+        assert_eq!(agent_kind(&v(&["bash", "--norc"])), None);
+        assert_eq!(
+            screen_kind("x\n› Ask Codex to do anything\n  GPT-6-Astra medium · /p\n"),
+            Some("codex")
+        );
+        assert_eq!(
+            screen_kind("❯ \n  ⏵⏵ auto mode on (shift+tab to cycle)\n"),
+            Some("claude")
+        );
+        assert_eq!(screen_kind("$ ls\nfoo\n$ "), None);
+    }
+
+    #[test]
+    fn usage_limits_and_their_reset_times() {
+        let codex = "• Ran cargo test\n\n■ You’ve hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/settings/\nusage to purchase more credits or try again at 5:03 AM.\n\n› Ask Codex to do anything\n\n  GPT-6-Astra medium · /projects/x\n";
+        assert_eq!(limit_notice(codex).as_deref(), Some("5:03 AM"));
+        assert_eq!(detect(codex, Some("codex")), Detected::Limited);
+        let dated =
+            "■ You've hit your usage limit. Try again at Oct 28th, 2026 3:17 AM.\n› Ask Codex\n";
+        assert_eq!(
+            limit_notice(dated).as_deref(),
+            Some("Oct 28th, 2026 3:17 AM")
+        );
+        let claude = "  ⎿  Claude usage limit reached. Your limit will reset at 5pm (Europe/Berlin).\n\n❯ \n  ⏵⏵ auto mode on\n";
+        assert_eq!(limit_notice(claude).as_deref(), Some("5pm"));
+        assert_eq!(detect(claude, Some("claude")), Detected::Limited);
+        let claude2 = "  ⎿  5-hour limit reached ∙ resets 3am\n❯ \n";
+        assert_eq!(limit_notice(claude2).as_deref(), Some("3am"));
+        // Work happened after the notice: no longer limited.
+        let resumed = "■ You’ve hit your usage limit. try again at 5:03 AM.\n› continue\n• Ran ls\n• Working (3s • esc to interrupt)\n";
+        assert_eq!(limit_notice(resumed), None);
+        assert_eq!(detect(resumed, Some("codex")), Detected::Working);
+        // A limit notice scrolled far above the bottom does not count.
+        let old = format!(
+            "■ You’ve hit your usage limit. try again at 5:03 AM.\n{}› Ask Codex\n",
+            "line\n".repeat(20)
+        );
+        assert_eq!(limit_notice(&old), None);
+    }
+
+    #[test]
+    fn reset_times_are_the_next_such_moment() {
+        // 2026-11-03 23:12 local time.
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        tm.tm_year = 126;
+        tm.tm_mon = 10;
+        tm.tm_mday = 3;
+        tm.tm_hour = 23;
+        tm.tm_min = 12;
+        tm.tm_isdst = -1;
+        let now = unsafe { libc::mktime(&mut tm) } as i64;
+        let at = |w: &str| reset_unix(w, now).map(|t| (t - now) / 60);
+        assert_eq!(at("5:03 AM"), Some(5 * 60 + 51), "tomorrow morning");
+        assert_eq!(at("11:50 PM"), Some(38));
+        assert_eq!(at("3am"), Some(3 * 60 + 48));
+        assert_eq!(
+            at("5pm"),
+            Some(-(6 * 60 + 12)),
+            "earlier today (within 12 h): already reset"
+        );
+        assert_eq!(at("Nov 4th 2026 3:17 AM"), Some(4 * 60 + 5));
+        assert_eq!(at("17:30"), Some(-(5 * 60 + 42)));
+        assert_eq!(at("soon"), None);
     }
 
     #[test]

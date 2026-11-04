@@ -248,6 +248,12 @@ impl Daemon {
                 }
                 Ok(json!({ "pane": pane.id }))
             }
+            Request::AutoContinue { pane, on } => {
+                let id = self.find(&pane)?.id.clone();
+                let on = crate::limits::auto_continue(&id, on);
+                let _ = self.ui_events.send(crate::ui::UiEvent::Panes);
+                Ok(json!({ "pane": id, "auto_continue": on }))
+            }
             Request::Kill { pane } => {
                 let id = self.find(&pane)?.id.clone();
                 self.kill(&id).await?;

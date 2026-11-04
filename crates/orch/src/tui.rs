@@ -365,6 +365,7 @@ fn status_mark(status: Option<&str>) -> (&'static str, Color) {
         Some("blocked") => ("⚠", Color::Red),
         Some("idle") => ("○", Color::Green),
         Some("done") => ("✓", Color::DarkGray),
+        Some("limited") => ("⏸", Color::Magenta),
         _ => (" ", Color::DarkGray),
     }
 }

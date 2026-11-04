@@ -57,6 +57,23 @@ pub fn restart_spec(sp: &SavedPane) -> (Vec<String>, Vec<(String, String)>) {
         }
     };
     match agent {
+        // Already a resume of one particular conversation (`codex resume <id>`,
+        // `claude --resume <id>`, as moved agents run): start exactly that again.
+        Some(_)
+            if shell_pane
+                && sp.argv.iter().skip(1).any(|a| {
+                    a.contains(" resume ") || a.contains("--resume ") || a.contains(" -r ")
+                }) =>
+        {
+            let mut argv = sp.argv.clone();
+            // Its bus name for the agent (the first command), as for the other restored agents.
+            if let (Some(n), Some(script)) = (&sp.bus_name, argv.last_mut()) {
+                if !script.starts_with("ORCH_AGENT=") {
+                    *script = format!("ORCH_AGENT='{}' {script}", n.replace('\'', ""));
+                }
+            }
+            (argv, Vec::new())
+        }
         Some(kind) if shell_pane => {
             let shell = sp
                 .argv
@@ -306,6 +323,21 @@ mod tests {
         let (argv, env) = restart_spec(&saved(&["codex"], Some("codex"), Some("x-codex")));
         assert_eq!(argv, v(&["codex", "resume", "--last"]));
         assert_eq!(env, vec![("ORCH_AGENT".to_string(), "x-codex".to_string())]);
+
+        // A moved agent that resumes one conversation by id: kept exactly.
+        let script = "codex resume 01a19cb9-ca22; exec bash";
+        let (argv, _) = restart_spec(&saved(
+            &["bash", "-lc", script],
+            Some("codex"),
+            Some("o-codex"),
+        ));
+        assert_eq!(
+            argv,
+            v(&["bash", "-lc", &format!("ORCH_AGENT='o-codex' {script}")])
+        );
+        let script = "claude --resume 6a43; exec bash";
+        let (argv, _) = restart_spec(&saved(&["bash", "-lc", script], Some("claude"), None));
+        assert_eq!(argv, v(&["bash", "-lc", script]));
 
         // A plain shell stays a plain shell.
         let (argv, env) = restart_spec(&saved(&["bash", "--norc"], None, None));

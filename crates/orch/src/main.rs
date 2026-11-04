@@ -108,6 +108,13 @@ enum Cmd {
     Kill { pane: String },
     /// Focus a pane and show its workspace in every open `orch` TUI
     Focus { pane: String },
+    /// After a usage-limit reset orchd types "continue" into the agent's pane: show or set that
+    AutoContinue {
+        pane: String,
+        /// on | off (without: show)
+        #[arg(value_parser = ["on", "off"])]
+        state: Option<String>,
+    },
     /// Workspaces: focus, new, rename, close (by id or label, as `orch watch` lists them)
     Ws {
         #[command(subcommand)]
@@ -491,6 +498,23 @@ async fn run(cli: Cli) -> Result<()> {
         Cmd::Latency { pane, count } => attach::latency(conn, &pane, count).await?,
         Cmd::StopDaemon { restart } => {
             conn.request(&Request::StopDaemon { restart }).await?;
+        }
+        Cmd::AutoContinue { pane, state } => {
+            let v = conn
+                .request(&Request::AutoContinue {
+                    pane: strip_orch(pane),
+                    on: state.map(|s| s == "on"),
+                })
+                .await?;
+            println!(
+                "{}: auto-continue {}",
+                v["pane"].as_str().unwrap_or(""),
+                if v["auto_continue"] == true {
+                    "on"
+                } else {
+                    "off"
+                }
+            );
         }
         Cmd::Ws { cmd } => ws::ws(&mut conn, cmd).await?,
         Cmd::Tab { cmd } => ws::tab_cmd(&mut conn, cmd).await?,

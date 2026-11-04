@@ -319,14 +319,25 @@ impl Pane {
         self.kind.lock().unwrap().clone()
     }
 
+    /// The agent in this pane: from its command or registration, else from its screen (an
+    /// agent typed into a shell).
+    pub fn agent(&self, screen: &str) -> Option<String> {
+        self.kind()
+            .or_else(|| detect::screen_kind(screen).map(String::from))
+    }
+
     /// Agent status from the screen right now.
     pub fn detect(&self) -> Detected {
         if self.exit_code().is_some() {
             return Detected::Done;
         }
-        let kind = self.kind();
         let text = self.term.lock().unwrap().visible_text();
-        detect::detect(&text, kind.as_deref())
+        detect::detect(&text, self.agent(&text).as_deref())
+    }
+
+    /// The visible screen text.
+    pub fn visible_text(&self) -> String {
+        self.term.lock().unwrap().visible_text()
     }
 
     pub fn info(&self) -> PaneInfo {
@@ -353,7 +364,9 @@ impl Pane {
             clients: self.clients.lock().unwrap().len(),
             title,
             created_unix: self.created_unix,
-            agent: self.kind(),
+            agent: self.agent(&self.visible_text()),
+            limit_reset: crate::limits::info(&self.id).and_then(|(r, _)| r),
+            auto_continue: crate::limits::auto_continue(&self.id, None),
             agent_status: match self.detect() {
                 Detected::None => None,
                 d => Some(

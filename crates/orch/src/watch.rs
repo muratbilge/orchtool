@@ -279,11 +279,37 @@ fn workspaces(session: &Session, panes: &[PaneInfo]) -> Vec<Value> {
 fn order(s: &str) -> u8 {
     match s {
         "blocked" => 0,
+        "limited" => 1,
         "working" => 1,
         "done" => 2,
         "idle" => 3,
         _ => 4,
     }
+}
+
+/// (limit_reset in ms, status text, auto_continue) of a pane; the text only while limited.
+fn limit_fields(p: &PaneInfo) -> (Value, Value, bool) {
+    if p.agent_status.as_deref() != Some("limited") {
+        return (Value::Null, Value::Null, p.auto_continue);
+    }
+    let text = match p.limit_reset {
+        Some(r) if p.auto_continue => format!("usage limit · continues {}", hhmm(r + 60)),
+        Some(r) => format!("usage limit · resets {} (auto-continue off)", hhmm(r)),
+        None => "usage limit · no reset time on screen".to_string(),
+    };
+    (
+        p.limit_reset.map_or(Value::Null, |r| json!(r * 1000)),
+        json!(text),
+        p.auto_continue,
+    )
+}
+
+fn hhmm(t: i64) -> String {
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    let t = t as libc::time_t;
+    // SAFETY: plain libc time conversion on stack values.
+    unsafe { libc::localtime_r(&t, &mut tm) };
+    format!("{:02}:{:02}", tm.tm_hour, tm.tm_min)
 }
 
 fn herdr_pane(a: &AgentRow) -> Option<&str> {
@@ -315,6 +341,7 @@ fn merge(
     let mut out = Vec::new();
     for a in agents {
         let mut status = a.status.clone();
+        let mut limit = (Value::Null, Value::Null, true);
         let (mut workspace, mut number, mut focused) = (String::new(), 0, false);
         let mut cwd = a.cwd.clone().unwrap_or_default();
         let live = match a.pane.as_deref() {
@@ -330,9 +357,12 @@ fn merge(
                         // The screen knows best about dialogs; the bus about everything else.
                         match info.agent_status.as_deref() {
                             Some("blocked") => status = "blocked".into(),
+                            // Hooks report idle/working; only the screen shows the limit.
+                            Some("limited") => status = "limited".into(),
                             Some(s) if status == "unknown" => status = s.into(),
                             _ => {}
                         }
+                        limit = limit_fields(info);
                         true
                     }
                     _ => continue, // its pane is gone
@@ -355,8 +385,10 @@ fn merge(
         out.push(json!({
             "name": a.name,
             "kind": a.kind,
+            "status_text": if status == "limited" { limit.1.clone() } else { json!(a.status_text) },
             "status": status,
-            "status_text": a.status_text,
+            "limit_reset": limit.0,
+            "auto_continue": limit.2,
             "pane": a.pane,
             "cwd": cwd,
             "workspace": workspace,
@@ -376,11 +408,14 @@ fn merge(
             continue;
         }
         let (workspace, number, focused) = place(&p.id);
+        let limit = limit_fields(p);
         out.push(json!({
             "name": p.name.clone().unwrap_or_else(|| format!("{kind}-{}", p.id)),
             "kind": kind,
             "status": p.agent_status.as_deref().unwrap_or("unknown"),
-            "status_text": Value::Null,
+            "status_text": limit.1,
+            "limit_reset": limit.0,
+            "auto_continue": limit.2,
             "pane": format!("orch:{}", p.id),
             "cwd": p.cwd,
             "workspace": workspace,
@@ -497,6 +532,8 @@ mod tests {
             created_unix: 0,
             agent: agent.map(String::from),
             agent_status: status.map(String::from),
+            limit_reset: None,
+            auto_continue: true,
         }
     }
 
@@ -535,6 +572,24 @@ mod tests {
                 workspace: "w1".into(),
             }),
         }
+    }
+
+    #[test]
+    fn a_limited_agent_says_when_it_continues() {
+        let mut p = pane("p1", Some("codex"), Some("limited"));
+        p.limit_reset = Some(1_000_000);
+        let list = merge(&[], &[p.clone()], &session_p1(), None, 0);
+        assert_eq!(list[0]["status"], "limited");
+        assert_eq!(list[0]["limit_reset"], 1_000_000_000i64);
+        assert_eq!(list[0]["auto_continue"], true);
+        let text = list[0]["status_text"].as_str().unwrap();
+        assert!(text.starts_with("usage limit · continues "), "{text}");
+        p.auto_continue = false;
+        let list = merge(&[], &[p], &session_p1(), None, 0);
+        assert!(list[0]["status_text"]
+            .as_str()
+            .unwrap()
+            .contains("auto-continue off"));
     }
 
     #[test]
