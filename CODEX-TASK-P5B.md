@@ -40,3 +40,29 @@ ran it this morning and was cut off mid-call); that case must be covered: it was
 
 When done, write `CODEX-REVIEW-P5B-RESULT.md`: commits, what you tested, anything open.
 Keep it short.
+
+## Part 2 (added by Murat's request): answer Codex's model-switch question
+
+Overnight the paperscanner Codex was continued at 05:04, worked 8 min, then sat for hours on this
+dialog (it blocks until answered):
+
+```
+  Approaching rate limits
+  Switch to gpt-6-luna for lower credit usage?
+
+› 1. Switch to gpt-6-luna
+  2. Keep current model
+  3. Keep current model (never show again)
+
+  enter select · esc back
+```
+
+orchd should answer it in Codex panes: detect it in `detect.rs` (new `Detected` variant or a helper;
+match "Approaching rate limits" + "Keep current model" near the screen bottom, Codex panes only;
+the model name will change, don't hard-code it), and in the `limits.rs` check loop type `2`
+(no Enter needed: typing 2 selected it this morning; verify with a fake screen in a test), once per
+appearance of the dialog. Respect `orch auto-continue <pane> off` for this too. Bus message to murat
+in thread "limits": "<name>: kept the current model at Codex's rate-limit question". Tests: detection
+unit tests (positive, and a normal screen that merely mentions the words in scrollback above the
+prompt is not matched) and an integration test like the limited-Codex one.
+Separate commit from Part 1.

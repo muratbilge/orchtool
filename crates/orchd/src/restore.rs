@@ -3,12 +3,22 @@
 //! `restore.json` next to its socket; the next orchd recreates them with fresh panes. Agents
 //! continue their last conversation (`claude --continue`, `codex resume --last`).
 
+use crate::detect::{self, Detected};
+use crate::pane::Pane;
 use crate::server::Daemon;
-use orch_proto::api::NewPane;
+use orch_proto::api::{NewPane, HUMAN};
 use orch_proto::layout::{Node, Session};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
+
+const READY_TIMEOUT: Duration = Duration::from_secs(90);
+const CHECK_EVERY: Duration = Duration::from_millis(250);
+const ENTER_AFTER: Duration = Duration::from_millis(300);
+pub const RESTART_NOTE: &str = "orchd was restarted while you were working (orch stop-daemon --restart); \
+the restart is done. Your last tool call was interrupted: check its outcome, then continue where you stopped.";
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Saved {
@@ -30,6 +40,35 @@ pub struct SavedPane {
     /// Its name on the bus: the restarted agent takes it again (unread mail, open questions).
     #[serde(default)]
     pub bus_name: Option<String>,
+    /// Positive screen detection at save time; old snapshots never opt into automatic input.
+    #[serde(default)]
+    pub was_working: bool,
+}
+
+fn should_continue(agent: Option<&str>, status: Detected, asking: bool) -> bool {
+    matches!(agent, Some("claude" | "codex")) && status == Detected::Working && !asking
+}
+
+/// One attempt per restored pane. Never turn a timeout, dialog or limit into permission to type.
+async fn continue_restored(pane: Arc<Pane>, name: String) -> Option<String> {
+    let deadline = tokio::time::Instant::now() + READY_TIMEOUT;
+    loop {
+        match pane.detect() {
+            Detected::Idle => break,
+            Detected::Blocked | Detected::Limited | Detected::Done => return None,
+            _ => {}
+        }
+        if tokio::time::Instant::now() >= deadline {
+            eprintln!("orchd: restart: {name} ({}) did not become idle within 90s; not nudged", pane.id);
+            return None;
+        }
+        tokio::time::sleep(CHECK_EVERY).await;
+    }
+    // The same text / pause / CR path as limits.rs. Recheck readiness before Enter as well.
+    if !pane.write(RESTART_NOTE.as_bytes().to_vec()) { return None; }
+    tokio::time::sleep(ENTER_AFTER).await;
+    if pane.detect() != Detected::Idle || !pane.write(b"\r".to_vec()) { return None; }
+    Some(name)
 }
 
 const SHELLS: [&str; 5] = ["bash", "zsh", "sh", "fish", "dash"];
@@ -148,6 +187,8 @@ impl Daemon {
         let session = self.session.lock().unwrap().clone();
         let mut panes = HashMap::new();
         let agents = self.bus.agents().unwrap_or_default();
+        // If the bus cannot be read, fail closed rather than continuing a pending human ask.
+        let questions = self.bus.questions(false).ok();
         for p in self.all_panes() {
             if p.exit_code().is_some() {
                 continue;
@@ -164,6 +205,10 @@ impl Daemon {
                 .iter()
                 .find(|a| a.pane.as_deref() == Some(format!("orch:{}", p.id).as_str()))
                 .map(|a| a.name.clone());
+            let screen = p.visible_text();
+            let agent = p.agent(&screen);
+            let asking = questions.as_ref().is_none_or(|qs| qs.iter().any(|q| Some(&q.from) == bus_name.as_ref()));
+            let was_working = should_continue(agent.as_deref(), detect::detect(&screen, agent.as_deref()), asking);
             panes.insert(
                 p.id.clone(),
                 SavedPane {
@@ -172,8 +217,9 @@ impl Daemon {
                     rows,
                     cols,
                     name: p.name.clone(),
-                    agent: p.kind(),
+                    agent,
                     bus_name,
+                    was_working,
                 },
             );
         }
@@ -197,8 +243,10 @@ impl Daemon {
 
     /// Recreates a saved layout with new panes. Panes whose program can't start are left out
     /// (their tab / workspace collapses if nothing is left). Returns how many came back.
-    pub fn restore_layout(&self, saved: Saved) -> usize {
+    pub fn restore_layout(self: &Arc<Self>, saved: Saved) -> usize {
         let mut ids: HashMap<String, String> = HashMap::new();
+        let mut resumed = 0;
+        let mut pending = Vec::new();
         let mut failed: Vec<String> = Vec::new();
         for ws in &saved.session.workspaces {
             for tab in &ws.tabs {
@@ -229,6 +277,14 @@ impl Daemon {
                         .or_else(|_| self.new_pane(req(None)));
                     match pane {
                         Ok(p) => {
+                            if matches!(sp.agent.as_deref(), Some("claude" | "codex")) {
+                                resumed += 1;
+                                if sp.was_working {
+                                    let name = sp.bus_name.clone().or_else(|| sp.name.clone())
+                                        .unwrap_or_else(|| format!("{} in {}", sp.agent.as_deref().unwrap(), p.id));
+                                    pending.push((Arc::clone(&p), name));
+                                }
+                            }
                             ids.insert(old, p.id.clone());
                         }
                         Err(e) => {
@@ -263,6 +319,21 @@ impl Daemon {
         }
         let _ = self.ui_events.send(crate::ui::UiEvent::Session);
         let _ = self.ui_events.send(crate::ui::UiEvent::Panes);
+        let daemon = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut jobs = tokio::task::JoinSet::new();
+            for (pane, name) in pending { jobs.spawn(continue_restored(pane, name)); }
+            let mut nudged = Vec::new();
+            while let Some(result) = jobs.join_next().await {
+                if let Ok(Some(name)) = result { nudged.push(name); }
+            }
+            nudged.sort();
+            let names = if nudged.is_empty() { String::new() } else { format!(" ({})", nudged.join(", ")) };
+            let text = format!("restart: resumed {resumed} agents, nudged {} that were working{names}", nudged.len());
+            if let Err(e) = daemon.bus.send("orchd", HUMAN, "msg", &text, Some("restart"), None) {
+                eprintln!("orchd: restart summary: {e}");
+            }
+        });
         ids.len()
     }
 }
@@ -305,7 +376,30 @@ mod tests {
             name: None,
             agent: agent.map(str::to_string),
             bus_name: bus.map(str::to_string),
+            was_working: false,
         }
+    }
+
+    #[test]
+    fn old_snapshots_default_to_no_automatic_input() {
+        let mut value = serde_json::to_value(saved(&["claude"], Some("claude"), None)).unwrap();
+        value.as_object_mut().unwrap().remove("was_working");
+        assert!(!serde_json::from_value::<SavedPane>(value.clone()).unwrap().was_working);
+        value["was_working"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<SavedPane>(value).unwrap().was_working);
+    }
+
+    #[test]
+    fn only_working_known_agents_without_human_questions_are_eligible() {
+        for kind in [Some("claude"), Some("codex")] {
+            assert!(should_continue(kind, Detected::Working, false));
+            assert!(!should_continue(kind, Detected::Working, true));
+            for status in [Detected::Idle, Detected::Blocked, Detected::Limited, Detected::Unknown, Detected::Done] {
+                assert!(!should_continue(kind, status, false));
+            }
+        }
+        assert!(!should_continue(None, Detected::Working, false));
+        assert!(!should_continue(Some("shell"), Detected::Working, false));
     }
 
     #[test]
