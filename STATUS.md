@@ -1,8 +1,31 @@
 # Status
 
+Older Codex briefs and review results (`CODEX-*.md`, `HANDOFF.md`) were removed from the tree on 2026-11-04;
+they are in git history (`git log --all -- 'CODEX-*.md'`). New briefs stay untracked (`.gitignore`).
+
+## 2026-11-04 — P5A–P5C merged, restart note, model menu, exact resume — Claude
+
+All on main, `scripts/check.sh` green, installed; live orchd restarted at 09:1x onto P5A/P5B.
+- **P5A** (Codex): review fixes (dialog hash, inherited ORCH_AGENT, login-env deadline, tab rename by id);
+  expired questions + `orch question close`; one frame per key; `│` split border; phone help; 20 ms Enter
+  except Codex/multi-line; `orch read --unwrapped`.
+- **Limits** (Claude): `limited` status, auto-continue after the reset (`orch auto-continue`).
+- **P5B**: after `stop-daemon --restart`, agents that were working get a note once idle (Codex); orchd answers
+  Codex's "switch to a cheaper model?" menu with "keep current model" (Codex + Claude).
+- **P5C** (Codex, reviewed by Claude): restore saves each agent's conversation id (Claude: from the hook's
+  session id; Codex: from its open rollout file) and real argv, resumes `--resume <id>` with the options kept.
+  Inbox race fixed (inbox requests carry flushed receipts). Proof under 4× parallel load of the bus suite:
+  before 1 in 15 runs failed `two_agents_talk_and_one_asks_murat`, after 0 in 100.
+- **Open:**
+  - Codex keeps its rollout files open in the shared `codex app-server` daemon, not in the pane's process,
+    so the id lookup finds nothing for Codex; a plain `codex` comes back as `codex resume --last` (wrong if two
+    Codex share a cwd). Panes started as `codex resume <id>` are exact. Lead: Codex hook / session id.
+  - `nudges_only_reach_idle_panes` fails under 4× parallel load (timing); fine in normal check runs.
+  - Live check of the restart note and exact resume at the next restart.
+
 ## 2026-11-04 — P5A implemented; full validation blocked — Codex
 
-Part A review/fixes and all six polish items are implemented; see `CODEX-REVIEW-P5A-RESULT.md` for commits, tests and open issues. Formatting/clippy/build pass, and 49 unit tests pass. Full `scripts/check.sh` is **not GREEN**: this sandbox rejects Unix-socket creation, preventing mux/integration tests and the real Claude/shell smoke check. The reported inbox/ACK test flake is listed, not suppressed.
+Part A review/fixes and all six polish items are implemented; commits and open issues in the entry above. Formatting/clippy/build pass, and 49 unit tests pass. Full `scripts/check.sh` is **not GREEN**: this sandbox rejects Unix-socket creation, preventing mux/integration tests and the real Claude/shell smoke check. The reported inbox/ACK test flake is listed, not suppressed.
 
 `.git` is read-only here. Separate `[codex]` commits were preserved in `/tmp/orch-p5a-commits.yhmUjF`; `/tmp/orch-p5a-series.patch` exports them for a clean checkout at `860d4bc`. The main branch is unchanged and its working tree contains the implementation. Live orchd and Kabuk were not touched.
 

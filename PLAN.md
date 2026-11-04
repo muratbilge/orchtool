@@ -68,7 +68,7 @@ Murat's goal (2026-11-02): manage ALL agents in a Rust tool — like herdr but b
 each other, report to him and ask him, with the best interaction and efficiency.
 Decisions (Murat OK'd Codex defaults 2026-11-02): daemon restart may interrupt running agents at first (orchd
 reports what was interrupted, no silent relaunch); Telegram = private chat, short questions, no automatic
-terminal-output forwarding. Engineering defaults from CODEX-OPINION.md apply (versioned JSON protocol first,
+terminal-output forwarding. Engineering defaults from Codex's opinion (in git history, CODEX-OPINION.md) apply (versioned JSON protocol first,
 vt100 behind an adapter, one controlling client + observers, bounded scrollback/queues, rusqlite + tokio).
 
 Codex builds each phase in the visible herdr workspace "Orchtool · Codex", Claude checks key claims; each phase

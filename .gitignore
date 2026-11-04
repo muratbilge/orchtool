@@ -2,3 +2,5 @@
 /.toolchain/
 /notes/spike-output/
 target/
+/CODEX-*.md
+/HANDOFF.md
