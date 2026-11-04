@@ -59,15 +59,22 @@ async fn continue_restored(pane: Arc<Pane>, name: String) -> Option<String> {
             _ => {}
         }
         if tokio::time::Instant::now() >= deadline {
-            eprintln!("orchd: restart: {name} ({}) did not become idle within 90s; not nudged", pane.id);
+            eprintln!(
+                "orchd: restart: {name} ({}) did not become idle within 90s; not nudged",
+                pane.id
+            );
             return None;
         }
         tokio::time::sleep(CHECK_EVERY).await;
     }
     // The same text / pause / CR path as limits.rs. Recheck readiness before Enter as well.
-    if !pane.write(RESTART_NOTE.as_bytes().to_vec()) { return None; }
+    if !pane.write(RESTART_NOTE.as_bytes().to_vec()) {
+        return None;
+    }
     tokio::time::sleep(ENTER_AFTER).await;
-    if pane.detect() != Detected::Idle || !pane.write(b"\r".to_vec()) { return None; }
+    if pane.detect() != Detected::Idle || !pane.write(b"\r".to_vec()) {
+        return None;
+    }
     Some(name)
 }
 
@@ -207,8 +214,14 @@ impl Daemon {
                 .map(|a| a.name.clone());
             let screen = p.visible_text();
             let agent = p.agent(&screen);
-            let asking = questions.as_ref().is_none_or(|qs| qs.iter().any(|q| Some(&q.from) == bus_name.as_ref()));
-            let was_working = should_continue(agent.as_deref(), detect::detect(&screen, agent.as_deref()), asking);
+            let asking = questions
+                .as_ref()
+                .is_none_or(|qs| qs.iter().any(|q| Some(&q.from) == bus_name.as_ref()));
+            let was_working = should_continue(
+                agent.as_deref(),
+                detect::detect(&screen, agent.as_deref()),
+                asking,
+            );
             panes.insert(
                 p.id.clone(),
                 SavedPane {
@@ -280,8 +293,13 @@ impl Daemon {
                             if matches!(sp.agent.as_deref(), Some("claude" | "codex")) {
                                 resumed += 1;
                                 if sp.was_working {
-                                    let name = sp.bus_name.clone().or_else(|| sp.name.clone())
-                                        .unwrap_or_else(|| format!("{} in {}", sp.agent.as_deref().unwrap(), p.id));
+                                    let name = sp
+                                        .bus_name
+                                        .clone()
+                                        .or_else(|| sp.name.clone())
+                                        .unwrap_or_else(|| {
+                                            format!("{} in {}", sp.agent.as_deref().unwrap(), p.id)
+                                        });
                                     pending.push((Arc::clone(&p), name));
                                 }
                             }
@@ -322,15 +340,29 @@ impl Daemon {
         let daemon = Arc::clone(self);
         tokio::spawn(async move {
             let mut jobs = tokio::task::JoinSet::new();
-            for (pane, name) in pending { jobs.spawn(continue_restored(pane, name)); }
+            for (pane, name) in pending {
+                jobs.spawn(continue_restored(pane, name));
+            }
             let mut nudged = Vec::new();
             while let Some(result) = jobs.join_next().await {
-                if let Ok(Some(name)) = result { nudged.push(name); }
+                if let Ok(Some(name)) = result {
+                    nudged.push(name);
+                }
             }
             nudged.sort();
-            let names = if nudged.is_empty() { String::new() } else { format!(" ({})", nudged.join(", ")) };
-            let text = format!("restart: resumed {resumed} agents, nudged {} that were working{names}", nudged.len());
-            if let Err(e) = daemon.bus.send("orchd", HUMAN, "msg", &text, Some("restart"), None) {
+            let names = if nudged.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", nudged.join(", "))
+            };
+            let text = format!(
+                "restart: resumed {resumed} agents, nudged {} that were working{names}",
+                nudged.len()
+            );
+            if let Err(e) = daemon
+                .bus
+                .send("orchd", HUMAN, "msg", &text, Some("restart"), None)
+            {
                 eprintln!("orchd: restart summary: {e}");
             }
         });
@@ -384,9 +416,17 @@ mod tests {
     fn old_snapshots_default_to_no_automatic_input() {
         let mut value = serde_json::to_value(saved(&["claude"], Some("claude"), None)).unwrap();
         value.as_object_mut().unwrap().remove("was_working");
-        assert!(!serde_json::from_value::<SavedPane>(value.clone()).unwrap().was_working);
+        assert!(
+            !serde_json::from_value::<SavedPane>(value.clone())
+                .unwrap()
+                .was_working
+        );
         value["was_working"] = serde_json::json!(true);
-        assert!(serde_json::from_value::<SavedPane>(value).unwrap().was_working);
+        assert!(
+            serde_json::from_value::<SavedPane>(value)
+                .unwrap()
+                .was_working
+        );
     }
 
     #[test]
@@ -394,7 +434,13 @@ mod tests {
         for kind in [Some("claude"), Some("codex")] {
             assert!(should_continue(kind, Detected::Working, false));
             assert!(!should_continue(kind, Detected::Working, true));
-            for status in [Detected::Idle, Detected::Blocked, Detected::Limited, Detected::Unknown, Detected::Done] {
+            for status in [
+                Detected::Idle,
+                Detected::Blocked,
+                Detected::Limited,
+                Detected::Unknown,
+                Detected::Done,
+            ] {
                 assert!(!should_continue(kind, status, false));
             }
         }
