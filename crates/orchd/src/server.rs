@@ -310,9 +310,17 @@ impl Daemon {
                 self.bus.touch(&row.from);
                 Ok(serde_json::to_value(row).unwrap())
             }
-            Request::Inbox { name, wait_ms } => {
+            Request::Inbox {
+                name,
+                wait_ms,
+                delivered,
+            } => {
                 let wait = Duration::from_millis(wait_ms.unwrap_or(0).min(3_600_000));
-                let rows = self.bus.inbox_wait(&name, wait).await.map_err(bus_err)?;
+                let rows = self
+                    .bus
+                    .inbox_after(&name, &delivered, wait)
+                    .await
+                    .map_err(bus_err)?;
                 Ok(json!({ "messages": rows }))
             }
             Request::Ack { name, ids } => {

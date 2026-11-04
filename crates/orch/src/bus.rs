@@ -118,6 +118,7 @@ pub async fn msg(conn: &mut Conn, from: &str, to: &str, text: &str) -> Result<()
 pub async fn inbox(conn: &mut Conn, name: &str, wait: u64, peek: bool) -> Result<()> {
     let v = conn
         .request(&Request::Inbox {
+            delivered: Vec::new(),
             name: name.into(),
             wait_ms: Some(wait * 1000),
         })
@@ -290,6 +291,7 @@ pub async fn hook(socket: &Path, kind: &str) {
             "Stop" => {
                 let v = conn
                     .request(&Request::Inbox {
+                        delivered: Vec::new(),
                         name: me.clone(),
                         wait_ms: Some(0),
                     })

@@ -351,6 +351,21 @@ impl Bus {
         Ok(n)
     }
 
+    /// Establish delivery order before reading. A receipt may arrive here before the
+    /// sender's separate post-flush ACK; applying it again is harmless. Only prior replies
+    /// are acknowledged, so cancelling this read cannot lose its result.
+    pub async fn inbox_after(
+        &self,
+        name: &str,
+        delivered: &[i64],
+        wait: Duration,
+    ) -> Result<Vec<MessageRow>> {
+        if !delivered.is_empty() {
+            self.ack(name, delivered)?;
+        }
+        self.inbox_wait(name, wait).await
+    }
+
     /// Wait up to `wait` for unread inbox rows (not consumed; see `ack`).
     pub async fn inbox_wait(&self, name: &str, wait: Duration) -> Result<Vec<MessageRow>> {
         let name = normalize_name(name);
@@ -796,6 +811,40 @@ mod tests {
         bus.register(&reg("late")).unwrap();
         assert_eq!(bus.inbox(&late).unwrap().len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn next_inbox_applies_receipts_before_a_delayed_standalone_ack() {
+        let bus = Bus::in_memory().unwrap();
+        let a = reg(&bus, "claude", "a", "/same");
+        let b = reg(&bus, "codex", "b", "/same");
+        let first = bus.send(&a, &b, "msg", "first", None, None).unwrap();
+        assert_eq!(bus.inbox(&b).unwrap()[0].id, first.id);
+        // The reply was flushed, but deliberately do NOT run its standalone ACK yet.
+        assert!(bus
+            .inbox_after(&b, &[first.id], Duration::ZERO)
+            .await
+            .unwrap()
+            .is_empty());
+        let second = bus.send(&a, &b, "msg", "second", None, None).unwrap();
+        assert_eq!(
+            bus.inbox_after(&b, &[first.id], Duration::ZERO)
+                .await
+                .unwrap()[0]
+                .id,
+            second.id
+        );
+        bus.ack(&b, &[first.id]).unwrap(); // late ACK, idempotent
+        assert_eq!(
+            bus.inbox(&b).unwrap()[0].id,
+            second.id,
+            "new reply is not pre-consumed"
+        );
+        assert!(bus
+            .inbox_after(&b, &[second.id], Duration::ZERO)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

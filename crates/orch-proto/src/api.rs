@@ -73,6 +73,10 @@ pub enum Request {
         name: String,
         #[serde(default)]
         wait_ms: Option<u64>,
+        /// Receipts from previously flushed replies. Apply before reading, even if their
+        /// standalone msg.ack is still in flight. Never include the current reply's ids.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        delivered: Vec<i64>,
     },
     #[serde(rename = "msg.ack")]
     Ack { name: String, ids: Vec<i64> },

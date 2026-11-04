@@ -13,14 +13,17 @@ use orch_proto::client::{connect_or_start, default_socket_path, register_request
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc;
+
+mod delivery;
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
 
 struct State {
     /// "claude", "codex", … from the client's `clientInfo.name`.
     kind: Mutex<String>,
+    delivered: delivery::Receipts,
     inflight: Mutex<HashMap<String, tokio::task::AbortHandle>>,
 }
 
@@ -28,21 +31,27 @@ struct State {
 async fn main() {
     let state = Arc::new(State {
         kind: Mutex::new("agent".into()),
+        delivered: delivery::Receipts::default(),
         inflight: Mutex::new(HashMap::new()),
     });
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Out>();
+    let writer_state = Arc::clone(&state);
     let writer = tokio::spawn(async move {
         let mut stdout = tokio::io::stdout();
         while let Some((v, after)) = out_rx.recv().await {
-            let mut line = serde_json::to_vec(&v).unwrap();
-            line.push(b'\n');
-            if stdout.write_all(&line).await.is_err() || stdout.flush().await.is_err() {
+            if writer_state
+                .delivered
+                .write(&mut stdout, &v, after.as_ref())
+                .await
+                .is_err()
+            {
                 break; // not delivered: its messages are NOT acknowledged
             }
-            // Delivered to the client: now consume what it contained (inbox acks). If we
-            // die right here, the messages come again next time (at-least-once).
+            // Receipt is already visible to the next inbox read, even while this ACK waits.
             if let Some(req) = after {
-                let _ = request(req).await;
+                if request(req.clone()).await.is_ok() {
+                    writer_state.delivered.confirm(&req).await;
+                }
             }
         }
     });
@@ -130,7 +139,8 @@ fn handle(state: &Arc<State>, out: &mpsc::UnboundedSender<Out>, msg: Value) {
                 let name = params["name"].as_str().unwrap_or("").to_string();
                 let args = params.get("arguments").cloned().unwrap_or(json!({}));
                 let kind = state2.kind.lock().unwrap().clone();
-                let (result, after) = match call_tool(&kind, &name, &args).await {
+                let (result, after) = match call_tool(&kind, &name, &args, &state2.delivered).await
+                {
                     Ok((text, after)) => (
                         json!({ "content": [{ "type": "text", "text": text }] }),
                         after,
@@ -319,14 +329,16 @@ async fn call_tool(
     kind: &str,
     name: &str,
     args: &Value,
+    delivered: &delivery::Receipts,
 ) -> Result<(String, Option<Request>), String> {
-    call_tool_inner(kind, name, args).await
+    call_tool_inner(kind, name, args, delivered).await
 }
 
 async fn call_tool_inner(
     kind: &str,
     name: &str,
     args: &Value,
+    delivered: &delivery::Receipts,
 ) -> Result<(String, Option<Request>), String> {
     let me = whoami(kind).await?;
     let str_arg = |k: &str| args[k].as_str().map(str::to_string);
@@ -346,6 +358,7 @@ async fn call_tool_inner(
         "read_inbox" => {
             let wait = wait_ms(kind, args, 0);
             let v = request(Request::Inbox {
+                delivered: delivered.for_agent(&me).await,
                 name: me.clone(),
                 wait_ms: Some(wait),
             })
