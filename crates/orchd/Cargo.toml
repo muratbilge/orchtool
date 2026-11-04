@@ -23,6 +23,7 @@ portable-pty.workspace = true
 libc.workspace = true
 anyhow.workspace = true
 base64.workspace = true
+shell-words = "1"
 rusqlite.workspace = true
 
 [dev-dependencies]

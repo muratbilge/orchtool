@@ -43,6 +43,11 @@ pub struct SavedPane {
     /// Positive screen detection at save time; old snapshots never opt into automatic input.
     #[serde(default)]
     pub was_working: bool,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// Actual agent argv, including an agent launched interactively inside a shell.
+    #[serde(default)]
+    pub agent_argv: Option<Vec<String>>,
 }
 
 fn should_continue(agent: Option<&str>, status: Detected, asking: bool) -> bool {
@@ -102,6 +107,41 @@ pub fn restart_spec(sp: &SavedPane) -> (Vec<String>, Vec<(String, String)>) {
             v.push(("ORCH_AGENT".into(), n.clone()));
         }
     };
+    if let Some(kind) = agent {
+        let actual = sp.agent_argv.clone().or_else(|| {
+            if shell_pane {
+                crate::resume_argv::shell_agent(&sp.argv, kind)
+                    .or_else(|| sp.session_id.as_ref().map(|_| vec![kind.to_string()]))
+            } else {
+                Some(sp.argv.clone())
+            }
+        });
+        if let Some(argv) = actual
+            .and_then(|args| crate::resume_argv::rewrite(&args, kind, sp.session_id.as_deref()))
+        {
+            if shell_pane {
+                let shell = sp
+                    .argv
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "/bin/bash".into());
+                let name = sp
+                    .bus_name
+                    .as_ref()
+                    .map(|n| format!("ORCH_AGENT={} ", shell_words::quote(n)))
+                    .unwrap_or_default();
+                let script = format!(
+                    "{name}{}; exec {}",
+                    shell_words::join(argv),
+                    shell_words::quote(&shell)
+                );
+                return (vec![shell, "-lc".into(), script], Vec::new());
+            }
+            let mut env = Vec::new();
+            name_env(&mut env);
+            return (argv, env);
+        }
+    }
     match agent {
         // Already a resume of one particular conversation (`codex resume <id>`,
         // `claude --resume <id>`, as moved agents run): start exactly that again.
@@ -156,6 +196,11 @@ pub fn restart_argv(argv: &[String]) -> Vec<String> {
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or_default();
+    if matches!(base, "claude" | "codex") {
+        if let Some(args) = crate::resume_argv::rewrite(argv, base, None) {
+            return args;
+        }
+    }
     let rest = &argv[1..];
     let only_flags = rest.iter().all(|a| a.starts_with('-'));
     let has = |flags: &[&str]| rest.iter().any(|a| flags.contains(&a.as_str()));
@@ -222,6 +267,18 @@ impl Daemon {
                 detect::detect(&screen, agent.as_deref()),
                 asking,
             );
+            let process = agent.as_deref().and_then(|kind| {
+                crate::conversation::discover(
+                    Path::new("/proc"),
+                    p.pid?,
+                    &crate::conversation::host_home()?,
+                    kind,
+                )
+            });
+            let session_id = process
+                .as_ref()
+                .and_then(|p| p.session_id.clone())
+                .or_else(|| agent.as_deref().and_then(|k| p.session_id(k)));
             panes.insert(
                 p.id.clone(),
                 SavedPane {
@@ -233,6 +290,8 @@ impl Daemon {
                     agent,
                     bus_name,
                     was_working,
+                    session_id,
+                    agent_argv: process.map(|p| p.argv),
                 },
             );
         }
@@ -383,17 +442,20 @@ mod tests {
         assert_eq!(restart_argv(&v(&["claude"])), v(&["claude", "--continue"]));
         assert_eq!(
             restart_argv(&v(&["/usr/bin/claude", "--model", "x"])),
-            v(&["/usr/bin/claude", "--model", "x"]),
-            "an option value is not a flag: left as it was"
+            v(&["/usr/bin/claude", "--continue", "--model", "x"]),
+            "option values survive resume"
         );
-        assert_eq!(restart_argv(&v(&["claude", "-c"])), v(&["claude", "-c"]));
+        assert_eq!(
+            restart_argv(&v(&["claude", "-c"])),
+            v(&["claude", "--continue"])
+        );
         assert_eq!(
             restart_argv(&v(&["codex", "--yolo"])),
             v(&["codex", "resume", "--last", "--yolo"])
         );
         assert_eq!(
             restart_argv(&v(&["codex", "fix the bug"])),
-            v(&["codex", "fix the bug"])
+            v(&["codex", "resume", "--last"])
         );
         assert_eq!(restart_argv(&v(&["bash"])), v(&["bash"]));
         assert!(restart_argv(&[]).is_empty());
@@ -409,7 +471,44 @@ mod tests {
             agent: agent.map(str::to_string),
             bus_name: bus.map(str::to_string),
             was_working: false,
+            session_id: None,
+            agent_argv: None,
         }
+    }
+
+    #[test]
+    fn exact_session_survives_snapshot_serialization_and_shell_quoting() {
+        let mut pane = saved(&["bash"], Some("claude"), Some("agent's name"));
+        pane.session_id = Some("11111111-1111-4111-8111-111111111111".into());
+        pane.agent_argv = Some(v(&["claude", "--model", "x y", "old prompt"]));
+        let pane: SavedPane = serde_json::from_str(&serde_json::to_string(&pane).unwrap()).unwrap();
+        let (argv, env) = restart_spec(&pane);
+        let command = argv[2].split("; exec").next().unwrap();
+        assert_eq!(
+            shell_words::split(command).unwrap(),
+            v(&[
+                "ORCH_AGENT=agent's name",
+                "claude",
+                "--resume",
+                "11111111-1111-4111-8111-111111111111",
+                "--model",
+                "x y"
+            ])
+        );
+        assert!(env.is_empty());
+        let mut hook_only = pane.clone();
+        hook_only.agent_argv = None;
+        assert!(restart_spec(&hook_only).0[2]
+            .contains("claude --resume 11111111-1111-4111-8111-111111111111"));
+        let old: SavedPane = serde_json::from_value(serde_json::json!({
+            "argv": ["codex", "-m", "y"], "cwd": "/tmp", "agent": "codex", "rows": 24, "cols": 80
+        }))
+        .unwrap();
+        assert!(old.session_id.is_none());
+        assert_eq!(
+            restart_spec(&old).0,
+            v(&["codex", "resume", "--last", "-m", "y"])
+        );
     }
 
     #[test]
@@ -473,7 +572,7 @@ mod tests {
         ));
         assert_eq!(
             argv,
-            v(&["bash", "-lc", &format!("ORCH_AGENT='o-codex' {script}")])
+            v(&["bash", "-lc", &format!("ORCH_AGENT=o-codex {script}")])
         );
         let script = "claude --resume 6a43; exec bash";
         let (argv, _) = restart_spec(&saved(&["bash", "-lc", script], Some("claude"), None));

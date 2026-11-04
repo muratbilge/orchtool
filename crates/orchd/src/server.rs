@@ -279,6 +279,13 @@ impl Daemon {
                 if let Some(id) = r.pane.as_deref().and_then(|p| p.strip_prefix("orch:")) {
                     if let Ok(p) = self.find(id) {
                         p.set_kind(&r.kind);
+                        if let Some(id) = r
+                            .instance
+                            .as_deref()
+                            .and_then(|s| s.strip_prefix(&format!("{}-session:", r.kind)))
+                        {
+                            p.remember_session(&r.kind, id);
+                        }
                     }
                 }
                 let row = self.bus.register(&r).map_err(bus_err)?;

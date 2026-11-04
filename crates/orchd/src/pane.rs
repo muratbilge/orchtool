@@ -46,6 +46,7 @@ pub struct Pane {
     next_client: AtomicU64,
     /// Agent kind: from argv, or learned when an agent registers from inside this pane.
     kind: Mutex<Option<String>>,
+    session_hint: Mutex<Option<(String, String)>>,
 }
 
 impl Pane {
@@ -120,6 +121,7 @@ impl Pane {
             clients: Mutex::new(BTreeSet::new()),
             next_client: AtomicU64::new(1),
             kind: Mutex::new(None),
+            session_hint: Mutex::new(None),
         });
         *pane.kind.lock().unwrap() = detect::agent_kind(&pane.argv).map(str::to_string);
 
@@ -313,6 +315,21 @@ impl Pane {
 
     pub fn set_kind(&self, kind: &str) {
         *self.kind.lock().unwrap() = Some(kind.to_string());
+    }
+
+    pub fn remember_session(&self, kind: &str, id: &str) {
+        if crate::conversation::uuid(id) {
+            *self.session_hint.lock().unwrap() = Some((kind.into(), id.into()));
+        }
+    }
+
+    pub fn session_id(&self, kind: &str) -> Option<String> {
+        self.session_hint
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|(k, _)| k == kind)
+            .map(|(_, id)| id.clone())
     }
 
     pub fn kind(&self) -> Option<String> {
