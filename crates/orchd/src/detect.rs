@@ -252,11 +252,33 @@ const BLOCKED: &[&str] = &[
     "[y/n]?",
 ];
 
+/// Codex's active rate-limit model menu, not a quoted menu above an ordinary prompt.
+/// Require option 2 to mean exactly "keep current model" before automatically sending 2.
+pub fn model_switch_question(screen: &str, kind: Option<&str>) -> bool {
+    if kind != Some("codex") {
+        return false;
+    }
+    let tail = tail_lines(screen, 10).to_lowercase();
+    let footer = tail.lines().last().unwrap_or_default();
+    tail.contains("approaching rate limits")
+        && tail.contains("switch to ")
+        && tail
+            .lines()
+            .any(|l| l.trim_start_matches([' ', '›', '❯']).trim_end() == "2. keep current model")
+        && footer.contains("enter")
+        && footer.contains("select")
+        && footer.contains("esc")
+        && footer.contains("back")
+}
+
 /// Classify the visible screen text of a pane running `kind`.
 pub fn detect(screen: &str, kind: Option<&str>) -> Detected {
     let Some(_kind) = kind else {
         return Detected::None;
     };
+    if model_switch_question(screen, kind) {
+        return Detected::Blocked;
+    }
     // Only the bottom of the screen matters (dialogs and status lines live there); scrolled-up
     // transcript text that merely quotes a prompt must not count.
     let lines: Vec<&str> = screen.lines().filter(|l| !l.trim().is_empty()).collect();
@@ -290,6 +312,27 @@ const IDLE: &[&str] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_menu_is_codex_only_and_must_be_the_active_bottom_menu() {
+        let menu = "Approaching rate limits\nSwitch to a-future-model for lower credit usage?\n› 1. Switch to a-future-model\n  2. Keep current model\n  3. Keep current model (never show again)\nenter select · esc back";
+        assert!(model_switch_question(menu, Some("codex")));
+        assert_eq!(detect(menu, Some("codex")), Detected::Blocked);
+        assert!(!model_switch_question(menu, Some("claude")));
+        assert!(!model_switch_question(menu, None));
+        assert!(!model_switch_question(
+            &format!("{menu}\n› Ask Codex\n? for shortcuts"),
+            Some("codex")
+        ));
+        assert!(!model_switch_question(
+            &format!("{menu}\n{}› Ask Codex", "old transcript\n".repeat(20)),
+            Some("codex")
+        ));
+        assert!(!model_switch_question(
+            &menu.replace("2. Keep current model", "2. Switch anyway"),
+            Some("codex")
+        ));
+    }
 
     #[test]
     fn real_screens() {

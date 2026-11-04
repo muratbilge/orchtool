@@ -745,3 +745,64 @@ async fn a_limited_codex_is_continued_once_after_its_reset() {
         "{texts:?}"
     );
 }
+
+#[tokio::test]
+async fn codex_model_question_is_answered_keep_current_once() {
+    let d = daemon().await;
+    let mut c = Conn::unix(&d.socket).await.unwrap();
+    // A fake Codex: shows the rate-limit model menu, takes one key raw, then its prompt.
+    let script = "stty -icanon -echo min 1; \
+        printf '• Ran cargo test\\n\\n  Approaching rate limits\\n  Switch to gpt-x-mini for lower credit usage?\\n\\n› 1. Switch to gpt-x-mini\\n  2. Keep current model\\n  3. Keep current model (never show again)\\n\\n  enter select · esc back\\n'; \
+        k=$(dd bs=1 count=1 2>/dev/null); printf '\\nPICKED:%s\\n\\n› Ask Codex to do anything\\n' \"$k\"; sleep 30";
+    let mut panes = Vec::new();
+    for on in [true, false] {
+        let p = new_pane(&mut c, &["sh", "-c", script], 24, 100).await;
+        c.request(&Request::RegisterAgent(orch_proto::api::RegisterAgent {
+            kind: "codex".into(),
+            pane: Some(format!("orch:{p}")),
+            name: None,
+            cwd: None,
+            instance: None,
+        }))
+        .await
+        .unwrap();
+        if !on {
+            c.request(&Request::AutoContinue {
+                pane: p.clone(),
+                on: Some(false),
+            })
+            .await
+            .unwrap();
+        }
+        panes.push(p);
+    }
+    let text = wait_for_text(&mut c, &panes[0], "PICKED:").await;
+    assert!(text.contains("PICKED:2"), "{text}");
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    let off = read(&mut c, &panes[1], ReadSource::Recent).await;
+    assert!(
+        !off.contains("PICKED"),
+        "auto-continue off: left alone: {off}"
+    );
+    let log = c
+        .request(&Request::Log {
+            after: None,
+            limit: Some(50),
+            follow: false,
+        })
+        .await
+        .unwrap();
+    let kept = log["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["to"] == "murat")
+        .filter(|m| {
+            m["text"]
+                .as_str()
+                .unwrap()
+                .contains("kept the current model")
+        })
+        .count();
+    assert_eq!(kept, 1, "{log}");
+}

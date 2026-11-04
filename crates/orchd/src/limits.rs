@@ -7,7 +7,7 @@
 use crate::detect::{self, Detected};
 use crate::server::Daemon;
 use orch_proto::api::HUMAN;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -36,6 +36,8 @@ struct Pause {
 #[derive(Default)]
 struct State {
     pauses: HashMap<String, Pause>,
+    /// Already answered in this observed appearance of Codex's model menu.
+    model_questions: HashSet<String>,
     /// Panes with auto-continue switched off.
     off: HashMap<String, bool>,
 }
@@ -107,9 +109,11 @@ pub async fn check(daemon: &Daemon) {
     };
     let mut due = Vec::new();
     let mut tell = Vec::new();
+    let mut keep_models = Vec::new();
     {
         let mut s = state().lock().unwrap();
         let mut seen = Vec::new();
+        let mut model_seen = HashSet::new();
         for pane in daemon.all_panes() {
             if pane.exit_code().is_some() {
                 continue;
@@ -118,6 +122,21 @@ pub async fn check(daemon: &Daemon) {
             let Some(kind) = pane.agent(&text) else {
                 continue;
             };
+            if detect::model_switch_question(&text, Some(&kind)) {
+                model_seen.insert(pane.id.clone());
+                // The menu can pop up over a limit notice: that pause goes on underneath it
+                // (no second "hit its usage limit" message once the menu is answered).
+                if s.pauses.contains_key(&pane.id) {
+                    seen.push(pane.id.clone());
+                }
+                if !s.off.get(&pane.id).copied().unwrap_or(false)
+                    && s.model_questions.insert(pane.id.clone())
+                {
+                    let name = name_of(&pane.id, &kind);
+                    keep_models.push((pane, name));
+                }
+                continue;
+            }
             if detect::detect(&text, Some(&kind)) != Detected::Limited {
                 continue;
             }
@@ -168,6 +187,28 @@ pub async fn check(daemon: &Daemon) {
         }
         // Panes no longer limited: their pause is over.
         s.pauses.retain(|id, _| seen.contains(id));
+        s.model_questions.retain(|id| model_seen.contains(id));
+    }
+    for (pane, name) in keep_models {
+        // Check again under the terminal lock; never send a stale menu choice to the prompt.
+        // Keep the off switch and reservation serialized with this one-byte send.
+        let sent = {
+            let s = state().lock().unwrap();
+            let term = pane.term.lock().unwrap();
+            let text = term.visible_text();
+            !s.off.get(&pane.id).copied().unwrap_or(false)
+                && pane.exit_code().is_none()
+                && detect::model_switch_question(&text, pane.agent(&text).as_deref())
+                && pane.write(b"2".to_vec())
+        };
+        if sent {
+            let text = format!("{name}: kept the current model at Codex's rate-limit question");
+            let _ = daemon
+                .bus
+                .send(&name, HUMAN, "msg", &text, Some("limits"), None);
+        } else {
+            state().lock().unwrap().model_questions.remove(&pane.id);
+        }
     }
     for (from, text) in tell {
         let _ = daemon
