@@ -7,7 +7,7 @@ Telegram**. Must feel faster than herdr over SSH.
 
 Decisions (Murat, 2026-10-27): **Rust** · **own stack, no herdr** · **own Telegram bot** · name **orchtool** (CLI `orch`).
 
-Background: notes/inventory.md (what DevBox has today), notes/research.md (other tools, transport options).
+Background research (DevBox inventory, other tools, transport options) is in git history: notes/inventory.md, notes/research.md.
 
 ## Architecture
 
@@ -72,7 +72,7 @@ terminal-output forwarding. Engineering defaults from Codex's opinion (in git hi
 vt100 behind an adapter, one controlling client + observers, bounded scrollback/queues, rusqlite + tokio).
 
 Codex builds each phase in the visible herdr workspace "Orchtool · Codex", Claude checks key claims; each phase
-ends GREEN (tests + short demo note in STATUS.md).
+ends GREEN (tests + short demo note in notes/STATUS.md).
 
 | # | Phase | Done when |
 |---|---|---|

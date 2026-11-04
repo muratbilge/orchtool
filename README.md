@@ -6,7 +6,7 @@ answer from the TUI, from a script, or from a phone. [Kabuk](https://github.com/
 terminal, drives it from the phone: agents, their permission dialogs and questions, and the workspaces, live.
 
 Built in Rust (stable) by Claude Code and Codex with Murat Bilge steering, for one dev server first. It is young
-(0.1.0): `STATUS.md` is the running log, `PLAN.md` the plan.
+(0.1.0): `notes/STATUS.md` is the running log, `notes/PLAN.md` the plan.
 
 ## Crates
 
