@@ -13,14 +13,17 @@ Built in Rust (stable) by Claude Code and Codex with Murat Bilge steering, for o
 - **`orchd`**, the daemon. Owns the PTYs (`portable-pty` + `vt100`), the workspaces and tabs, and a SQLite store
   for the bus (timeline, questions, answers). Reads each agent's status off its screen: working, blocked on a
   permission dialog, idle, done, or limited (a usage-limit notice; orchd types "continue" a minute after the reset
-  unless `orch auto-continue <pane> off`). Answers a dialog only if the screen still hashes to what the client
+  unless `orch auto-continue <pane> off`; Codex's "switch to a cheaper model?" menu is answered "keep current
+  model" the same way). Answers a dialog only if the screen still hashes to what the client
   saw (`send --expect`), and each screen once. `orch stop-daemon --restart` saves the layout and the next orchd
-  recreates it, agents resumed. Starts on demand from `orch`, or as a user service (`contrib/orchd.service`).
+  recreates it, agents resumed; agents that were mid-turn get a note to carry on once they are back at their
+  prompt. Questions from agents whose pane is gone expire by themselves. Starts on demand from `orch`, or as a user service (`contrib/orchd.service`).
 - **`orch`**, the CLI and the TUI (`ratatui`; mouse and touch: tap a pane or a tab, `+` for a new tab, `☰` for
-  the workspace list). Panes: `new`, `ls`, `attach`, `send`, `read`, `kill`, `focus`; layout: `ws` and `tab`
-  (focus, new, rename, close, by id); bus: `agents`, `tail`, `msg`, `inbox`, `questions`, `question`, `answer`,
-  `ask`, `status`; `watch --json` streams everything for clients; `--host H` talks to an orchd on another
-  machine through `ssh H orch proxy`.
+  the workspace list). Panes: `new`, `ls`, `attach`, `send`, `read` (`--unwrapped` joins soft-wrapped
+  rows), `kill`, `focus`, `auto-continue`; layout: `ws` and `tab`
+  (focus, new, rename, close, by id); bus: `agents`, `tail`, `msg`, `inbox`, `questions`, `question close`, `answer`,
+  `ask`, `status`, `hook`; `watch --json` streams everything for clients; `--host H` talks to an orchd on another
+  machine through `ssh H orch proxy`; `ping` and `latency` measure the round trip.
 - **`orch-mcp`**, an MCP server for agents on the bus: `send_message`, `read_inbox`, `ask_human`,
   `wait_for_answer`, `post_status`, `list_agents`.
 - **`orch-proto`**, the versioned JSON-lines protocol between them.
@@ -39,10 +42,22 @@ Rust stable via rustup with rustfmt and clippy (`rust-toolchain.toml`). The scri
 ## Agents on the bus
 
 - **Claude Code:** `orch hook` as the hook entry point registers the agent and keeps its status current; the MCP
-  server gives it the bus tools. A pane without hooks is still listed, from its screen.
-- **Any script or shell agent:** `orch ask "<question>"` waits for the human's answer; `orch status working|idle|blocked|done`;
+  server gives it the bus tools. A pane without hooks is still listed, from its screen. Setup, in
+  `~/.claude/settings.json` (the same entry for `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`,
+  `Notification` and `Stop`; the hook never fails):
+
+  ```json
+  "hooks": {
+    "Stop": [{ "hooks": [{ "type": "command", "command": "orch hook 2>/dev/null || true", "timeout": 5 }] }]
+  }
+  ```
+
+  and the MCP server: `claude mcp add --scope user orch -- orch-mcp`. Set `ORCH_AGENT=<name>` before starting an
+  agent to give it a fixed name on the bus.
+- **Any script or shell agent:** `orch ask "<question>"` waits for the human's answer; `orch status <name> working|idle|blocked|done [text]`;
   `orch msg -- <agent> "<text>"`.
-- **You:** `orch questions`, `orch answer <id> <text or option number>`, `orch tail -f`, `orch inbox`.
+- **You:** `orch questions`, `orch answer <id> <text or option number>`, `orch question close <id>`, `orch tail -f`,
+  `orch inbox`.
 
 ## Clients
 
