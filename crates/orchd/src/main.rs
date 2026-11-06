@@ -103,6 +103,9 @@ async fn main() -> anyhow::Result<()> {
     // this one never touches the path again (it would unlink the new orchd's socket).
     let _ = std::fs::remove_file(&socket);
     server.abort();
+    // No task dispatch or completion check runs past this point: a pane killed for the
+    // restart keeps its running task (restore rebinds it), it did not fail.
+    let _gate = daemon.task_gate.lock().await;
     daemon.kill_all();
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     Ok(())

@@ -61,7 +61,11 @@ async fn working_agents_including_the_restart_caller_continue_once() {
     let mut c = connect(&d.socket).await;
     let script = r#"#!/bin/sh
 stty -echo
-role=$1; marker=$2; receipts=$3; trigger=$4; socket=$5; orch=$6
+# Settings come from the script's own path, not arguments: a restart resumes the agent without
+# its positional arguments (they are prompts for a real agent).
+here=$(dirname "$0"); top=$(dirname "$here"); role=$(basename "$here")
+marker=$top/$role.started; receipts=$top/$role.received; trigger=$top/stop-now
+socket=$(cat "$top/socket-path"); orch=$(cat "$top/orch-path")
 initial=no
 if [ ! -f "$marker" ]; then initial=yes; : > "$marker"; fi
 case "$role" in
@@ -81,30 +85,27 @@ if [ "$role" = self ] && [ "$initial" = yes ]; then
 fi
 while IFS= read -r line; do printf '%s\n' "$line" >> "$receipts"; done
 "#;
-    let fake = d.dir.join("fake-claude");
-    let shell = d.dir.join("fake-program");
-    for path in [&fake, &shell] {
-        std::fs::write(path, script).unwrap();
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
-    }
     let trigger = d.dir.join("stop-now");
     let orch = Path::new(env!("CARGO_BIN_EXE_orchd")).with_file_name("orch");
+    std::fs::write(
+        d.dir.join("socket-path"),
+        d.socket.to_string_lossy().as_bytes(),
+    )
+    .unwrap();
+    std::fs::write(d.dir.join("orch-path"), orch.to_string_lossy().as_bytes()).unwrap();
     let mut ids = Vec::new();
     for role in [
         "working", "self", "idle", "blocked", "limited", "asking", "shell",
     ] {
-        let argv = vec![
-            if role == "shell" { &shell } else { &fake },
-            Path::new(role),
-            &d.dir.join(format!("{role}.started")),
-            &d.dir.join(format!("{role}.received")),
-            &trigger,
-            &d.socket,
-            &orch,
-        ]
-        .into_iter()
-        .map(|p| p.to_string_lossy().into_owned())
-        .collect();
+        let program = d.dir.join(role).join(if role == "shell" {
+            "fake-program"
+        } else {
+            "fake-claude"
+        });
+        std::fs::create_dir_all(program.parent().unwrap()).unwrap();
+        std::fs::write(&program, script).unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let argv = vec![program.to_string_lossy().into_owned()];
         let v = c
             .request(&Request::NewPane(NewPane {
                 argv,

@@ -84,6 +84,9 @@ async fn check(
 ) -> anyhow::Result<()> {
     // Cancel/done cannot race the text/CR sequence. Also serializes task dispatch with nudges.
     let _gate = d.task_gate.lock().await;
+    if d.stopping.load(std::sync::atomic::Ordering::SeqCst) {
+        return Ok(());
+    }
     let panes = d.all_panes();
     idle_since.retain(|id, _| panes.iter().any(|p| &p.id == id));
     for p in &panes {

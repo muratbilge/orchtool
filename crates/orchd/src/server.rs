@@ -32,7 +32,9 @@ fn send_enter_delay(kind: Option<&str>, text: &str) -> Duration {
 const ANSWERED_FOR: Duration = Duration::from_secs(30);
 
 pub struct Daemon {
-    pub(crate) task_gate: tokio::sync::Mutex<()>,
+    pub task_gate: tokio::sync::Mutex<()>,
+    /// Set once shutdown starts: panes dying from `kill_all` are not task failures.
+    pub stopping: std::sync::atomic::AtomicBool,
     pub bus: Arc<Bus>,
     pub(crate) session: Mutex<orch_proto::layout::Session>,
     pub(crate) ui_events: tokio::sync::broadcast::Sender<crate::ui::UiEvent>,
@@ -67,6 +69,7 @@ impl Daemon {
     pub fn new(scrollback: usize, bus: Arc<Bus>) -> Arc<Self> {
         Arc::new(Self {
             task_gate: tokio::sync::Mutex::new(()),
+            stopping: std::sync::atomic::AtomicBool::new(false),
             bus,
             session: Mutex::new(orch_proto::layout::Session::default()),
             ui_events: tokio::sync::broadcast::channel(256).0,
@@ -158,6 +161,8 @@ impl Daemon {
     }
 
     pub fn kill_all(&self) {
+        self.stopping
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         for pane in self.panes.lock().unwrap().values() {
             pane.kill();
             pane.signal_group(libc::SIGTERM);
