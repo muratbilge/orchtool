@@ -9,6 +9,25 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "method", content = "params")]
 pub enum Request {
+    #[serde(rename = "task.add")]
+    TaskAdd {
+        target: String,
+        text: String,
+        created_by: String,
+        after: Option<i64>,
+    },
+    #[serde(rename = "task.list")]
+    TaskList {
+        #[serde(default)]
+        all: bool,
+    },
+    #[serde(rename = "task.cancel")]
+    TaskCancel { id: i64 },
+    #[serde(rename = "task.done")]
+    TaskDone {
+        id: Option<i64>,
+        pane: Option<String>,
+    },
     #[serde(rename = "ping")]
     Ping {},
     #[serde(rename = "pane.new")]
@@ -218,6 +237,9 @@ pub enum UiOp {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum Event {
+    Tasks {
+        tasks: Vec<TaskRow>,
+    },
     /// Panes were created, exited, changed status or title: the full list is cheap.
     Panes {
         panes: Vec<PaneInfo>,
@@ -239,6 +261,8 @@ pub enum Event {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Snapshot {
+    #[serde(default)]
+    pub tasks: Vec<TaskRow>,
     pub session: crate::layout::Session,
     pub panes: Vec<PaneInfo>,
     pub agents: Vec<AgentRow>,
@@ -572,4 +596,21 @@ pub enum Stream {
 /// The pane's id or its name.
 pub fn pane_matches(info: &PaneInfo, key: &str) -> bool {
     info.id == key || info.name.as_deref() == Some(key)
+}
+
+/// Durable task queue entry. Target is a workspace label, optionally `label@tab-id`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskRow {
+    pub id: i64,
+    pub target: String,
+    pub text: String,
+    pub state: String,
+    pub created_by: String,
+    pub created_ms: i64,
+    pub started_ms: Option<i64>,
+    pub finished_ms: Option<i64>,
+    pub pane: Option<String>,
+    pub after: Option<i64>,
+    pub error: Option<String>,
+    pub saw_working: bool,
 }

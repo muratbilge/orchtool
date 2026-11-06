@@ -9,7 +9,7 @@
 //! The line is a versioned contract (notes/kabuk-contract-v2.md): `"v"` bumps only when a field
 //! is removed, renamed or retyped, or an `orch` exit code changes — never on an addition; the
 //! phone ignores fields it does not know. `"orch"` is this binary's version, for diagnostics.
-//! `tests/fixtures/watch-v1.json` is a real line of the shape Kabuk's tests load too; the test
+//! `tests/fixtures/watch-v1.json` is generated through composition and loaded by Kabuk too; the test
 //! below keeps every key of it in what `compose` builds.
 
 use anyhow::Result;
@@ -133,6 +133,7 @@ fn now_ms() -> i64 {
 
 /// The authoritative state as one JSON line.
 async fn snapshot(c: &mut Conn) -> Result<String> {
+    let tasks = c.request(&Request::TaskList { all: false }).await?["tasks"].clone();
     let agents: Vec<AgentRow> =
         serde_json::from_value(c.request(&Request::ListAgents {}).await?["agents"].clone())?;
     let panes: Vec<PaneInfo> =
@@ -170,7 +171,7 @@ async fn snapshot(c: &mut Conn) -> Result<String> {
         }
     }
     let workspaces = workspaces(&session, &panes);
-    Ok(compose(list, &questions, screens, &timeline, workspaces).to_string())
+    Ok(compose(list, &questions, screens, &timeline, workspaces, tasks).to_string())
 }
 
 /// The watch line from its parts: agents (from `merge`) sorted blocked-first, the open questions,
@@ -181,6 +182,7 @@ fn compose(
     screens: serde_json::Map<String, Value>,
     timeline: &[MessageRow],
     workspaces: Vec<Value>,
+    tasks: Value,
 ) -> Value {
     let hashes: serde_json::Map<String, Value> = screens
         .iter()
@@ -209,6 +211,7 @@ fn compose(
         "screens": screens,
         "timeline": timeline,
         "workspaces": workspaces,
+        "tasks": tasks,
     })
 }
 
@@ -620,8 +623,8 @@ mod tests {
         assert_eq!(out[3]["pane"], "orch:p2");
     }
 
-    /// The contract with Kabuk: a composed line has every key of the frozen v1 fixture (a real
-    /// `--once` line; Kabuk's tests load the same file). Removing or renaming a key fails here.
+    /// The contract with Kabuk: a composed line has every key of the v1 fixture
+    /// (Kabuk's tests load the same file). Removing or renaming a key fails here.
     #[test]
     fn line_keeps_every_key_of_the_v1_fixture() {
         let fixture: Value =
@@ -660,7 +663,37 @@ mod tests {
             &session_p1(),
             &[pane("p1", Some("claude"), Some("blocked"))],
         );
-        let line = compose(list, &[question], screens, &[row], ws);
+        let task = orch_proto::api::TaskRow {
+            id: 1,
+            target: "proj".into(),
+            text: "Review the change".into(),
+            state: "queued".into(),
+            created_by: HUMAN.into(),
+            created_ms: 1000,
+            started_ms: None,
+            finished_ms: None,
+            pane: None,
+            after: None,
+            error: None,
+            saw_working: false,
+        };
+        let line = compose(list, &[question], screens, &[row], ws, json!([task]));
+        if std::env::var_os("ORCH_UPDATE_WATCH_FIXTURE").is_some() {
+            std::fs::write(
+                concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/watch-v1.json"),
+                format!("{line}\n"),
+            )
+            .unwrap();
+        }
+        assert!(line["tasks"].is_array());
+        if let Some(task) = fixture["tasks"].as_array().and_then(|a| a.first()) {
+            for key in task.as_object().unwrap().keys() {
+                assert!(
+                    line["tasks"][0].get(key).is_some(),
+                    "missing task key {key}"
+                );
+            }
+        }
         let keys = |v: &Value| -> Vec<String> { v.as_object().unwrap().keys().cloned().collect() };
         for k in keys(&fixture) {
             assert!(line.get(&k).is_some(), "top-level key {k:?} missing");

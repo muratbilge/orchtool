@@ -1,5 +1,12 @@
 # Status
 
+## 2026-11-04 — P6A task queue — Codex
+
+Implemented durable workspace/tab task queues, guarded dispatch, explicit MCP completion and
+Codex working→idle fallback, CLI/watch/TUI counts. Unit validation and a private fake-agent
+integration test added. Socket integration/release validation remains blocked by sandbox EPERM;
+see untracked CODEX-REVIEW-P6A-RESULT.md. No live daemon changes.
+
 Older Codex briefs and review results (`CODEX-*.md`, `HANDOFF.md`) were removed from the tree on 2026-11-04;
 they are in git history (`git log --all -- 'CODEX-*.md'`). New briefs stay untracked (`.gitignore`).
 

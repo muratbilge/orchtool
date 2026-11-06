@@ -373,6 +373,7 @@ pub async fn subscribe(
     let messages = daemon.bus.log(None, 200).unwrap_or_default();
     let mut last_msg = messages.last().map(|m| m.id).unwrap_or(0);
     let snapshot = Snapshot {
+        tasks: daemon.bus.tasks(false).unwrap_or_default(),
         session: daemon.session(),
         panes: daemon.pane_infos(),
         agents: daemon.bus.agents().unwrap_or_default(),
@@ -407,6 +408,9 @@ pub async fn subscribe(
                 match ev {
                     // Events are hints: always send the current lists / ordered rows read from
                     // the store, so a late or dropped event can never leave stale state.
+                    Ok(BusEvent::Tasks) => {
+                        writer.send_body(&id, send(Event::Tasks { tasks: daemon.bus.tasks(false).unwrap_or_default() })).await?;
+                    }
                     Ok(BusEvent::Agent(_)) => {
                         let agents = daemon.bus.agents().unwrap_or_default();
                         writer.send_body(&id, send(Event::Agents { agents })).await?
@@ -422,6 +426,7 @@ pub async fn subscribe(
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        writer.send_body(&id, send(Event::Tasks { tasks: daemon.bus.tasks(false).unwrap_or_default() })).await?;
                         let agents = daemon.bus.agents().unwrap_or_default();
                         writer.send_body(&id, send(Event::Agents { agents })).await?;
                         let questions = daemon.bus.questions(false).unwrap_or_default();

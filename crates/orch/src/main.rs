@@ -37,6 +37,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Queue work for a workspace label (optionally label@tab-id)
+    Task {
+        #[command(subcommand)]
+        cmd: TaskCmd,
+    },
     /// Open the workspace TUI (same as plain `orch`)
     Ui,
     /// Start a program in a new pane (default: your login shell)
@@ -234,6 +239,26 @@ enum Cmd {
         /// Agent kind to register as
         #[arg(long, default_value = "claude")]
         kind: String,
+    },
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum TaskCmd {
+    Add {
+        target: String,
+        text: String,
+        #[arg(long)]
+        after: Option<i64>,
+    },
+    Ls {
+        #[arg(long)]
+        all: bool,
+    },
+    Cancel {
+        id: i64,
+    },
+    Done {
+        id: Option<i64>,
     },
 }
 
@@ -483,6 +508,47 @@ async fn run(cli: Cli) -> Result<()> {
                 pane: strip_orch(pane),
             }))
             .await?;
+        }
+        Cmd::Task { cmd } => {
+            let req = match &cmd {
+                TaskCmd::Add {
+                    target,
+                    text,
+                    after,
+                } => Request::TaskAdd {
+                    target: target.clone(),
+                    text: text.clone(),
+                    after: *after,
+                    created_by: std::env::var("ORCH_AGENT")
+                        .or_else(|_| std::env::var("ORCH_PANE").map(|p| format!("orch:{p}")))
+                        .unwrap_or_else(|_| "murat".into()),
+                },
+                TaskCmd::Ls { all } => Request::TaskList { all: *all },
+                TaskCmd::Cancel { id } => Request::TaskCancel { id: *id },
+                TaskCmd::Done { id } => Request::TaskDone {
+                    id: *id,
+                    pane: std::env::var("ORCH_PANE").ok(),
+                },
+            };
+            let v = conn.request(&req).await?;
+            match cmd {
+                TaskCmd::Add { .. } => println!("{}", v["id"]),
+                TaskCmd::Ls { all } => {
+                    for t in v["tasks"].as_array().into_iter().flatten() {
+                        if !all && t["state"] != "queued" && t["state"] != "running" {
+                            continue;
+                        }
+                        println!(
+                            "{}\t{}\t{}\t{}",
+                            t["id"],
+                            t["state"].as_str().unwrap_or(""),
+                            t["target"].as_str().unwrap_or(""),
+                            t["text"].as_str().unwrap_or("").replace('\n', "\\n")
+                        );
+                    }
+                }
+                _ => println!("{} {}", v["id"], v["state"].as_str().unwrap_or("")),
+            }
         }
         Cmd::Ping { count } => {
             for _ in 0..count {

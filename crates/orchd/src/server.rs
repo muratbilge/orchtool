@@ -32,6 +32,7 @@ fn send_enter_delay(kind: Option<&str>, text: &str) -> Duration {
 const ANSWERED_FOR: Duration = Duration::from_secs(30);
 
 pub struct Daemon {
+    pub(crate) task_gate: tokio::sync::Mutex<()>,
     pub bus: Arc<Bus>,
     pub(crate) session: Mutex<orch_proto::layout::Session>,
     pub(crate) ui_events: tokio::sync::broadcast::Sender<crate::ui::UiEvent>,
@@ -65,6 +66,7 @@ pub(crate) fn err(code: &'static str, message: impl Into<String>) -> ApiError {
 impl Daemon {
     pub fn new(scrollback: usize, bus: Arc<Bus>) -> Arc<Self> {
         Arc::new(Self {
+            task_gate: tokio::sync::Mutex::new(()),
             bus,
             session: Mutex::new(orch_proto::layout::Session::default()),
             ui_events: tokio::sync::broadcast::channel(256).0,
@@ -178,6 +180,76 @@ impl Daemon {
 
     async fn handle(&self, req: Request) -> Result<Value, ApiError> {
         match req {
+            Request::TaskAdd {
+                target,
+                text,
+                created_by,
+                after,
+            } => {
+                self.task_target(&target)?;
+                let text = text.replace("\r\n", "\n").replace('\r', "\n");
+                if text.trim().is_empty()
+                    || text
+                        .chars()
+                        .any(|c| c.is_control() && c != '\n' && c != '\t')
+                {
+                    return Err(err("bad_task", "task text must be nonempty plain text"));
+                }
+                if let Some(id) = after {
+                    if self.bus.task(id).map_err(bus_err)?.is_none() {
+                        return Err(err("no_task", "unknown dependency"));
+                    }
+                }
+                Ok(serde_json::to_value(
+                    self.bus
+                        .task_add(&target, &text, &created_by, after)
+                        .map_err(bus_err)?,
+                )
+                .unwrap())
+            }
+            Request::TaskList { all } => {
+                Ok(json!({"tasks": self.bus.tasks(all).map_err(bus_err)?}))
+            }
+            Request::TaskCancel { id } => {
+                let _gate = self.task_gate.lock().await;
+                if self.bus.task(id).map_err(bus_err)?.is_none() {
+                    return Err(err("no_task", "unknown task"));
+                }
+                let t = self
+                    .bus
+                    .task_finish(id, "cancelled", None)
+                    .map_err(bus_err)?
+                    .ok_or_else(|| err("task_state", "task is terminal"))?;
+                Ok(serde_json::to_value(t).unwrap())
+            }
+            Request::TaskDone { id, pane } => {
+                let _gate = self.task_gate.lock().await;
+                let id = match id {
+                    Some(id) => id,
+                    None => {
+                        let p = pane.as_deref().ok_or_else(|| {
+                            err("no_task", "specify an id or run inside the task pane")
+                        })?;
+                        let p = p.strip_prefix("orch:").unwrap_or(p);
+                        self.bus
+                            .tasks(false)
+                            .map_err(bus_err)?
+                            .iter()
+                            .find(|t| t.state == "running" && t.pane.as_deref() == Some(p))
+                            .map(|t| t.id)
+                            .ok_or_else(|| err("no_task", "no running task for this pane"))?
+                    }
+                };
+                if self.bus.task(id).map_err(bus_err)?.is_none() {
+                    return Err(err("no_task", "unknown task"));
+                }
+                let t = self
+                    .bus
+                    .task_finish(id, "done", None)
+                    .map_err(bus_err)?
+                    .ok_or_else(|| err("task_state", "task is not running"))?;
+                Ok(serde_json::to_value(t).unwrap())
+            }
             Request::Ping {} => Ok(json!({"pong": true, "version": orch_proto::VERSION,
                 "pid": std::process::id()})),
             Request::NewPane(req) => {
@@ -279,6 +351,9 @@ impl Daemon {
                 if let Some(id) = r.pane.as_deref().and_then(|p| p.strip_prefix("orch:")) {
                     if let Ok(p) = self.find(id) {
                         p.set_kind(&r.kind);
+                        if r.instance.as_deref().is_some_and(|i| i.starts_with("mcp:")) {
+                            self.bus.task_register_mcp(&p.id).map_err(bus_err)?;
+                        }
                         if let Some(id) = r
                             .instance
                             .as_deref()
@@ -587,6 +662,7 @@ async fn pane_idle(daemon: &Daemon, pane: &str) -> Option<bool> {
 }
 
 async fn nudge(daemon: &Daemon, agent: &str, pane: &str, text: &str) {
+    let _gate = daemon.task_gate.lock().await;
     if pane_idle(daemon, pane).await != Some(true) {
         return;
     }

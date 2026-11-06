@@ -179,7 +179,7 @@ const INSTRUCTIONS: &str = "You are connected to orchtool, Murat's agent bus. Ot
 and Murat himself are reachable here. Use send_message to talk to another agent or to Murat (to: \"murat\"), \
 read_inbox to get messages sent to you, and ask_human when you need Murat's decision — he can answer from his \
 terminal or phone. Keep messages short and concrete. When a tool result says a question is not answered \
-yet, call wait_for_answer with that question_id instead of asking again.";
+yet, call wait_for_answer with that question_id instead of asking again. After completing a queued orch task, call task_done; omit id to complete the running task in your pane.";
 
 fn tools() -> Value {
     json!([
@@ -191,6 +191,11 @@ fn tools() -> Value {
                 "text": { "type": "string" },
                 "thread": { "type": "string", "description": "Optional topic to group related messages" }
             }, "required": ["to", "text"] }
+        },
+        {
+            "name": "task_done",
+            "description": "Mark your running orch task done after completing its work. Omit id to use your current pane's running task.",
+            "inputSchema": { "type": "object", "properties": { "id": { "type": "integer" } } }
         },
         {
             "name": "read_inbox",
@@ -343,6 +348,18 @@ async fn call_tool_inner(
     let me = whoami(kind).await?;
     let str_arg = |k: &str| args[k].as_str().map(str::to_string);
     match name {
+        "task_done" => {
+            let id = args
+                .get("id")
+                .map(|v| v.as_i64().ok_or("`id` must be an integer"))
+                .transpose()?;
+            let v = request(Request::TaskDone {
+                id,
+                pane: std::env::var("ORCH_PANE").ok(),
+            })
+            .await?;
+            Ok((format!("Task #{} done.", v["id"]), None))
+        }
         "send_message" => {
             let to = str_arg("to").ok_or("`to` is required")?;
             let text = str_arg("text").ok_or("`text` is required")?;

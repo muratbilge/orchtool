@@ -146,6 +146,7 @@ struct App {
     tx: mpsc::UnboundedSender<Msg>,
     session: Session,
     panes: HashMap<String, PaneInfo>,
+    tasks: Vec<orch_proto::api::TaskRow>,
     agents: Vec<AgentRow>,
     questions: Vec<QuestionRow>,
     messages: VecDeque<MessageRow>,
@@ -450,6 +451,7 @@ impl App {
             tx,
             session: Session::default(),
             panes: HashMap::new(),
+            tasks: Vec::new(),
             agents: Vec::new(),
             questions: Vec::new(),
             messages: VecDeque::new(),
@@ -834,6 +836,7 @@ impl App {
     fn handle(&mut self, m: Msg) -> Result<bool> {
         match m {
             Msg::Snapshot(s) => {
+                self.tasks = s.tasks;
                 self.session = s.session;
                 self.panes = s.panes.into_iter().map(|p| (p.id.clone(), p)).collect();
                 self.agents = s.agents;
@@ -871,6 +874,7 @@ impl App {
                     }
                 }
                 // Complete lists from the store: replace, never patch.
+                Event::Tasks { tasks } => self.tasks = tasks,
                 Event::Agents { agents } => self.agents = agents,
                 Event::Questions { questions } => {
                     let new = questions
@@ -2439,10 +2443,15 @@ impl App {
                     Span::styled(format!(" {mark} "), Style::default().fg(color)),
                     Span::styled(
                         format!(
-                            "{} {:<20} {} tab(s)  {}",
+                            "{} {:<20} {} tab(s)  {} queued  {}",
                             i + 1,
                             w.label,
                             w.tabs.len(),
+                            self.tasks
+                                .iter()
+                                .filter(|t| t.state == "queued"
+                                    && t.target.split('@').next() == Some(w.label.as_str()))
+                                .count(),
                             w.cwd
                         ),
                         style,

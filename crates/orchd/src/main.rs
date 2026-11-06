@@ -84,6 +84,7 @@ async fn main() -> anyhow::Result<()> {
             Err(e) => eprintln!("orchd: ignoring {}: {e}", restore.display()),
         }
     }
+    orchd::tasks::start(Arc::clone(&daemon));
     let server = tokio::spawn(serve(listener, Arc::clone(&daemon)));
     let mut term = signal(SignalKind::terminate())?;
     let mut int = signal(SignalKind::interrupt())?;

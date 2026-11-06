@@ -22,13 +22,14 @@ use tokio::sync::broadcast;
 
 #[derive(Debug, Clone)]
 pub enum BusEvent {
+    Tasks,
     Message(MessageRow),
     Question(QuestionRow),
     Agent(AgentRow),
 }
 
 pub struct Bus {
-    db: Mutex<Connection>,
+    pub(crate) db: Mutex<Connection>,
     tx: broadcast::Sender<BusEvent>,
 }
 
@@ -84,6 +85,7 @@ impl Bus {
     fn with_connection(db: Connection) -> Result<Self> {
         db.busy_timeout(Duration::from_secs(5))?;
         db.execute_batch(SCHEMA)?;
+        db.execute_batch(crate::tasks_store::SCHEMA)?;
         // Columns added after the first release of the schema: agents.ident.
         let has_ident: bool = db
             .prepare("SELECT 1 FROM pragma_table_info('agents') WHERE name = 'ident'")?
@@ -102,7 +104,7 @@ impl Bus {
         self.tx.subscribe()
     }
 
-    fn emit(&self, e: BusEvent) {
+    pub(crate) fn emit(&self, e: BusEvent) {
         let _ = self.tx.send(e);
     }
 
@@ -624,7 +626,7 @@ impl Bus {
     }
 }
 
-fn insert_message(
+pub(crate) fn insert_message(
     db: &Connection,
     from: &str,
     to: &str,

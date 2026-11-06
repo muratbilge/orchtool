@@ -362,6 +362,9 @@ impl Daemon {
                                     pending.push((Arc::clone(&p), name));
                                 }
                             }
+                            if let Err(e) = self.bus.task_rebind(&old, &p.id) {
+                                eprintln!("orchd: task rebind: {e:#}");
+                            }
                             ids.insert(old, p.id.clone());
                         }
                         Err(e) => {

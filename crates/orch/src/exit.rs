@@ -12,7 +12,7 @@
 //! | 11   | already answered: `send --expect` on a screen answered within 30 s, or `answer` on a question somebody answered first (stderr carries that answer) |
 //! | 12   | the pane's program has exited, nothing was sent |
 //! | 13   | the program is not reading its input, nothing was sent |
-//! | 14   | no such pane, question, workspace or tab, or the pane is not in a workspace |
+//! | 14   | no such pane, question, workspace, tab, task or task target, or the pane is not in a workspace |
 //! | 20   | orchd unreachable: not running, did not start, or did not answer in time |
 //!
 //! 3 and 4 are never used: Kabuk's own `sh` wrapper takes them (no `orch` binary, no such folder).
@@ -38,7 +38,7 @@ pub const HELP: &str = "Exit codes:
   11  already answered: the screen (send --expect, 30 s) or the question (answer; stderr has the answer)
   12  the pane's program has exited, nothing sent
   13  the program is not reading its input, nothing sent
-  14  no such pane, question, workspace or tab, or the pane is not in a workspace
+  14  no such pane, question, workspace, tab, task or task target, or the pane is not in a workspace
   20  orchd unreachable (not running, did not start, or did not answer in time)";
 
 /// Outcomes decided on the client side that have their own exit code (orchd's own come back as
@@ -94,7 +94,8 @@ fn remote(code: &str) -> i32 {
         "answered" => ANSWERED,
         "exited" => EXITED,
         "input_full" => INPUT_FULL,
-        "no_pane" | "no_question" | "not_placed" | "no_workspace" | "no_tab" => NOT_FOUND,
+        "no_task" | "no_target" | "no_pane" | "no_question" | "not_placed" | "no_workspace"
+        | "no_tab" => NOT_FOUND,
         _ => FAILURE,
     }
 }

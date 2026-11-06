@@ -91,7 +91,7 @@ not an option index.
 | 11 | already answered: the screen (`send --expect`, within 30 s) or the question (`answer`; stderr: `#<id> was already answered by <who>: <answer>`) | **not sent** (someone else's answer stands) |
 | 12 | the pane's program has exited | **not sent** |
 | 13 | the program is not reading its input | **not sent** |
-| 14 | no such pane / question, or the pane is not in a workspace (`focus`) | **not sent** |
+| 14 | no such pane / question / task / task target, or the pane is not in a workspace (`focus`) | **not sent** |
 | 20 | orchd unreachable: not running, did not start, or did not answer | not sent when the connection failed; **unknown** when it broke mid-request |
 | 3, 4 | Kabuk's wrapper (no `orch`, no folder) | not sent |
 
@@ -128,8 +128,8 @@ or "taken" from them, nor release its own answer ledger.
 
 ## 6. Fixture
 
-`crates/orch/tests/fixtures/watch-v1.json` is a real `orch watch --once` line (0.1.0, one blocked agent, its
-screen, one open question, two timeline rows) plus `"orch"`. The unit test in `watch.rs` builds a line through
+`crates/orch/tests/fixtures/watch-v1.json` is a watch v1 example generated through production composition
+(one blocked agent, its screen, an open question, timeline and queued task). The unit test in `watch.rs` builds a line through
 `merge` + `compose` and asserts every top-level, agent, question and timeline key of the fixture is present and
 `v == 1`. Kabuk's `app/src/test/resources/orch-watch.json` is the **same file**; its parse test loads it. Policy:
 regenerate the fixture in orchtool on every stream change, copy it into Kabuk the same day, both suites green.
@@ -151,3 +151,52 @@ never the throwable (Android's `org.json` puts the whole input into the exceptio
   itself (same per-pane switch as auto-continue); the pane shows `blocked` for the few seconds before that.
 - After `orch stop-daemon --restart`, agents that were working get a note typed in once they are back at
   their prompt; Murat gets "restart: resumed N agents, nudged M …" on the bus (thread "restart", from orchd).
+
+## Task queues (P6A, additive)
+
+`orch task add <workspace-label> "<text>" [--after ID]` prints a numeric task ID.
+`label@tab-id` narrows the target to a tab. Labels are literal (not workspace numbers or pane
+IDs); `@` is reserved for the separator. Bus names are not task targets in v1. The label and tab
+IDs survive daemon layout restart. Renaming/removing a workspace leaves its queued tasks waiting;
+requeue them under the new label. A target with zero or multiple live agents waits; never pick
+an arbitrary agent or whichever pane happens to be focused. Overlapping workspace/tab targets
+also cannot run two tasks in the same pane.
+
+`orch task ls` lists queued/running work; `--all` includes all history. `orch task cancel ID`
+cancels queued/running scheduling, without interrupting the agent's current work. `orch task done [ID]`
+completes running work; omitted ID resolves via ORCH_PANE. The MCP `task_done` tool takes optional
+integer `id` with the same meaning. Unknown task/dependency/target is exit **14**; invalid text or
+an invalid state transition is **1**. Terminal states cannot be changed. An unmet `--after` waits
+until that task is `done`; cancelled/failed dependencies never release their dependents. Dispatch
+chooses the oldest eligible task; a blocked dependency does not hold up later independent work.
+
+Dispatch requires three seconds of continuously idle screen detection, no working/blocked bus
+status, no open human question, no limit or model menu. Input is sent as one paste followed by a
+separate Enter after 300 ms. Multiline text requires the terminal's bracketed-paste mode; otherwise
+the task fails without typing. CRLF/CR normalize to LF; terminal control bytes are rejected.
+Input interruption fails the task and pauses further task dispatch to that pane: inspect its
+prompt and recreate the pane before requeueing. No automatic replay of uncertain input.
+
+MCP registration opts a pane into **explicit completion**; its dispatched text includes the task ID
+and `task_done` instruction. Other agents use observed working → three seconds stable idle. Merely
+sending text or initially seeing an idle prompt never completes a task. Limits keep work running and require fresh observed work after the pause before heuristic completion.
+Pane exit makes running work failed. On layout restore running reservations map to new panes;
+they are not resent and need fresh observed work or explicit completion. If the daemon dies
+between its durable claim and the PTY write, operator inspection/explicit completion is required:
+SQLite and terminal input cannot be one atomic transaction. A cold start without restored panes
+fails orphaned running tasks and retains queued tasks.
+
+Watch v1 adds `tasks`: open tasks plus the last 20 terminal tasks, ordered by ID. Each row has
+`id`, `target`, `text`, `state` (queued/running/done/failed/cancelled), `created_by`, `created_ms`,
+`started_ms`, `finished_ms`, `pane` (raw pN or null), `after` (ID or null), `error` (or null), and
+`saw_working` (boolean). Times are Unix milliseconds. Start/done/failed/cancelled transitions emit
+a message to murat, thread `tasks`, atomically with the task transition. Subscribe snapshots and
+`tasks` events contain the same rows. The TUI workspace list counts queued tasks, including tabs.
+
+Fixture policy: regenerate on additive changes too. The deterministic production `merge`/`compose`
+fixture generator is `ORCH_UPDATE_WATCH_FIXTURE=1 cargo test -p orch --bin orch
+watch::tests::line_keeps_every_key_of_the_v1_fixture`; it includes a queued task and checks every
+serialized task key. P6A uses this generator because private sockets are unavailable in Codex's
+sandbox. On the integration host, also capture a real `orch --socket <private> watch --once` and
+validate it. Copy the regenerated fixture into Kabuk and run its parser tests before release;
+that cross-repository step is still required, not implied by orchtool's unit test passing.
