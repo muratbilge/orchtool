@@ -48,6 +48,10 @@ pub struct SavedPane {
     /// Actual agent argv, including an agent launched interactively inside a shell.
     #[serde(default)]
     pub agent_argv: Option<Vec<String>>,
+    /// A Codex pane without a known conversation that was the only Codex pane in its folder:
+    /// `codex resume --last` (per folder) can only mean this one, so nobody has to pick.
+    #[serde(default)]
+    pub sole_codex_in_cwd: bool,
 }
 
 fn should_continue(agent: Option<&str>, status: Detected, asking: bool) -> bool {
@@ -116,9 +120,17 @@ pub fn restart_spec(sp: &SavedPane) -> (Vec<String>, Vec<(String, String)>) {
                 Some(sp.argv.clone())
             }
         });
-        if let Some(argv) = actual
+        if let Some(mut argv) = actual
             .and_then(|args| crate::resume_argv::rewrite(&args, kind, sp.session_id.as_deref()))
         {
+            // No id (neither known nor on its command line) but unambiguous: skip the picker.
+            if kind == "codex"
+                && sp.sole_codex_in_cwd
+                && argv.get(1).is_some_and(|a| a == "resume")
+                && argv.get(2).is_none_or(|a| a.starts_with('-'))
+            {
+                argv.insert(2, "--last".into());
+            }
             if shell_pane {
                 let shell = sp
                     .argv
@@ -279,9 +291,6 @@ impl Daemon {
                 .as_ref()
                 .and_then(|p| p.session_id.clone())
                 .or_else(|| agent.as_deref().and_then(|k| p.session_id(k)));
-            if agent.as_deref() == Some("codex") && session_id.is_none() {
-                eprintln!("orchd: {}: no process-owned Codex session ID or SessionStart report; preserving an explicit resume ID if present, otherwise use the picker",p.id);
-            }
             panes.insert(
                 p.id.clone(),
                 SavedPane {
@@ -295,8 +304,33 @@ impl Daemon {
                     was_working,
                     session_id,
                     agent_argv: process.map(|p| p.argv),
+                    sole_codex_in_cwd: false,
                 },
             );
+        }
+        // Codex without a known conversation: `--last` only where it cannot mean another pane.
+        let unknown: Vec<(String, String)> = panes
+            .iter()
+            .filter(|(_, sp)| sp.agent.as_deref() == Some("codex") && sp.session_id.is_none())
+            .map(|(id, sp)| (id.clone(), sp.cwd.clone()))
+            .collect();
+        for (id, cwd) in unknown {
+            let sole = panes
+                .values()
+                .filter(|sp| sp.agent.as_deref() == Some("codex") && sp.cwd == cwd)
+                .count()
+                == 1;
+            eprintln!(
+                "orchd: {id}: no verified Codex session id (needs codex --no-daemon + the SessionStart hook); {}",
+                if sole {
+                    "only Codex pane in its folder: an id on its command line, else resume --last"
+                } else {
+                    "other Codex panes share its folder: an id on its command line, else the picker"
+                }
+            );
+            if let Some(sp) = panes.get_mut(&id) {
+                sp.sole_codex_in_cwd = sole;
+            }
         }
         Saved { session, panes }
     }
@@ -479,7 +513,45 @@ mod tests {
             was_working: false,
             session_id: None,
             agent_argv: None,
+            sole_codex_in_cwd: false,
         }
+    }
+
+    #[test]
+    fn codex_without_an_id_skips_the_picker_only_when_alone_in_its_folder() {
+        let mut pane = saved(&["codex", "--approve-for-me"], Some("codex"), None);
+        assert_eq!(
+            restart_spec(&pane).0,
+            v(&["codex", "resume", "--approve-for-me"])
+        );
+        pane.sole_codex_in_cwd = true;
+        assert_eq!(
+            restart_spec(&pane).0,
+            v(&["codex", "resume", "--last", "--approve-for-me"])
+        );
+        // A known id, or one on its own command line, always wins over --last.
+        pane.session_id = Some("11111111-1111-4111-8111-111111111111".into());
+        assert_eq!(
+            restart_spec(&pane).0,
+            v(&[
+                "codex",
+                "resume",
+                "11111111-1111-4111-8111-111111111111",
+                "--approve-for-me"
+            ])
+        );
+        let mut explicit = saved(&["codex", "resume", "abc"], Some("codex"), None);
+        explicit.sole_codex_in_cwd = true;
+        assert_eq!(restart_spec(&explicit).0, v(&["codex", "resume", "abc"]));
+        // Old snapshots have no flag: picker.
+        let mut value = serde_json::to_value(&pane).unwrap();
+        value.as_object_mut().unwrap().remove("sole_codex_in_cwd");
+        value["session_id"] = serde_json::Value::Null;
+        let old: SavedPane = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            restart_spec(&old).0,
+            v(&["codex", "resume", "--approve-for-me"])
+        );
     }
 
     #[test]

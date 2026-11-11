@@ -75,8 +75,10 @@ Rust stable via rustup with rustfmt and clippy (`rust-toolchain.toml`). The scri
   It handles startup/resume/clear/fork/compact without a matcher. The payload contract and trust
   flow are documented in [OpenAI Hooks](https://learn.chatgpt.com/docs/hooks).
 
-  If identity is unavailable or origin validation fails, orch logs why and restores Codex to
-  `codex resume` (the picker), **not** `--last`. Existing explicit resume IDs still work. No cwd,
+  If identity is unavailable or origin validation fails, orch logs why. A Codex pane that is the
+  only Codex pane in its folder then comes back with `codex resume --last` (Codex's `--last` is per
+  folder, so it cannot mean another pane); with several Codex panes in one folder it comes back at
+  `codex resume` (the picker), **not** `--last`. Existing explicit resume IDs still work. No
   timestamp, newest-file, or shared app-server FD guessing. Private tests must pass `--socket`
   before `hook`, or export `ORCHD_SOCKET`; keep HOME separate. Neither config file is edited by
   the build/install scripts.

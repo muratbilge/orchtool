@@ -1,5 +1,15 @@
 # Status
 
+## 2026-11-11 — P6B reviewed and merged; lone Codex pane keeps `--last` — Claude
+
+Reviewed Codex's P6B outside its sandbox: `scripts/check.sh` green, the two-pane resume test passes,
+`nudges_only_reach_idle_panes` 50/50 with 4 in parallel; `--no-daemon` and `resume <id>` confirmed
+on codex-cli 0.166.0. One change on top: a Codex pane without a verified id that is the only Codex
+pane in its folder comes back with `codex resume --last` (per folder, so unambiguous) instead of
+stopping at the picker with nobody at the board; several Codex panes in one folder still get the
+picker. Open: start Codex panes with `--no-daemon` and add the SessionStart hook (README) — needs
+Murat's trust step in Codex `/hooks`; until then exact resume only applies to the lone-pane case.
+
 ## 2026-11-06 — P6B: verified Codex resume and nudge test readiness — Codex
 
 Codex SessionStart reports now require a dedicated `--no-daemon` client and matching process
