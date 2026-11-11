@@ -185,6 +185,53 @@ impl Daemon {
 
     async fn handle(&self, req: Request) -> Result<Value, ApiError> {
         match req {
+            Request::ReportSession {
+                pane,
+                session_id,
+                reporter_pid,
+            } => {
+                let p = self.find(pane.strip_prefix("orch:").unwrap_or(&pane))?;
+                let argv = p
+                    .pid
+                    .and_then(|root| {
+                        crate::conversation::discover(
+                            std::path::Path::new("/proc"),
+                            root,
+                            &crate::conversation::host_home().unwrap_or_default(),
+                            "codex",
+                        )
+                    })
+                    .map(|process| process.argv)
+                    .or_else(|| {
+                        p.argv
+                            .first()
+                            .filter(|exe| {
+                                std::path::Path::new(exe)
+                                    .file_name()
+                                    .is_some_and(|n| n == "codex")
+                            })
+                            .map(|_| p.argv.clone())
+                    });
+                let dedicated = argv
+                    .as_ref()
+                    .is_some_and(|args| args.iter().any(|a| a == "--no-daemon"));
+                if !dedicated
+                    || p.exit_code().is_some()
+                    || !crate::conversation::uuid(&session_id)
+                    || !p.pid.is_some_and(|root| {
+                        crate::conversation::descendant(
+                            std::path::Path::new("/proc"),
+                            root,
+                            reporter_pid,
+                        )
+                    })
+                {
+                    return Err(err("session_origin", "Codex session report is not from this pane's process tree; use codex --no-daemon"));
+                }
+                p.set_kind("codex");
+                p.remember_session("codex", &session_id);
+                Ok(json!({"recorded":true}))
+            }
             Request::TaskAdd {
                 target,
                 text,
@@ -364,7 +411,9 @@ impl Daemon {
                             .as_deref()
                             .and_then(|s| s.strip_prefix(&format!("{}-session:", r.kind)))
                         {
-                            p.remember_session(&r.kind, id);
+                            if r.kind != "codex" {
+                                p.remember_session(&r.kind, id);
+                            }
                         }
                     }
                 }
@@ -911,5 +960,83 @@ mod enter_delay_tests {
             send_enter_delay(Some("codex"), "hello"),
             Duration::from_millis(250)
         );
+    }
+}
+
+#[cfg(test)]
+mod session_report_tests {
+    use super::*;
+    #[tokio::test]
+    async fn session_reports_require_a_dedicated_client_and_its_own_process_tree() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("orch-session-report-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("codex");
+        std::fs::write(&bin, "#!/bin/sh\nsleep 120\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let d = Daemon::new(100, Arc::new(Bus::in_memory().unwrap()));
+        struct Guard(Arc<Daemon>, std::path::PathBuf);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                self.0.kill_all();
+                let _ = std::fs::remove_dir_all(&self.1);
+            }
+        }
+        let _guard = Guard(Arc::clone(&d), dir.clone());
+        let mut panes = Vec::new();
+        for dedicated in [true, true, false] {
+            let mut argv = vec![bin.to_string_lossy().into_owned()];
+            if dedicated {
+                argv.push("--no-daemon".into());
+            }
+            argv.extend(["--model".into(), "kept".into()]);
+            let p = d
+                .new_pane(NewPane {
+                    argv,
+                    cwd: Some(dir.to_string_lossy().into_owned()),
+                    env: Some(vec![("HOME".into(), dir.to_string_lossy().into_owned())]),
+                    ..Default::default()
+                })
+                .unwrap();
+            d.place_new_pane(&p.info()).unwrap();
+            panes.push(p);
+        }
+        let ids = [
+            "11111111-1111-4111-8111-111111111111",
+            "22222222-2222-4222-8222-222222222222",
+        ];
+        let req = |n: usize, pid: u32, id: &str| Request::ReportSession {
+            pane: panes[n].id.clone(),
+            reporter_pid: pid,
+            session_id: id.into(),
+        };
+        assert!(d
+            .handle(req(0, panes[1].pid.unwrap(), ids[1]))
+            .await
+            .is_err());
+        assert!(
+            d.handle(req(2, panes[2].pid.unwrap(), ids[0]))
+                .await
+                .is_err(),
+            "shared mode rejected even if ancestry matches"
+        );
+        assert!(d
+            .handle(req(0, panes[0].pid.unwrap(), "invalid"))
+            .await
+            .is_err());
+        for n in 0..2 {
+            d.handle(req(n, panes[n].pid.unwrap(), ids[n]))
+                .await
+                .unwrap();
+        }
+        let saved = d.snapshot_layout();
+        for n in 0..2 {
+            let p = &saved.panes[&panes[n].id];
+            assert_eq!(p.session_id.as_deref(), Some(ids[n]));
+            assert_eq!(
+                crate::restore::restart_spec(p).0[1..],
+                ["resume", ids[n], "--no-daemon", "--model", "kept"]
+            );
+        }
     }
 }

@@ -247,6 +247,29 @@ pub async fn ask(
     Ok(())
 }
 
+/// Codex lifecycle hooks identify the session explicitly, never by cwd or rollout mtime.
+/// Require a local pane and SessionStart; turn IDs and notification IDs are not thread IDs.
+fn codex_session<'a>(ev: &'a serde_json::Value, pane: Option<&str>) -> Option<&'a str> {
+    let pane = pane?.strip_prefix("orch:")?;
+    if !pane
+        .strip_prefix('p')
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        || ev["hook_event_name"] != "SessionStart"
+    {
+        return None;
+    }
+    let id = ev["session_id"].as_str()?;
+    (id.len() == 36
+        && id.bytes().enumerate().all(|(i, b)| {
+            if [8, 13, 18, 23].contains(&i) {
+                b == b'-'
+            } else {
+                b.is_ascii_hexdigit()
+            }
+        }))
+    .then_some(id)
+}
+
 /// Claude Code hook: keep the agent's status current and hand it unread bus messages when
 /// it stops. Must never break Claude: any problem → exit quietly, print nothing.
 /// Wired as `orch hook` for SessionStart, UserPromptSubmit, PreToolUse, Notification, Stop.
@@ -255,14 +278,39 @@ pub async fn hook(socket: &Path, kind: &str) {
     let _ = std::io::stdin().take(1 << 20).read_to_string(&mut input);
     let ev: serde_json::Value = serde_json::from_str(&input).unwrap_or_default();
     let event = ev["hook_event_name"].as_str().unwrap_or("").to_string();
-    let run = async {
-        // Do not start orchd from a hook: if it is not running there is nothing to report.
-        let mut conn = Conn::unix(socket).await.ok()?;
-        let mut reg = register_request(kind);
-        // Claude's session id: a stable identity when there is no pane.
+    let mut reg = register_request(kind);
+    if kind == "codex" {
+        let Some(id) = codex_session(&ev, reg.pane.as_deref()) else {
+            eprintln!(
+                "orch hook: ignored Codex event without a SessionStart UUID and local ORCH_PANE"
+            );
+            return;
+        };
+        reg.instance = Some(format!("codex-session:{id}"));
+    } else {
         reg.instance = ev["session_id"]
             .as_str()
             .map(|s| format!("{kind}-session:{s}"));
+    }
+    let run = async {
+        // Do not start orchd from a hook: if it is not running there is nothing to report.
+        let mut conn = Conn::unix(socket).await.ok()?;
+        // Identity only, with process ancestry proof. A shared server's environment is
+        // NOT a per-client identity; reject rather than writing another pane's session.
+        if kind == "codex" {
+            let id = codex_session(&ev, reg.pane.as_deref())?;
+            if let Err(e) = conn
+                .request(&Request::ReportSession {
+                    pane: reg.pane.clone()?,
+                    session_id: id.into(),
+                    reporter_pid: std::process::id(),
+                })
+                .await
+            {
+                eprintln!("orch hook: Codex session not recorded: {e}");
+            }
+            return Some(());
+        }
         let me = conn.request(&Request::RegisterAgent(reg)).await.ok()?;
         let me = me["name"].as_str()?.to_string();
         let status = |s: &str, t: Option<String>| Request::SetStatus {
@@ -331,4 +379,34 @@ pub async fn hook(socket: &Path, kind: &str) {
         Some(())
     };
     let _ = tokio::time::timeout(Duration::from_secs(3), run).await;
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn codex_session_is_explicit_and_bound_to_a_local_pane() {
+        let ids = [
+            "11111111-1111-4111-8111-111111111111",
+            "22222222-2222-4222-8222-222222222222",
+        ];
+        for (i, id) in ids.iter().enumerate() {
+            let ev = json!({"hook_event_name":"SessionStart","session_id":id,"cwd":"/same","source":"resume"});
+            assert_eq!(
+                codex_session(&ev, Some(&format!("orch:p{}", i + 1))),
+                Some(*id)
+            );
+            assert!(codex_session(&ev, None).is_none());
+            assert!(codex_session(&ev, Some("herdr:p1")).is_none());
+        }
+        for ev in [
+            json!({"hook_event_name":"Stop","session_id":ids[0]}),
+            json!({"hook_event_name":"SessionStart","turn_id":ids[0]}),
+            json!({"hook_event_name":"SessionStart","session_id":"bad"}),
+            json!({"type":"agent-turn-complete","thread-id":ids[0]}),
+        ] {
+            assert!(codex_session(&ev, Some("orch:p1")).is_none());
+        }
+    }
 }

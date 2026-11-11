@@ -1,5 +1,13 @@
 # Status
 
+## 2026-11-06 — P6B: verified Codex resume and nudge test readiness — Codex
+
+Codex SessionStart reports now require a dedicated `--no-daemon` client and matching process
+ancestry; shared-server hook environments are not pane-specific (verified with Codex 0.166.0).
+Unknown sessions use the picker, never automatic `--last`. README has the opt-in hook setup.
+The nudge test now waits for detected prompt/dialog readiness before sending. Socket tests and
+the 50-run load comparison remain blocked by sandbox EPERM; see CODEX-REVIEW-P6B-RESULT.md.
+
 ## 2026-11-04 — P6A task queue — Codex
 
 Implemented durable workspace/tab task queues, guarded dispatch, explicit MCP completion and

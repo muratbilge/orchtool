@@ -54,6 +54,32 @@ Rust stable via rustup with rustfmt and clippy (`rust-toolchain.toml`). The scri
 
   and the MCP server: `claude mcp add --scope user orch -- orch-mcp`. Set `ORCH_AGENT=<name>` before starting an
   agent to give it a fixed name on the bus.
+- **Codex 0.166.0 (exact resume):** use `codex --no-daemon` in orch panes. The shared
+  app-server runs hooks with its own environment, not the individual TUI's `ORCH_PANE`.
+  orch refuses a session report unless the reporting process is in that pane's process tree.
+  `--no-daemon` is preserved by restart along with your model/options. For resumed sessions:
+  `codex --no-daemon resume <id>`. An already running shared-server session needs to be reopened
+  this way; configuring a hook does not retroactively identify it.
+
+  Merge this **additional** entry into `~/.codex/hooks.json`'s `hooks.SessionStart` array;
+  retain the existing herdr entry and any other hooks. Use your installed absolute orch path:
+
+  ```json
+  { "hooks": [{ "type": "command", "command": "/home/murat/.local/bin/orch hook --kind codex", "timeout": 5 }] }
+  ```
+
+  Ensure `[features] hooks = true` in `~/.codex/config.toml` (already enabled on this machine).
+  Review/trust the new command in Codex `/hooks`; do not copy another hook's trust hash or bypass
+  hook trust. No `notify` replacement is needed. The helper reads `SessionStart.session_id` from
+  stdin, reports identity only, and never starts orchd or changes Codex's working/idle status.
+  It handles startup/resume/clear/fork/compact without a matcher. The payload contract and trust
+  flow are documented in [OpenAI Hooks](https://learn.chatgpt.com/docs/hooks).
+
+  If identity is unavailable or origin validation fails, orch logs why and restores Codex to
+  `codex resume` (the picker), **not** `--last`. Existing explicit resume IDs still work. No cwd,
+  timestamp, newest-file, or shared app-server FD guessing. Private tests must pass `--socket`
+  before `hook`, or export `ORCHD_SOCKET`; keep HOME separate. Neither config file is edited by
+  the build/install scripts.
 - **Any script or shell agent:** `orch ask "<question>"` waits for the human's answer; `orch status <name> working|idle|blocked|done [text]`;
   `orch msg -- <agent> "<text>"`.
 - **You:** `orch questions`, `orch answer <id> <text or option number>`, `orch question close <id>`, `orch tail -f`,

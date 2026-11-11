@@ -234,7 +234,7 @@ enum Cmd {
         status: String,
         text: Vec<String>,
     },
-    /// Claude Code hook entry point (reads the hook JSON on stdin; never fails the hook)
+    /// Agent hook entry point (Claude lifecycle; Codex SessionStart identity only)
     Hook {
         /// Agent kind to register as
         #[arg(long, default_value = "claude")]

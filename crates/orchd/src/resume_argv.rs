@@ -191,7 +191,9 @@ pub fn rewrite(argv: &[String], kind: &str, discovered: Option<&str>) -> Option<
         }
     } else if kind == "codex" {
         out.push("resume".into());
-        out.push(id.unwrap_or_else(|| "--last".into()));
+        if let Some(id) = id {
+            out.push(id);
+        } // Unknown session: picker, never another pane's latest.
     } else {
         return None;
     }
@@ -301,7 +303,7 @@ mod tests {
                 None
             )
             .unwrap(),
-            v(&["codex", "resume", "--last", "-m", "y"])
+            v(&["codex", "resume", "-m", "y"])
         );
         assert!(rewrite(
             &v(&["claude", "--new-unknown-option", "value"]),

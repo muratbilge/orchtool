@@ -104,6 +104,29 @@ pub fn discover(proc_root: &Path, root: u32, home: &Path, kind: &str) -> Option<
     (matches.len() == 1).then(|| matches.remove(0))
 }
 
+/// Prove a hook belongs to this pane, not to the shared app-server's inherited environment.
+/// Fail closed on inaccessible/exited processes, cycles, or a different process namespace.
+pub fn descendant(proc_root: &Path, root: u32, mut child: u32) -> bool {
+    let mut seen = HashSet::new();
+    while child > 1 && seen.len() < 1024 && seen.insert(child) {
+        if child == root {
+            return true;
+        }
+        let Ok(stat) = std::fs::read_to_string(proc_root.join(child.to_string()).join("stat"))
+        else {
+            return false;
+        };
+        let Some((_, rest)) = stat.rsplit_once(')') else {
+            return false;
+        };
+        let Some(parent) = rest.split_whitespace().nth(1).and_then(|p| p.parse().ok()) else {
+            return false;
+        };
+        child = parent;
+    }
+    false
+}
+
 pub fn host_home() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
 }
@@ -112,6 +135,24 @@ pub fn host_home() -> Option<PathBuf> {
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
+    #[test]
+    fn ancestry_rejects_shared_server_and_handles_process_names() {
+        let root = std::env::temp_dir().join(format!("orch-ancestry-{}", std::process::id()));
+        for (pid, parent) in [(100, 1), (101, 100), (102, 101), (200, 1), (201, 200)] {
+            std::fs::create_dir_all(root.join(pid.to_string())).unwrap();
+            std::fs::write(
+                root.join(format!("{pid}/stat")),
+                format!("{pid} (name with ) spaces) S {parent} 0"),
+            )
+            .unwrap();
+        }
+        assert!(descendant(&root, 100, 102));
+        assert!(!descendant(&root, 100, 201));
+        assert!(!descendant(&root, 100, 999));
+        std::fs::write(root.join("101/stat"), "101 (cycle) S 102").unwrap();
+        assert!(!descendant(&root, 100, 102));
+        std::fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn two_agents_in_one_cwd_keep_their_own_open_transcripts() {
         let root = std::env::temp_dir().join(format!(

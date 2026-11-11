@@ -1,7 +1,7 @@
 //! Restart without losing the layout: on `daemon.stop` with `restart`, orchd writes its
 //! workspaces / tabs / splits and what ran in each pane (program, current folder, size) to
 //! `restore.json` next to its socket; the next orchd recreates them with fresh panes. Agents
-//! continue their last conversation (`claude --continue`, `codex resume --last`).
+//! resume an identified conversation (Codex uses its picker if identity is unavailable).
 
 use crate::detect::{self, Detected};
 use crate::pane::Pane;
@@ -211,7 +211,7 @@ pub fn restart_argv(argv: &[String]) -> Vec<String> {
             v
         }
         "codex" if only_flags => {
-            let mut v = vec![first.clone(), "resume".into(), "--last".into()];
+            let mut v = vec![first.clone(), "resume".into()];
             v.extend(rest.iter().cloned());
             v
         }
@@ -279,6 +279,9 @@ impl Daemon {
                 .as_ref()
                 .and_then(|p| p.session_id.clone())
                 .or_else(|| agent.as_deref().and_then(|k| p.session_id(k)));
+            if agent.as_deref() == Some("codex") && session_id.is_none() {
+                eprintln!("orchd: {}: no process-owned Codex session ID or SessionStart report; preserving an explicit resume ID if present, otherwise use the picker",p.id);
+            }
             panes.insert(
                 p.id.clone(),
                 SavedPane {
@@ -454,11 +457,11 @@ mod tests {
         );
         assert_eq!(
             restart_argv(&v(&["codex", "--yolo"])),
-            v(&["codex", "resume", "--last", "--yolo"])
+            v(&["codex", "resume", "--yolo"])
         );
         assert_eq!(
             restart_argv(&v(&["codex", "fix the bug"])),
-            v(&["codex", "resume", "--last"])
+            v(&["codex", "resume"])
         );
         assert_eq!(restart_argv(&v(&["bash"])), v(&["bash"]));
         assert!(restart_argv(&[]).is_empty());
@@ -508,10 +511,7 @@ mod tests {
         }))
         .unwrap();
         assert!(old.session_id.is_none());
-        assert_eq!(
-            restart_spec(&old).0,
-            v(&["codex", "resume", "--last", "-m", "y"])
-        );
+        assert_eq!(restart_spec(&old).0, v(&["codex", "resume", "-m", "y"]));
     }
 
     #[test]
@@ -563,7 +563,7 @@ mod tests {
         assert!(env.is_empty(), "the shell itself gets no agent name");
 
         let (argv, env) = restart_spec(&saved(&["codex"], Some("codex"), Some("x-codex")));
-        assert_eq!(argv, v(&["codex", "resume", "--last"]));
+        assert_eq!(argv, v(&["codex", "resume"]));
         assert_eq!(env, vec![("ORCH_AGENT".to_string(), "x-codex".to_string())]);
 
         // A moved agent that resumes one conversation by id: kept exactly.

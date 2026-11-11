@@ -520,6 +520,34 @@ async fn msg(env: &Env, to: &str, text: &str) {
         .unwrap();
 }
 
+/// NewPane/registration acknowledge creation, not the PTY reader having rendered a prompt.
+/// Sending earlier can correctly skip the nudge while the screen is still Unknown.
+async fn wait_for_pane_status(env: &Env, pane: &str, expected: &str) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let v = env
+            .conn()
+            .await
+            .request(&Request::ListPanes {})
+            .await
+            .unwrap();
+        let status = v["panes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["id"] == pane)
+            .and_then(|p| p["agent_status"].as_str());
+        if status == Some(expected) {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "pane {pane}: expected {expected}, got {status:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn nudges_only_reach_idle_panes() {
     let mut env = Env::new("nudge");
@@ -531,6 +559,7 @@ async fn nudges_only_reach_idle_panes() {
     )
     .await;
     register_in_pane(&env, "idler", "codex", &idle).await;
+    wait_for_pane_status(&env, &idle, "idle").await;
     msg(&env, "idler", "wake up").await;
     let mut ok = false;
     for _ in 0..40 {
@@ -552,7 +581,7 @@ async fn nudges_only_reach_idle_panes() {
     )
     .await;
     register_in_pane(&env, "asker", "codex", &blocked).await;
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    wait_for_pane_status(&env, &blocked, "blocked").await;
     msg(&env, "asker", "do not type into my dialog").await;
     tokio::time::sleep(Duration::from_millis(1200)).await;
     assert!(
@@ -567,6 +596,7 @@ async fn nudges_only_reach_idle_panes() {
     )
     .await;
     register_in_pane(&env, "busy", "codex", &busy).await;
+    wait_for_pane_status(&env, &busy, "idle").await;
     env.conn()
         .await
         .request(&Request::SetStatus {

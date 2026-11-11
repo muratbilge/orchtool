@@ -9,6 +9,13 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "method", content = "params")]
 pub enum Request {
+    /// Explicit Codex hook identity, accepted only from a descendant of the pane process.
+    #[serde(rename = "pane.session")]
+    ReportSession {
+        pane: String,
+        session_id: String,
+        reporter_pid: u32,
+    },
     #[serde(rename = "task.add")]
     TaskAdd {
         target: String,

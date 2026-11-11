@@ -227,3 +227,112 @@ while IFS= read -r line; do printf '%s\n' "$line" >> "$receipts"; done
     }
     assert!(!d.dir.join("restore.json").exists());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_session_hooks_resume_two_panes_in_the_same_cwd_exactly() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!(
+        "orch-codex-resume-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(dir.join("home")).unwrap();
+    let socket = dir.join("s.sock");
+    let mut d = Private {
+        child: start(&dir, &socket),
+        dir,
+        socket,
+    };
+    let mut c = connect(&d.socket).await;
+    let orch = Path::new(env!("CARGO_BIN_EXE_orchd")).with_file_name("orch");
+    let ids = [
+        "11111111-1111-4111-8111-111111111111",
+        "22222222-2222-4222-8222-222222222222",
+    ];
+    let mut panes = Vec::new();
+    for (n, id) in ids.iter().enumerate() {
+        let bin = d.dir.join(format!("agent{n}/codex"));
+        std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        let script = format!(
+            r#"#!/usr/bin/python3
+import json, subprocess, time
+subprocess.run([{orch}, '--socket', {socket}, 'hook', '--kind', 'codex'], input=json.dumps({{'hook_event_name':'SessionStart','session_id':{id},'source':'startup'}}), text=True, check=True)
+print('reported\n› Ask Codex\n? for shortcuts', flush=True)
+time.sleep(120)
+"#,
+            orch = serde_json::to_string(&orch.to_string_lossy()).unwrap(),
+            socket = serde_json::to_string(&d.socket.to_string_lossy()).unwrap(),
+            id = serde_json::to_string(id).unwrap()
+        );
+        std::fs::write(&bin, script).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let v = c
+            .request(&Request::NewPane(NewPane {
+                argv: vec![
+                    bin.to_string_lossy().into_owned(),
+                    "--no-daemon".into(),
+                    "--model".into(),
+                    format!("model{n}"),
+                ],
+                cwd: Some(d.dir.to_string_lossy().into_owned()),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        panes.push(v["id"].as_str().unwrap().to_string());
+    }
+    for pane in &panes {
+        let mut ready = false;
+        for _ in 0..200 {
+            let v = c
+                .request(&Request::Read(orch_proto::api::ReadPane {
+                    pane: pane.clone(),
+                    lines: Some(20),
+                    source: orch_proto::api::ReadSource::Visible,
+                }))
+                .await
+                .unwrap();
+            if v["text"].as_str().unwrap().contains("reported") {
+                ready = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(ready, "fake Codex hook did not finish");
+    }
+    c.request(&Request::StopDaemon { restart: true })
+        .await
+        .unwrap();
+    d.child.wait().unwrap();
+    let saved: orchd::restore::Saved =
+        serde_json::from_slice(&std::fs::read(d.dir.join("restore.json")).unwrap()).unwrap();
+    for (pane, id) in panes.iter().zip(ids) {
+        assert_eq!(saved.panes[pane].session_id.as_deref(), Some(id));
+    }
+    d.child = start(&d.dir, &d.socket);
+    c = connect(&d.socket).await;
+    let v = c.request(&Request::ListPanes {}).await.unwrap();
+    let rows = v["panes"].as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    for (n, id) in ids.iter().enumerate() {
+        let row = rows
+            .iter()
+            .find(|r| {
+                r["argv"][0]
+                    .as_str()
+                    .unwrap()
+                    .contains(&format!("agent{n}/codex"))
+            })
+            .unwrap();
+        assert_eq!(
+            row["argv"].as_array().unwrap()[1..],
+            serde_json::json!(["resume", id, "--no-daemon", "--model", format!("model{n}")])
+                .as_array()
+                .unwrap()[..]
+        );
+        assert!(!panes.contains(&row["id"].as_str().unwrap().to_string()));
+    }
+}
