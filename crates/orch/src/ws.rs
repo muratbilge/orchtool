@@ -8,7 +8,7 @@ use anyhow::Result;
 use clap::Subcommand;
 use orch_proto::api::{Request, Spawn, UiOp};
 use orch_proto::client::Conn;
-use orch_proto::layout::{Session, Workspace};
+use orch_proto::layout::{Session, Tab, Workspace};
 
 #[derive(Subcommand, Debug)]
 pub enum WsCmd {
@@ -35,8 +35,16 @@ pub enum WsCmd {
 
 #[derive(Subcommand, Debug)]
 pub enum TabCmd {
-    /// New tab with a shell (or ARGV) in a workspace; prints the new pane id
+    /// New tab with a shell (or ARGV) in a workspace; prints the new pane id.
+    /// WORKSPACE "." = the workspace this command runs in ($ORCH_PANE): how an agent starts a
+    /// helper agent next to itself instead of in a workspace of its own
     New {
+        /// Name the tab (e.g. the agent in it)
+        #[arg(long)]
+        label: Option<String>,
+        /// Start in DIR instead of the workspace's folder
+        #[arg(long)]
+        cwd: Option<String>,
         workspace: String,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         argv: Vec<String>,
@@ -63,6 +71,23 @@ async fn session(c: &mut Conn) -> Result<Session> {
 fn find<'a>(s: &'a Session, key: &str) -> Result<&'a Workspace> {
     s.workspace(key)
         .ok_or_else(|| CliError::NotFound(format!("no workspace {key:?}")).into())
+}
+
+/// A pane id as the CLI prints it ("p7") or as the layout may hold it ("orch:p7").
+fn holds(t: &Tab, pane: &str) -> bool {
+    let bare = pane.strip_prefix("orch:").unwrap_or(pane);
+    t.root.contains(bare) || t.root.contains(&format!("orch:{bare}"))
+}
+
+/// The workspace the caller's own pane ($ORCH_PANE) is in.
+fn own(s: &Session) -> Result<&Workspace> {
+    let pane = std::env::var("ORCH_PANE").map_err(|_| {
+        CliError::NotFound("\".\" needs $ORCH_PANE: run it inside an orch pane".into())
+    })?;
+    s.workspaces
+        .iter()
+        .find(|w| w.tabs.iter().any(|t| holds(t, &pane)))
+        .ok_or_else(|| CliError::NotFound(format!("pane {pane} is not in a workspace")).into())
 }
 
 /// (index, focused pane) of a tab given by id.
@@ -137,15 +162,42 @@ pub async fn ws(c: &mut Conn, cmd: WsCmd) -> Result<()> {
 
 pub async fn tab_cmd(c: &mut Conn, cmd: TabCmd) -> Result<()> {
     match cmd {
-        TabCmd::New { workspace, argv } => {
+        TabCmd::New {
+            label,
+            cwd,
+            workspace,
+            argv,
+        } => {
             let s = session(c).await?;
-            let w = find(&s, &workspace)?;
+            let w = if workspace == "." {
+                own(&s)?
+            } else {
+                find(&s, &workspace)?
+            };
+            let ws_id = w.id.clone();
             let v = c
                 .request(&Request::Ui(UiOp::NewTab {
-                    workspace: w.id.clone(),
-                    spawn: spawn(argv, Some(w.cwd.clone()))?,
+                    workspace: ws_id.clone(),
+                    spawn: spawn(argv, cwd.or_else(|| Some(w.cwd.clone())))?,
                 }))
                 .await?;
+            if let (Some(label), Some(pane)) = (label, v["pane"]["id"].as_str()) {
+                let s = session(c).await?;
+                if let Some((index, t)) = find(&s, &ws_id)?
+                    .tabs
+                    .iter()
+                    .enumerate()
+                    .find(|(_, t)| holds(t, pane))
+                {
+                    c.request(&Request::Ui(UiOp::RenameTab {
+                        workspace: ws_id,
+                        index,
+                        tab: Some(t.id.clone()),
+                        label,
+                    }))
+                    .await?;
+                }
+            }
             print_pane(&v);
         }
         TabCmd::Focus { workspace, tab: t } => {

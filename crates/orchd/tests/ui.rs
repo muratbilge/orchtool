@@ -543,3 +543,96 @@ async fn rename_tab_uses_identity_after_an_earlier_tab_closes() {
     assert_eq!(s.workspaces[0].tabs[0].label, "target");
     assert_ne!(s.workspaces[0].tabs[1].label, "target");
 }
+
+/// `orch tab new .`: an agent starts a helper as a named tab of its own workspace (found through
+/// $ORCH_PANE) instead of a workspace of its own; `--cwd` overrides the workspace's folder.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_tab_new_in_the_callers_own_workspace() {
+    let d = daemon("owntab").await;
+    let other = d.dir.join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    let orch = std::path::Path::new(env!("CARGO_BIN_EXE_orchd")).with_file_name("orch");
+    let run = |pane: Option<&str>, args: &[&str]| {
+        let mut c = Command::new(&orch);
+        c.arg("--socket").arg(&d.socket).args(args);
+        c.env("HOME", &d.dir).env_remove("ORCH_PANE");
+        if let Some(p) = pane {
+            c.env("ORCH_PANE", p);
+        }
+        c.output().unwrap()
+    };
+    let out = |o: std::process::Output| String::from_utf8(o.stdout).unwrap().trim().to_string();
+
+    op(
+        &d,
+        UiOp::NewWorkspace {
+            label: Some("first".into()),
+            spawn: spawn(&["cat"]),
+        },
+    )
+    .await;
+    let v = op(
+        &d,
+        UiOp::NewWorkspace {
+            label: Some("proj".into()),
+            spawn: spawn(&["cat"]),
+        },
+    )
+    .await;
+    let me = v["pane"]["id"].as_str().unwrap().to_string();
+
+    let o = run(
+        Some(&me),
+        &[
+            "tab",
+            "new",
+            "--label",
+            "Codex",
+            "--cwd",
+            other.to_str().unwrap(),
+            ".",
+            "--",
+            "cat",
+        ],
+    );
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let helper = out(o);
+
+    let s: Session = serde_json::from_value(
+        Conn::unix(&d.socket)
+            .await
+            .unwrap()
+            .request(&Request::UiGet {})
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(s.workspaces.len(), 2, "no workspace was added");
+    let w = s.workspace("proj").unwrap();
+    assert_eq!(w.tabs.len(), 2);
+    assert_eq!(w.tabs[1].label, "Codex");
+    assert!(w.tabs[1].root.contains(&helper));
+    assert_eq!(s.workspace("first").unwrap().tabs.len(), 1);
+    let panes = Conn::unix(&d.socket)
+        .await
+        .unwrap()
+        .request(&Request::ListPanes {})
+        .await
+        .unwrap();
+    assert!(
+        panes.to_string().contains(other.to_str().unwrap()),
+        "--cwd reaches the pane: {panes}"
+    );
+
+    // Outside a pane, or from a pane that is in no workspace: exit 14, nothing started.
+    assert_eq!(
+        run(None, &["tab", "new", ".", "--", "cat"]).status.code(),
+        Some(14)
+    );
+    assert_eq!(
+        run(Some("p999"), &["tab", "new", ".", "--", "cat"])
+            .status
+            .code(),
+        Some(14)
+    );
+}
