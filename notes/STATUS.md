@@ -1,5 +1,12 @@
 # Status
 
+## 2026-11-11 — Codex's update menu is skipped automatically — Claude
+
+After today's restart both Codex panes sat at Codex's "Update available" menu (it comes before
+`codex resume`). orchd now presses Escape (= skip) on that menu, once per appearance, also when
+the pane's agent is not known yet; `orch auto-continue <pane> off` leaves it alone; Murat gets a
+bus message (thread limits). Detected only as the active bottom menu (`detect::codex_update_question`).
+
 ## 2026-11-11 — P6B reviewed and merged; lone Codex pane keeps `--last` — Claude
 
 Reviewed Codex's P6B outside its sandbox: `scripts/check.sh` green, the two-pane resume test passes,

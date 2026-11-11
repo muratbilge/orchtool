@@ -806,3 +806,58 @@ async fn codex_model_question_is_answered_keep_current_once() {
         .count();
     assert_eq!(kept, 1, "{log}");
 }
+
+/// Codex's start-up update menu: orchd presses Escape (skip) once, also when the pane's agent is
+/// not known yet (Codex typed into a shell), and leaves a pane with auto-continue off alone.
+#[tokio::test]
+async fn codex_update_question_is_skipped_once() {
+    let d = daemon().await;
+    let mut c = Conn::unix(&d.socket).await.unwrap();
+    // A fake Codex: shows the update menu, takes one key raw, then its prompt.
+    let script = "stty -icanon -echo min 1; \
+        printf '  Update available · 0.166.0 → 0.167.1\\n  Release notes: https://github.com/openai/codex/releases/latest\\n\\n› 1. Update now (runs `npm install -g @openai/codex`)\\n  2. Skip\\n  3. Skip until next version\\n\\n  enter continue · esc skip\\n'; \
+        k=$(dd bs=1 count=1 2>/dev/null | od -An -tx1 | tr -d ' '); printf '\\nPICKED:%s\\n\\n› Ask Codex to do anything\\n' \"$k\"; sleep 30";
+    let mut panes = Vec::new();
+    for on in [true, false] {
+        // Not registered: nothing says yet that this is Codex.
+        let p = new_pane(&mut c, &["sh", "-c", script], 24, 100).await;
+        if !on {
+            c.request(&Request::AutoContinue {
+                pane: p.clone(),
+                on: Some(false),
+            })
+            .await
+            .unwrap();
+        }
+        panes.push(p);
+    }
+    let text = wait_for_text(&mut c, &panes[0], "PICKED:").await;
+    assert!(text.contains("PICKED:1b"), "Escape, nothing else: {text}");
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    let off = read(&mut c, &panes[1], ReadSource::Recent).await;
+    assert!(
+        !off.contains("PICKED"),
+        "auto-continue off: left alone: {off}"
+    );
+    let log = c
+        .request(&Request::Log {
+            after: None,
+            limit: Some(50),
+            follow: false,
+        })
+        .await
+        .unwrap();
+    let told = log["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["to"] == "murat")
+        .filter(|m| {
+            m["text"]
+                .as_str()
+                .unwrap()
+                .contains("skipped Codex's update question")
+        })
+        .count();
+    assert_eq!(told, 1, "{log}");
+}

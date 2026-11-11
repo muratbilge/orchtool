@@ -38,6 +38,8 @@ struct State {
     pauses: HashMap<String, Pause>,
     /// Already answered in this observed appearance of Codex's model menu.
     model_questions: HashSet<String>,
+    /// Already skipped in this observed appearance of Codex's update menu.
+    update_questions: HashSet<String>,
     /// Panes with auto-continue switched off.
     off: HashMap<String, bool>,
 }
@@ -110,15 +112,28 @@ pub async fn check(daemon: &Daemon) {
     let mut due = Vec::new();
     let mut tell = Vec::new();
     let mut keep_models = Vec::new();
+    let mut skip_updates = Vec::new();
     {
         let mut s = state().lock().unwrap();
         let mut seen = Vec::new();
         let mut model_seen = HashSet::new();
+        let mut update_seen = HashSet::new();
         for pane in daemon.all_panes() {
             if pane.exit_code().is_some() {
                 continue;
             }
             let text = pane.visible_text();
+            // Before the agent check: at this menu a Codex typed into a shell is not known yet.
+            if detect::codex_update_question(&text, pane.agent(&text).as_deref()) {
+                update_seen.insert(pane.id.clone());
+                if !s.off.get(&pane.id).copied().unwrap_or(false)
+                    && s.update_questions.insert(pane.id.clone())
+                {
+                    let name = name_of(&pane.id, "codex");
+                    skip_updates.push((pane, name));
+                }
+                continue;
+            }
             let Some(kind) = pane.agent(&text) else {
                 continue;
             };
@@ -188,6 +203,30 @@ pub async fn check(daemon: &Daemon) {
         // Panes no longer limited: their pause is over.
         s.pauses.retain(|id, _| seen.contains(id));
         s.model_questions.retain(|id| model_seen.contains(id));
+        s.update_questions.retain(|id| update_seen.contains(id));
+    }
+    for (pane, name) in skip_updates {
+        // Same care as the model menu below: re-check under the terminal lock, one key.
+        let sent = {
+            let s = state().lock().unwrap();
+            let term = pane.term.lock().unwrap();
+            let text = term.visible_text();
+            !s.off.get(&pane.id).copied().unwrap_or(false)
+                && pane.exit_code().is_none()
+                && detect::codex_update_question(&text, pane.agent(&text).as_deref())
+                && pane.write(b"\x1b".to_vec())
+        };
+        if sent {
+            let text = format!(
+                "{name}: skipped Codex's update question ({}); update Codex yourself when it suits",
+                pane.id
+            );
+            let _ = daemon
+                .bus
+                .send(&name, HUMAN, "msg", &text, Some("limits"), None);
+        } else {
+            state().lock().unwrap().update_questions.remove(&pane.id);
+        }
     }
     for (pane, name) in keep_models {
         // Check again under the terminal lock; never send a stale menu choice to the prompt.

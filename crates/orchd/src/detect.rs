@@ -271,12 +271,38 @@ pub fn model_switch_question(screen: &str, kind: Option<&str>) -> bool {
         && footer.contains("back")
 }
 
+/// Codex's start-up "Update available" menu (it comes before the session, so also before a
+/// restored `codex resume`). Must be the active bottom menu with "2. Skip" and the
+/// "esc skip" footer before orchd presses Escape. The pane's agent may not be known yet
+/// (Codex typed into a shell has drawn nothing else), so only another known agent rules it out.
+pub fn codex_update_question(screen: &str, kind: Option<&str>) -> bool {
+    if kind.is_some_and(|k| k != "codex") {
+        return false;
+    }
+    let tail = tail_lines(screen, 10).to_lowercase();
+    let footer = tail.lines().last().unwrap_or_default();
+    let option = |text: &str| {
+        tail.lines()
+            .any(|l| l.trim_start_matches([' ', '›', '❯']).trim_end() == text)
+    };
+    tail.contains("update available")
+        // The command after "Update now" names Codex, possibly on its wrapped next line.
+        && tail.lines().any(|l| l.contains("1. update now"))
+        && tail.contains("codex")
+        && option("2. skip")
+        && option("3. skip until next version")
+        && footer.contains("enter")
+        && footer.contains("continue")
+        && footer.contains("esc")
+        && footer.contains("skip")
+}
+
 /// Classify the visible screen text of a pane running `kind`.
 pub fn detect(screen: &str, kind: Option<&str>) -> Detected {
     let Some(_kind) = kind else {
         return Detected::None;
     };
-    if model_switch_question(screen, kind) {
+    if model_switch_question(screen, kind) || codex_update_question(screen, kind) {
         return Detected::Blocked;
     }
     // Only the bottom of the screen matters (dialogs and status lines live there); scrolled-up
@@ -312,6 +338,44 @@ const IDLE: &[&str] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn update_menu_must_be_codex_and_the_active_bottom_menu() {
+        // As Codex 0.166.0 drew it in a 70-column pane (the command wraps).
+        let menu = "  Update available · 0.166.0 → 0.167.1\n  Release notes: https://github.com/openai/codex/releases/latest\n\n› 1. Update now (runs `sh -c 's=$(curl -fsSL https://chatgpt.com/\n     codex/install.sh) && CODEX_NON_INTERACTIVE=1 eval \"$s\"'`)\n  2. Skip\n  3. Skip until next version\n\n  enter continue · esc skip\n";
+        assert!(codex_update_question(menu, Some("codex")));
+        assert!(codex_update_question(menu, None), "agent not known yet");
+        assert_eq!(detect(menu, Some("codex")), Detected::Blocked);
+        assert!(!codex_update_question(menu, Some("claude")));
+        // The npm variant names the package on the same line.
+        let npm = menu.replace(
+            "› 1. Update now (runs `sh -c 's=$(curl -fsSL https://chatgpt.com/\n     codex/install.sh) && CODEX_NON_INTERACTIVE=1 eval \"$s\"'`)",
+            "› 1. Update now (runs `npm install -g @openai/codex`)",
+        );
+        assert!(codex_update_question(&npm, Some("codex")));
+        // Answered or quoted further up: not the active menu.
+        assert!(!codex_update_question(
+            &format!("{menu}› Ask Codex\n? for shortcuts"),
+            Some("codex")
+        ));
+        assert!(!codex_update_question(
+            &format!("{menu}{}$ ", "old output\n".repeat(20)),
+            None
+        ));
+        // Another program's update menu, or a changed meaning of Escape / option 2.
+        assert!(!codex_update_question(
+            &menu.replace("codex", "other").replace("CODEX", "OTHER"),
+            None
+        ));
+        assert!(!codex_update_question(
+            &menu.replace("2. Skip\n", "2. Update later\n"),
+            Some("codex")
+        ));
+        assert!(!codex_update_question(
+            &menu.replace("esc skip", "esc update"),
+            Some("codex")
+        ));
+    }
 
     #[test]
     fn model_menu_is_codex_only_and_must_be_the_active_bottom_menu() {

@@ -14,7 +14,8 @@ Built in Rust (stable) by Claude Code and Codex with Murat Bilge steering, for o
   for the bus (timeline, questions, answers). Reads each agent's status off its screen: working, blocked on a
   permission dialog, idle, done, or limited (a usage-limit notice; orchd types "continue" a minute after the reset
   unless `orch auto-continue <pane> off`; Codex's "switch to a cheaper model?" menu is answered "keep current
-  model" the same way). Answers a dialog only if the screen still hashes to what the client
+  model" the same way, and Codex's start-up "Update available" menu is skipped with Escape, so a restarted
+  Codex pane does not wait there). Answers a dialog only if the screen still hashes to what the client
   saw (`send --expect`), and each screen once. `orch stop-daemon --restart` saves the layout and the next orchd
   recreates it, agents resumed; agents that were mid-turn get a note to carry on once they are back at their
   prompt. Questions from agents whose pane is gone expire by themselves. Starts on demand from `orch`, or as a user service (`contrib/orchd.service`).
