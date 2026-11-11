@@ -199,6 +199,36 @@ pub fn restart_spec(sp: &SavedPane) -> (Vec<String>, Vec<(String, String)>) {
     }
 }
 
+/// Codex without a known conversation: `--last` only where it cannot mean another pane.
+/// Run when saving and again when restoring, so a snapshot written by an older orchd (which
+/// has no flag) is treated the same.
+pub fn mark_sole_codex(panes: &mut HashMap<String, SavedPane>) {
+    let codex = |sp: &SavedPane| sp.agent.as_deref() == Some("codex");
+    let unknown: Vec<(String, String)> = panes
+        .iter()
+        .filter(|(_, sp)| codex(sp) && sp.session_id.is_none())
+        .map(|(id, sp)| (id.clone(), sp.cwd.clone()))
+        .collect();
+    for (id, cwd) in unknown {
+        let sole = panes
+            .values()
+            .filter(|sp| codex(sp) && sp.cwd == cwd)
+            .count()
+            == 1;
+        eprintln!(
+            "orchd: {id}: no verified Codex session id (needs codex --no-daemon + the SessionStart hook); {}",
+            if sole {
+                "only Codex pane in its folder: an id on its command line, else resume --last"
+            } else {
+                "other Codex panes share its folder: an id on its command line, else the picker"
+            }
+        );
+        if let Some(sp) = panes.get_mut(&id) {
+            sp.sole_codex_in_cwd = sole;
+        }
+    }
+}
+
 /// What to run again: the same program; agents resume their last conversation.
 pub fn restart_argv(argv: &[String]) -> Vec<String> {
     let Some(first) = argv.first() else {
@@ -308,30 +338,7 @@ impl Daemon {
                 },
             );
         }
-        // Codex without a known conversation: `--last` only where it cannot mean another pane.
-        let unknown: Vec<(String, String)> = panes
-            .iter()
-            .filter(|(_, sp)| sp.agent.as_deref() == Some("codex") && sp.session_id.is_none())
-            .map(|(id, sp)| (id.clone(), sp.cwd.clone()))
-            .collect();
-        for (id, cwd) in unknown {
-            let sole = panes
-                .values()
-                .filter(|sp| sp.agent.as_deref() == Some("codex") && sp.cwd == cwd)
-                .count()
-                == 1;
-            eprintln!(
-                "orchd: {id}: no verified Codex session id (needs codex --no-daemon + the SessionStart hook); {}",
-                if sole {
-                    "only Codex pane in its folder: an id on its command line, else resume --last"
-                } else {
-                    "other Codex panes share its folder: an id on its command line, else the picker"
-                }
-            );
-            if let Some(sp) = panes.get_mut(&id) {
-                sp.sole_codex_in_cwd = sole;
-            }
-        }
+        mark_sole_codex(&mut panes);
         Saved { session, panes }
     }
 
@@ -352,7 +359,8 @@ impl Daemon {
 
     /// Recreates a saved layout with new panes. Panes whose program can't start are left out
     /// (their tab / workspace collapses if nothing is left). Returns how many came back.
-    pub fn restore_layout(self: &Arc<Self>, saved: Saved) -> usize {
+    pub fn restore_layout(self: &Arc<Self>, mut saved: Saved) -> usize {
+        mark_sole_codex(&mut saved.panes);
         let mut ids: HashMap<String, String> = HashMap::new();
         let mut resumed = 0;
         let mut pending = Vec::new();
@@ -543,15 +551,24 @@ mod tests {
         let mut explicit = saved(&["codex", "resume", "abc"], Some("codex"), None);
         explicit.sole_codex_in_cwd = true;
         assert_eq!(restart_spec(&explicit).0, v(&["codex", "resume", "abc"]));
-        // Old snapshots have no flag: picker.
+        // A snapshot from an older orchd has no flag: marked again when it is restored.
         let mut value = serde_json::to_value(&pane).unwrap();
         value.as_object_mut().unwrap().remove("sole_codex_in_cwd");
         value["session_id"] = serde_json::Value::Null;
         let old: SavedPane = serde_json::from_value(value).unwrap();
-        assert_eq!(
-            restart_spec(&old).0,
-            v(&["codex", "resume", "--approve-for-me"])
+        assert!(!old.sole_codex_in_cwd);
+        let mut panes = HashMap::from([
+            ("p1".to_string(), old.clone()),
+            ("p2".to_string(), saved(&["claude"], Some("claude"), None)),
+        ]);
+        mark_sole_codex(&mut panes);
+        assert!(
+            panes["p1"].sole_codex_in_cwd,
+            "a claude pane in the folder does not count"
         );
+        panes.insert("p3".to_string(), old);
+        mark_sole_codex(&mut panes);
+        assert!(!panes["p1"].sole_codex_in_cwd && !panes["p3"].sole_codex_in_cwd);
     }
 
     #[test]
