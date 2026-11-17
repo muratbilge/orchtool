@@ -532,3 +532,121 @@ while IFS= read -r line; do printf '%s\n' "$line" >> "$receipts"; done
         }
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sigterm_keeps_an_agent_that_died_before_its_shell() {
+    // A long timer: after the agent shows up, only a layout op writes the autosave.
+    let mut d = daemon("shellagent", 100, 60_000).await;
+    let agent = d.dir.join("fake-agent");
+    let pidfile = d.dir.join("agent.pid");
+    // Looks like Claude Code; dies on SIGTERM (clearing its screen, as a TUI leaves it).
+    std::fs::write(
+        &agent,
+        format!(
+            "trap 'printf \"\\033[2J\\033[H\"; exit 143' TERM\n\
+             printf 'Done\\n⏵⏵ auto mode on (shift+tab to cycle)\\n'\n\
+             echo $$ > {}\n\
+             while :; do sleep 0.05; done\n",
+            pidfile.display()
+        ),
+    )
+    .unwrap();
+    let v = op(
+        &d,
+        UiOp::NewWorkspace {
+            label: Some("agent".into()),
+            spawn: spawn(&["bash", "--norc"]),
+        },
+    )
+    .await;
+    let ws = v["session"]["workspaces"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let pane = v["pane"]["id"].as_str().unwrap().to_string();
+    let mut c = conn(&d).await;
+    c.request(&Request::Send(orch_proto::api::SendPane {
+        pane: pane.clone(),
+        text: format!("sh {}", agent.display()),
+        enter: true,
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+    let agent_seen = |want: bool| {
+        let pane = pane.clone();
+        let socket = d.socket.clone();
+        async move {
+            for _ in 0..400 {
+                let mut c = Conn::unix(&socket).await.unwrap();
+                let panes = pane_infos(&mut c).await;
+                let p = panes.iter().find(|p| p.id == pane).unwrap();
+                if p.agent.is_some() == want {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            panic!("agent seen never became {want}");
+        }
+    };
+    agent_seen(true).await;
+    // A layout op: the debounced autosave records the agent.
+    op(
+        &d,
+        UiOp::RenameWorkspace {
+            workspace: ws,
+            label: "agent2".into(),
+        },
+    )
+    .await;
+    wait_saved(&d, "the agent in the shell", |s| {
+        s.panes
+            .get(&pane)
+            .is_some_and(|p| p.agent.as_deref() == Some("claude"))
+            && s.session.workspaces.iter().any(|w| w.label == "agent2")
+    })
+    .await;
+    // The shutdown: the agent dies, the interactive shell ignores SIGTERM.
+    let mut pid = String::new();
+    for _ in 0..200 {
+        pid = std::fs::read_to_string(&pidfile).unwrap_or_default();
+        if !pid.trim().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let bash = pane_infos(&mut c)
+        .await
+        .into_iter()
+        .find(|p| p.id == pane)
+        .unwrap()
+        .pid
+        .unwrap();
+    for target in [pid.trim().to_string(), bash.to_string()] {
+        assert!(Command::new("kill")
+            .args(["-TERM", &target])
+            .status()
+            .unwrap()
+            .success());
+    }
+    agent_seen(false).await;
+    kill(&mut d, "TERM");
+    let saved: orchd::restore::Saved =
+        serde_json::from_slice(&std::fs::read(autosave(&d)).unwrap()).unwrap();
+    assert_eq!(saved.panes[&pane].agent.as_deref(), Some("claude"));
+    let mut c = restart(&mut d).await;
+    let after = session(&d).await;
+    assert_eq!(labels(&after), vec!["agent2"]);
+    let new = after.workspaces[0].tabs[0].root.panes()[0].clone();
+    let info = pane_infos(&mut c)
+        .await
+        .into_iter()
+        .find(|p| p.id == new)
+        .unwrap();
+    assert_eq!(info.argv[..2], ["bash", "-lc"]);
+    assert!(
+        info.argv[2].contains("claude --continue"),
+        "the agent is resumed in its shell: {:?}",
+        info.argv
+    );
+}

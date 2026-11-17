@@ -160,8 +160,17 @@ impl Daemon {
 }
 
 /// A VM shutdown signals every process of the session at once, so an agent may already be
-/// gone when orchd takes its final snapshot. A pane still in the layout whose program died
-/// since the last autosave keeps that entry. (Panes that had exited before it stay left out.)
+/// gone when orchd takes its final snapshot. Only for that final save, against the last
+/// autosave, for panes still in the layout:
+/// - a pane whose program died since then keeps that entry;
+/// - a pane whose agent died but whose shell survived (an interactive shell ignores SIGTERM)
+///   keeps that entry's agent (argv, agent, bus name, session id, agent argv, was_working),
+///   with the folder and size as they are now;
+/// - an agent still seen whose session id / real argv are no longer found (its process is
+///   gone) keeps the known ones.
+///
+/// Panes that had exited before the last autosave stay left out, and the periodic autosave
+/// never does this (there an agent that is gone was quit on purpose).
 fn keep_panes_that_just_died(
     saved: &mut crate::restore::Saved,
     last: Option<&crate::restore::Saved>,
@@ -170,8 +179,27 @@ fn keep_panes_that_just_died(
     for ws in &saved.session.workspaces {
         for tab in &ws.tabs {
             for id in tab.root.panes() {
-                if let Some(sp) = last.panes.get(&id) {
-                    saved.panes.entry(id).or_insert_with(|| sp.clone());
+                let Some(old) = last.panes.get(&id) else {
+                    continue;
+                };
+                let Some(now) = saved.panes.get_mut(&id) else {
+                    saved.panes.insert(id, old.clone());
+                    continue;
+                };
+                if old.agent.is_some() && now.agent.is_none() {
+                    *now = crate::restore::SavedPane {
+                        cwd: std::mem::take(&mut now.cwd),
+                        rows: now.rows,
+                        cols: now.cols,
+                        ..old.clone()
+                    };
+                } else if now.agent.is_some() && now.agent == old.agent {
+                    if now.session_id.is_none() {
+                        now.session_id.clone_from(&old.session_id);
+                    }
+                    if now.agent_argv.is_none() {
+                        now.agent_argv.clone_from(&old.agent_argv);
+                    }
                 }
             }
         }
@@ -337,6 +365,52 @@ mod tests {
             "a running pane is taken as it is now"
         );
         assert_eq!(now.panes["p2"].argv, ["claude"]);
+
+        // The shell survived the shutdown, the agent in it did not.
+        let mut agent = pane("bash");
+        agent.agent = Some("claude".into());
+        agent.bus_name = Some("x-claude".into());
+        agent.session_id = Some("11111111-1111-4111-8111-111111111111".into());
+        agent.agent_argv = Some(vec!["claude".into(), "--model".into(), "m".into()]);
+        agent.was_working = true;
+        let mut last = saved(&["p1", "p2"], &[]);
+        last.panes.insert("p1".into(), agent.clone());
+        last.panes.insert("p2".into(), agent.clone());
+        let mut now = saved(&["p1", "p2"], &[("p1", "bash")]);
+        {
+            let p1 = now.panes.get_mut("p1").unwrap();
+            p1.cwd = "/srv".into();
+            p1.rows = 40;
+        }
+        // p2: the agent is still seen (registered kind), but its process is gone.
+        let mut seen = pane("bash");
+        seen.agent = Some("claude".into());
+        seen.bus_name = Some("x-claude".into());
+        now.panes.insert("p2".into(), seen);
+        keep_panes_that_just_died(&mut now, Some(&last));
+        let p1 = &now.panes["p1"];
+        assert_eq!(p1.agent.as_deref(), Some("claude"));
+        assert_eq!(p1.bus_name.as_deref(), Some("x-claude"));
+        assert_eq!(p1.session_id, agent.session_id);
+        assert_eq!(p1.agent_argv, agent.agent_argv);
+        assert!(p1.was_working);
+        assert_eq!(
+            (p1.cwd.as_str(), p1.rows),
+            ("/srv", 40),
+            "folder and size as now"
+        );
+        let p2 = &now.panes["p2"];
+        assert_eq!(p2.session_id, agent.session_id);
+        assert_eq!(p2.agent_argv, agent.agent_argv);
+        assert!(!p2.was_working, "taken as it is now otherwise");
+        // A different agent now (or a session id found now) is not overwritten.
+        let mut now = saved(&["p1"], &[]);
+        let mut other = pane("bash");
+        other.agent = Some("codex".into());
+        now.panes.insert("p1".into(), other);
+        keep_panes_that_just_died(&mut now, Some(&last));
+        assert!(now.panes["p1"].session_id.is_none());
+
         let mut first = saved(&["p1"], &[]);
         keep_panes_that_just_died(&mut first, None);
         assert!(first.panes.is_empty());
