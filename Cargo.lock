@@ -736,6 +736,7 @@ dependencies = [
  "serde",
  "serde_json",
  "shell-words",
+ "signal-hook-registry",
  "tokio",
  "tokio-util",
  "vt100",

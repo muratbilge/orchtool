@@ -75,6 +75,8 @@ async fn main() -> anyhow::Result<()> {
     let mut term = signal(SignalKind::terminate())?;
     let mut int = signal(SignalKind::interrupt())?;
     let mut hup = signal(SignalKind::hangup())?;
+    // A stuck runtime is logged, and a stop signal it cannot handle still ends orchd.
+    orchd::watchdog::start();
     // After a restart (restore.json) or an unplanned stop (autosave.json): the layout the
     // previous orchd saved, with fresh panes. Autosaving starts only once that is done.
     let _ = daemon.restore_path.set(dir.join("restore.json"));

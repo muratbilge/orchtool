@@ -31,6 +31,13 @@ fn send_enter_delay(kind: Option<&str>, text: &str) -> Duration {
 /// How long a conditional send's screen state counts as answered.
 const ANSWERED_FOR: Duration = Duration::from_secs(30);
 
+/// Lock order (std mutexes; never take an earlier one while holding a later one, and never
+/// hold one across an `.await`):
+///   `task_gate` (tokio) → limits `state` → `Pane.term` → `Pane.kind` / `answered` /
+///   `Pane.master` → leaves.
+/// `panes`, `session`, bus `db`, `autosave.state`, `Pane.clients` / `session_hint` /
+/// `killer` are leaves: nothing else is locked under them (copy out with `all_panes()` /
+/// `session()`, then call on). Watch-channel reads (`exit_code()`) are fine anywhere.
 pub struct Daemon {
     pub task_gate: tokio::sync::Mutex<()>,
     /// Set once shutdown starts: panes dying from `kill_all` are not task failures.
@@ -166,7 +173,7 @@ impl Daemon {
     pub fn kill_all(&self) {
         self.stopping
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        for pane in self.panes.lock().unwrap().values() {
+        for pane in self.all_panes() {
             pane.kill();
             pane.signal_group(libc::SIGTERM);
         }
@@ -316,14 +323,8 @@ impl Daemon {
             Request::UiGet {} => Ok(serde_json::to_value(self.session()).unwrap()),
             Request::Ui(op) => self.ui_op(op).await,
             Request::ListPanes {} => {
-                let panes: Vec<_> = self
-                    .panes
-                    .lock()
-                    .unwrap()
-                    .values()
-                    .map(|p| p.info())
-                    .collect();
-                Ok(json!({ "panes": panes }))
+                // `info()` takes the limits lock: never call it under `panes` (lock order).
+                Ok(json!({ "panes": self.pane_infos() }))
             }
             Request::Read(r) => {
                 let pane = self.find(&r.pane)?;

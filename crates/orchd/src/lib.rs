@@ -12,6 +12,7 @@ mod resume_argv;
 pub mod server;
 pub mod term;
 pub mod ui;
+pub mod watchdog;
 
 pub mod tasks;
 mod tasks_store;

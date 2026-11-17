@@ -113,12 +113,14 @@ pub async fn check(daemon: &Daemon) {
     let mut tell = Vec::new();
     let mut keep_models = Vec::new();
     let mut skip_updates = Vec::new();
+    // Before `state`: `panes` is never taken under it (ListPanes → `info()` takes `state`).
+    let panes = daemon.all_panes();
     {
         let mut s = state().lock().unwrap();
         let mut seen = Vec::new();
         let mut model_seen = HashSet::new();
         let mut update_seen = HashSet::new();
-        for pane in daemon.all_panes() {
+        for pane in panes {
             if pane.exit_code().is_some() {
                 continue;
             }
