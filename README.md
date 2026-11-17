@@ -18,7 +18,13 @@ Built in Rust (stable) by Claude Code and Codex with Murat Bilge steering, for o
   Codex pane does not wait there). Answers a dialog only if the screen still hashes to what the client
   saw (`send --expect`), and each screen once. `orch stop-daemon --restart` saves the layout and the next orchd
   recreates it, agents resumed; agents that were mid-turn get a note to carry on once they are back at their
-  prompt. Questions from agents whose pane is gone expire by themselves. Starts on demand from `orch`, or as a user service (`contrib/orchd.service`).
+  prompt. The layout also survives an unplanned stop (crash, `kill -9`, VM reset or shutdown): orchd keeps
+  `autosave.json` next to its socket (2 s after a layout change, every 60 s for folders / agents / was-working,
+  only when something changed, and once more on SIGTERM/SIGINT before the panes are killed); the next orchd
+  restores it when there is no `restore.json` and agents that were working get a note that their last tool call
+  and background work were lost. A plain `orch stop-daemon` removes it (the next orchd starts empty). A restore
+  that does not finish is not tried again: the file is kept as `autosave.json.failed`. Questions from agents
+  whose pane is gone expire by themselves. Starts on demand from `orch`, or as a user service (`contrib/orchd.service`).
 - **`orch`**, the CLI and the TUI (`ratatui`; mouse and touch: tap a pane or a tab, `+` for a new tab, `☰` for
   the workspace list). Panes: `new`, `ls`, `attach`, `send`, `read` (`--unwrapped` joins soft-wrapped
   rows), `kill`, `focus`, `auto-continue`; layout: `ws` and `tab`

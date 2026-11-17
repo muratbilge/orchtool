@@ -1,5 +1,15 @@
 # Status
 
+## 2026-11-17 — P7: the layout survives an unplanned stop — Claude (Opus, standing in for Codex)
+
+orchd now keeps `autosave.json` (restore.json format, 0600, atomic) next to its socket: 2 s after a layout
+change, every 60 s otherwise, skipped when unchanged; a final save on SIGTERM/SIGINT before `kill_all`. Start-up:
+`restore.json` (planned restart, wins and removes the autosave), else the autosave, moved to
+`autosave.json.restoring` while it is restored; a marker found at start-up → kept as `autosave.json.failed`, no
+restore. Plain `stop-daemon` removes the autosave. Recovered agents that were working get `RECOVERY_NOTE`, the bus
+summary says "recovered after an unplanned stop". New tests in `crates/orchd/tests/autosave.rs`. Not installed;
+the live orchd needs an install + one planned restart (see the untracked CODEX-REVIEW-P7-RESULT.md).
+
 ## 2026-11-11 — Codex's update menu is skipped automatically — Claude
 
 After today's restart both Codex panes sat at Codex's "Update available" menu (it comes before

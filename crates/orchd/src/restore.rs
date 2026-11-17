@@ -19,6 +19,28 @@ const CHECK_EVERY: Duration = Duration::from_millis(250);
 const ENTER_AFTER: Duration = Duration::from_millis(300);
 pub const RESTART_NOTE: &str = "orchd was restarted while you were working (orch stop-daemon --restart); \
 the restart is done. Your last tool call was interrupted: check its outcome, then continue where you stopped.";
+/// For agents that were working when orchd (or the whole machine) stopped without warning.
+pub const RECOVERY_NOTE: &str = "orchd or the machine stopped unexpectedly while you were working; orchd has \
+brought your pane back. Your last tool call and any background work (running commands, subagents) were lost: \
+check their outcome, then continue where you stopped.";
+
+/// Where a restored layout came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    /// `restore.json`, written by `orch stop-daemon --restart`.
+    Restart,
+    /// `autosave.json`, after orchd or the machine stopped without a planned restart.
+    Recovery,
+}
+
+impl Source {
+    fn note(self) -> &'static str {
+        match self {
+            Source::Restart => RESTART_NOTE,
+            Source::Recovery => RECOVERY_NOTE,
+        }
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Saved {
@@ -59,7 +81,7 @@ fn should_continue(agent: Option<&str>, status: Detected, asking: bool) -> bool 
 }
 
 /// One attempt per restored pane. Never turn a timeout, dialog or limit into permission to type.
-async fn continue_restored(pane: Arc<Pane>, name: String) -> Option<String> {
+async fn continue_restored(pane: Arc<Pane>, name: String, note: &'static str) -> Option<String> {
     let deadline = tokio::time::Instant::now() + READY_TIMEOUT;
     loop {
         match pane.detect() {
@@ -77,7 +99,7 @@ async fn continue_restored(pane: Arc<Pane>, name: String) -> Option<String> {
         tokio::time::sleep(CHECK_EVERY).await;
     }
     // The same text / pause / CR path as limits.rs. Recheck readiness before Enter as well.
-    if !pane.write(RESTART_NOTE.as_bytes().to_vec()) {
+    if !pane.write(note.as_bytes().to_vec()) {
         return None;
     }
     tokio::time::sleep(ENTER_AFTER).await;
@@ -203,6 +225,11 @@ pub fn restart_spec(sp: &SavedPane) -> (Vec<String>, Vec<(String, String)>) {
 /// Run when saving and again when restoring, so a snapshot written by an older orchd (which
 /// has no flag) is treated the same.
 pub fn mark_sole_codex(panes: &mut HashMap<String, SavedPane>) {
+    mark_sole_codex_logged(panes, true)
+}
+
+/// `log`: the autosave runs every minute and must not repeat the explanation each time.
+fn mark_sole_codex_logged(panes: &mut HashMap<String, SavedPane>, log: bool) {
     let codex = |sp: &SavedPane| sp.agent.as_deref() == Some("codex");
     let unknown: Vec<(String, String)> = panes
         .iter()
@@ -215,7 +242,8 @@ pub fn mark_sole_codex(panes: &mut HashMap<String, SavedPane>) {
             .filter(|sp| codex(sp) && sp.cwd == cwd)
             .count()
             == 1;
-        eprintln!(
+        if log {
+            eprintln!(
             "orchd: {id}: no verified Codex session id (needs codex --no-daemon + the SessionStart hook); {}",
             if sole {
                 "only Codex pane in its folder: an id on its command line, else resume --last"
@@ -223,6 +251,7 @@ pub fn mark_sole_codex(panes: &mut HashMap<String, SavedPane>) {
                 "other Codex panes share its folder: an id on its command line, else the picker"
             }
         );
+        }
         if let Some(sp) = panes.get_mut(&id) {
             sp.sole_codex_in_cwd = sole;
         }
@@ -261,6 +290,27 @@ pub fn restart_argv(argv: &[String]) -> Vec<String> {
     }
 }
 
+/// The snapshot as written: the same layout always gives the same bytes (sorted keys), so an
+/// unchanged autosave is recognised and not written again.
+pub fn layout_bytes(saved: &Saved) -> serde_json::Result<Vec<u8>> {
+    serde_json::to_vec_pretty(&serde_json::to_value(saved)?)
+}
+
+/// tmp file (0600) + fsync + rename: a reader sees the old file or the new one, never half.
+pub fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let tmp = path.with_extension("json.new");
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&tmp)?;
+    std::io::Write::write_all(&mut f, data)?;
+    f.sync_all()?;
+    std::fs::rename(&tmp, path)
+}
+
 fn map_node(n: &Node, ids: &HashMap<String, String>) -> Node {
     match n {
         Node::Pane { pane } => Node::Pane {
@@ -278,6 +328,11 @@ fn map_node(n: &Node, ids: &HashMap<String, String>) -> Node {
 impl Daemon {
     /// The layout and its panes as they are now.
     pub fn snapshot_layout(&self) -> Saved {
+        self.snapshot(true)
+    }
+
+    /// `log`: explain panes without a verified Codex id (not for the autosave, every minute).
+    pub(crate) fn snapshot(&self, log: bool) -> Saved {
         let session = self.session.lock().unwrap().clone();
         let mut panes = HashMap::new();
         let agents = self.bus.agents().unwrap_or_default();
@@ -338,28 +393,17 @@ impl Daemon {
                 },
             );
         }
-        mark_sole_codex(&mut panes);
+        mark_sole_codex_logged(&mut panes, log);
         Saved { session, panes }
     }
 
     pub fn save_layout(&self, path: &Path) -> std::io::Result<()> {
-        use std::os::unix::fs::OpenOptionsExt;
-        let data = serde_json::to_vec_pretty(&self.snapshot_layout())?;
-        let tmp = path.with_extension("json.new");
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp)?;
-        std::io::Write::write_all(&mut f, &data)?;
-        f.sync_all()?;
-        std::fs::rename(&tmp, path)
+        write_atomic(path, &layout_bytes(&self.snapshot_layout())?)
     }
 
     /// Recreates a saved layout with new panes. Panes whose program can't start are left out
     /// (their tab / workspace collapses if nothing is left). Returns how many came back.
-    pub fn restore_layout(self: &Arc<Self>, mut saved: Saved) -> usize {
+    pub fn restore_layout(self: &Arc<Self>, mut saved: Saved, source: Source) -> usize {
         mark_sole_codex(&mut saved.panes);
         let mut ids: HashMap<String, String> = HashMap::new();
         let mut resumed = 0;
@@ -448,7 +492,7 @@ impl Daemon {
         tokio::spawn(async move {
             let mut jobs = tokio::task::JoinSet::new();
             for (pane, name) in pending {
-                jobs.spawn(continue_restored(pane, name));
+                jobs.spawn(continue_restored(pane, name, source.note()));
             }
             let mut nudged = Vec::new();
             while let Some(result) = jobs.join_next().await {
@@ -462,8 +506,12 @@ impl Daemon {
             } else {
                 format!(" ({})", nudged.join(", "))
             };
+            let what = match source {
+                Source::Restart => "restart",
+                Source::Recovery => "recovered after an unplanned stop",
+            };
             let text = format!(
-                "restart: resumed {resumed} agents, nudged {} that were working{names}",
+                "{what}: resumed {resumed} agents, nudged {} that were working{names}",
                 nudged.len()
             );
             if let Err(e) = daemon

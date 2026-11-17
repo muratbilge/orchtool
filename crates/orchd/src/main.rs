@@ -70,34 +70,34 @@ async fn main() -> anyhow::Result<()> {
     start_nudger(Arc::clone(&daemon));
     orchd::ui::start_detector(Arc::clone(&daemon));
     orchd::limits::start(Arc::clone(&daemon));
-    // After a restart: the layout the previous orchd saved, with fresh panes.
-    let restore = dir.join("restore.json");
-    let _ = daemon.restore_path.set(restore.clone());
-    if let Ok(data) = std::fs::read(&restore) {
-        // Read once: a layout that makes orchd fail must not come back on every start.
-        let _ = std::fs::remove_file(&restore);
-        match serde_json::from_slice::<orchd::restore::Saved>(&data) {
-            Ok(saved) => {
-                let n = daemon.restore_layout(saved);
-                eprintln!("orchd: restored the layout with {n} pane(s)");
-            }
-            Err(e) => eprintln!("orchd: ignoring {}: {e}", restore.display()),
-        }
-    }
-    orchd::tasks::start(Arc::clone(&daemon));
-    let server = tokio::spawn(serve(listener, Arc::clone(&daemon)));
+    // Before the restore: a SIGTERM while it runs waits for it (then saves the restored
+    // layout) instead of killing orchd half-way, which would leave the loop-guard marker.
     let mut term = signal(SignalKind::terminate())?;
     let mut int = signal(SignalKind::interrupt())?;
     let mut hup = signal(SignalKind::hangup())?;
-    loop {
+    // After a restart (restore.json) or an unplanned stop (autosave.json): the layout the
+    // previous orchd saved, with fresh panes. Autosaving starts only once that is done.
+    let _ = daemon.restore_path.set(dir.join("restore.json"));
+    daemon.autosave.set_path(dir.join(orchd::autosave::FILE));
+    orchd::autosave::restore_at_start(&daemon, &dir);
+    orchd::autosave::start(Arc::clone(&daemon));
+    orchd::tasks::start(Arc::clone(&daemon));
+    let server = tokio::spawn(serve(listener, Arc::clone(&daemon)));
+    let signalled = loop {
         tokio::select! {
-            _ = daemon.shutdown.notified() => break,
-            _ = term.recv() => break,
-            _ = int.recv() => break,
+            // `stop-daemon`: restore.json is saved (--restart) or the autosave removed.
+            _ = daemon.shutdown.notified() => break false,
+            _ = term.recv() => break true,
+            _ = int.recv() => break true,
             // Survive the controlling terminal going away (SSH logout).
             _ = hup.recv() => continue,
         }
+    };
+    // A VM shutdown / reboot: saved while the panes still run, like `--restart` does.
+    if signalled {
+        daemon.autosave_final().await;
     }
+    daemon.autosave.close();
     eprintln!("orchd: stopping, killing panes");
     // The socket goes first: from now on a client finds no orchd and starts a new one, and
     // this one never touches the path again (it would unlink the new orchd's socket).

@@ -46,6 +46,8 @@ pub struct Daemon {
     pub shutdown: Notify,
     /// Where `daemon.stop` with `restart` saves the layout for the next orchd (set by main).
     pub restore_path: std::sync::OnceLock<std::path::PathBuf>,
+    /// The layout kept on disk for an unplanned stop (`autosave.json`, set by main).
+    pub autosave: crate::autosave::Autosave,
 }
 
 #[derive(Debug)]
@@ -79,6 +81,7 @@ impl Daemon {
             scrollback,
             shutdown: Notify::new(),
             restore_path: Default::default(),
+            autosave: Default::default(),
         })
     }
 
@@ -395,6 +398,9 @@ impl Daemon {
                     self.save_layout(path).map_err(|e| {
                         err("save_failed", format!("saving the layout failed: {e}"))
                     })?;
+                } else {
+                    // "End everything": the next orchd starts empty.
+                    self.autosave.forget();
                 }
                 self.shutdown.notify_one();
                 Ok(json!({ "stopping": true }))
