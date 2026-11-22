@@ -6,7 +6,9 @@
 use crate::detect::{self, Detected};
 use crate::pane::Pane;
 use crate::server::Daemon;
+use orch_proto::api::{AgentRow, QuestionRow};
 use orch_proto::api::{NewPane, HUMAN};
+use orch_proto::layout::Workspace;
 use orch_proto::layout::{Node, Session};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -48,33 +50,8 @@ pub struct Saved {
     pub panes: HashMap<String, SavedPane>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SavedPane {
-    pub argv: Vec<String>,
-    pub cwd: String,
-    pub rows: u16,
-    pub cols: u16,
-    #[serde(default)]
-    pub name: Option<String>,
-    /// The agent seen in the pane (claude / codex), also when it was started inside a shell.
-    #[serde(default)]
-    pub agent: Option<String>,
-    /// Its name on the bus: the restarted agent takes it again (unread mail, open questions).
-    #[serde(default)]
-    pub bus_name: Option<String>,
-    /// Positive screen detection at save time; old snapshots never opt into automatic input.
-    #[serde(default)]
-    pub was_working: bool,
-    #[serde(default)]
-    pub session_id: Option<String>,
-    /// Actual agent argv, including an agent launched interactively inside a shell.
-    #[serde(default)]
-    pub agent_argv: Option<Vec<String>>,
-    /// A Codex pane without a known conversation that was the only Codex pane in its folder:
-    /// `codex resume --last` (per folder) can only mean this one, so nobody has to pick.
-    #[serde(default)]
-    pub sole_codex_in_cwd: bool,
-}
+/// Defined in orch-proto: a sleeping workspace in the layout carries the same record.
+pub use orch_proto::layout::SavedPane;
 
 fn should_continue(agent: Option<&str>, status: Detected, asking: bool) -> bool {
     matches!(agent, Some("claude" | "codex")) && status == Detected::Working && !asking
@@ -110,6 +87,11 @@ async fn continue_restored(pane: Arc<Pane>, name: String, note: &'static str) ->
 }
 
 const SHELLS: [&str; 5] = ["bash", "zsh", "sh", "fish", "dash"];
+
+/// A shell (bash, zsh, …) by its program path.
+pub(crate) fn is_shell(argv0: &str) -> bool {
+    SHELLS.contains(&base(argv0))
+}
 
 fn base(p: &str) -> &str {
     Path::new(p)
@@ -325,94 +307,87 @@ fn map_node(n: &Node, ids: &HashMap<String, String>) -> Node {
     }
 }
 
+/// What runs in one pane now, enough to start it again. `questions`: `None` when the bus could
+/// not be read (then an agent counts as asking: fail closed, no automatic input later).
+pub(crate) fn saved_pane(
+    p: &Pane,
+    agents: &[AgentRow],
+    questions: Option<&[QuestionRow]>,
+) -> SavedPane {
+    // The folder the program is in now (a shell may have cd'ed), else where it started.
+    let cwd = p
+        .pid
+        .and_then(|pid| std::fs::read_link(format!("/proc/{pid}/cwd")).ok())
+        .map(|c| c.to_string_lossy().into_owned())
+        .filter(|c| !c.ends_with(" (deleted)"))
+        .unwrap_or_else(|| p.cwd.clone());
+    let (rows, cols) = p.size();
+    let bus_name = agents
+        .iter()
+        .find(|a| a.pane.as_deref() == Some(format!("orch:{}", p.id).as_str()))
+        .map(|a| a.name.clone());
+    let screen = p.visible_text();
+    let agent = p.agent(&screen);
+    let asking = questions.is_none_or(|qs| qs.iter().any(|q| Some(&q.from) == bus_name.as_ref()));
+    let was_working = should_continue(
+        agent.as_deref(),
+        detect::detect(&screen, agent.as_deref()),
+        asking,
+    );
+    let process = agent.as_deref().and_then(|kind| {
+        crate::conversation::discover(
+            Path::new("/proc"),
+            p.pid?,
+            &crate::conversation::host_home()?,
+            kind,
+        )
+    });
+    let session_id = process
+        .as_ref()
+        .and_then(|p| p.session_id.clone())
+        .or_else(|| agent.as_deref().and_then(|k| p.session_id(k)));
+    SavedPane {
+        argv: p.argv.clone(),
+        cwd,
+        rows,
+        cols,
+        name: p.name.clone(),
+        agent,
+        bus_name,
+        was_working,
+        session_id,
+        agent_argv: process.map(|p| p.argv),
+        sole_codex_in_cwd: false,
+    }
+}
+
+/// Panes started again for saved workspaces (restore and wake share this).
+pub(crate) struct Spawned {
+    /// The workspaces with their new pane ids; panes that did not come back are left out
+    /// (a tab / workspace without any is gone).
+    pub workspaces: Vec<Workspace>,
+    /// old pane id → new pane
+    pub ids: HashMap<String, Arc<Pane>>,
+    pub failed: Vec<String>,
+    /// Agents (claude / codex) started again.
+    pub resumed: usize,
+}
+
 impl Daemon {
-    /// The layout and its panes as they are now.
-    pub fn snapshot_layout(&self) -> Saved {
-        self.snapshot(true)
-    }
-
-    /// `log`: explain panes without a verified Codex id (not for the autosave, every minute).
-    pub(crate) fn snapshot(&self, log: bool) -> Saved {
-        let session = self.session.lock().unwrap().clone();
-        let mut panes = HashMap::new();
-        let agents = self.bus.agents().unwrap_or_default();
-        // If the bus cannot be read, fail closed rather than continuing a pending human ask.
-        let questions = self.bus.questions(false).ok();
-        for p in self.all_panes() {
-            if p.exit_code().is_some() {
-                continue;
-            }
-            // The folder the program is in now (a shell may have cd'ed), else where it started.
-            let cwd = p
-                .pid
-                .and_then(|pid| std::fs::read_link(format!("/proc/{pid}/cwd")).ok())
-                .map(|c| c.to_string_lossy().into_owned())
-                .filter(|c| !c.ends_with(" (deleted)"))
-                .unwrap_or_else(|| p.cwd.clone());
-            let (rows, cols) = p.size();
-            let bus_name = agents
-                .iter()
-                .find(|a| a.pane.as_deref() == Some(format!("orch:{}", p.id).as_str()))
-                .map(|a| a.name.clone());
-            let screen = p.visible_text();
-            let agent = p.agent(&screen);
-            let asking = questions
-                .as_ref()
-                .is_none_or(|qs| qs.iter().any(|q| Some(&q.from) == bus_name.as_ref()));
-            let was_working = should_continue(
-                agent.as_deref(),
-                detect::detect(&screen, agent.as_deref()),
-                asking,
-            );
-            let process = agent.as_deref().and_then(|kind| {
-                crate::conversation::discover(
-                    Path::new("/proc"),
-                    p.pid?,
-                    &crate::conversation::host_home()?,
-                    kind,
-                )
-            });
-            let session_id = process
-                .as_ref()
-                .and_then(|p| p.session_id.clone())
-                .or_else(|| agent.as_deref().and_then(|k| p.session_id(k)));
-            panes.insert(
-                p.id.clone(),
-                SavedPane {
-                    argv: p.argv.clone(),
-                    cwd,
-                    rows,
-                    cols,
-                    name: p.name.clone(),
-                    agent,
-                    bus_name,
-                    was_working,
-                    session_id,
-                    agent_argv: process.map(|p| p.argv),
-                    sole_codex_in_cwd: false,
-                },
-            );
-        }
-        mark_sole_codex_logged(&mut panes, log);
-        Saved { session, panes }
-    }
-
-    pub fn save_layout(&self, path: &Path) -> std::io::Result<()> {
-        write_atomic(path, &layout_bytes(&self.snapshot_layout())?)
-    }
-
-    /// Recreates a saved layout with new panes. Panes whose program can't start are left out
-    /// (their tab / workspace collapses if nothing is left). Returns how many came back.
-    pub fn restore_layout(self: &Arc<Self>, mut saved: Saved, source: Source) -> usize {
-        mark_sole_codex(&mut saved.panes);
-        let mut ids: HashMap<String, String> = HashMap::new();
+    /// Starts every pane of `workspaces` again from `panes` (keyed by the old pane ids) and
+    /// maps the layout onto the new panes. Running tasks follow their pane.
+    pub(crate) fn spawn_saved(
+        &self,
+        workspaces: Vec<Workspace>,
+        panes: &HashMap<String, SavedPane>,
+    ) -> Spawned {
+        let mut ids: HashMap<String, Arc<Pane>> = HashMap::new();
         let mut resumed = 0;
-        let mut pending = Vec::new();
         let mut failed: Vec<String> = Vec::new();
-        for ws in &saved.session.workspaces {
+        for ws in &workspaces {
             for tab in &ws.tabs {
                 for old in tab.root.panes() {
-                    let Some(sp) = saved.panes.get(&old) else {
+                    let Some(sp) = panes.get(&old) else {
                         failed.push(old);
                         continue;
                     };
@@ -440,21 +415,11 @@ impl Daemon {
                         Ok(p) => {
                             if matches!(sp.agent.as_deref(), Some("claude" | "codex")) {
                                 resumed += 1;
-                                if sp.was_working {
-                                    let name = sp
-                                        .bus_name
-                                        .clone()
-                                        .or_else(|| sp.name.clone())
-                                        .unwrap_or_else(|| {
-                                            format!("{} in {}", sp.agent.as_deref().unwrap(), p.id)
-                                        });
-                                    pending.push((Arc::clone(&p), name));
-                                }
                             }
                             if let Err(e) = self.bus.task_rebind(&old, &p.id) {
                                 eprintln!("orchd: task rebind: {e:#}");
                             }
-                            ids.insert(old, p.id.clone());
+                            ids.insert(old, p);
                         }
                         Err(e) => {
                             eprintln!("orchd: restore {old}: {}", e.message);
@@ -464,11 +429,16 @@ impl Daemon {
                 }
             }
         }
-        let mut session = saved.session;
+        let new_ids: HashMap<String, String> =
+            ids.iter().map(|(o, p)| (o.clone(), p.id.clone())).collect();
+        let mut session = Session {
+            workspaces,
+            ..Default::default()
+        };
         for ws in &mut session.workspaces {
             for tab in &mut ws.tabs {
-                tab.root = map_node(&tab.root, &ids);
-                tab.focus = ids.get(&tab.focus).cloned().unwrap_or_default();
+                tab.root = map_node(&tab.root, &new_ids);
+                tab.focus = new_ids.get(&tab.focus).cloned().unwrap_or_default();
             }
         }
         // Gaps of panes that didn't come back: removed like closed panes.
@@ -480,6 +450,62 @@ impl Daemon {
                 }
             }
         }
+        Spawned {
+            workspaces: session.workspaces,
+            ids,
+            failed,
+            resumed,
+        }
+    }
+
+    /// The layout and its panes as they are now.
+    pub fn snapshot_layout(&self) -> Saved {
+        self.snapshot(true)
+    }
+
+    /// `log`: explain panes without a verified Codex id (not for the autosave, every minute).
+    pub(crate) fn snapshot(&self, log: bool) -> Saved {
+        let session = self.session.lock().unwrap().clone();
+        let mut panes = HashMap::new();
+        let agents = self.bus.agents().unwrap_or_default();
+        // If the bus cannot be read, fail closed rather than continuing a pending human ask.
+        let questions = self.bus.questions(false).ok();
+        for p in self.all_panes() {
+            if p.exit_code().is_some() {
+                continue;
+            }
+            panes.insert(p.id.clone(), saved_pane(&p, &agents, questions.as_deref()));
+        }
+        mark_sole_codex_logged(&mut panes, log);
+        Saved { session, panes }
+    }
+
+    pub fn save_layout(&self, path: &Path) -> std::io::Result<()> {
+        write_atomic(path, &layout_bytes(&self.snapshot_layout())?)
+    }
+
+    /// Recreates a saved layout with new panes. Panes whose program can't start are left out
+    /// (their tab / workspace collapses if nothing is left). Returns how many came back.
+    pub fn restore_layout(self: &Arc<Self>, mut saved: Saved, source: Source) -> usize {
+        mark_sole_codex(&mut saved.panes);
+        let mut session = saved.session;
+        let had_panes = !session.workspaces.is_empty();
+        let spawned = self.spawn_saved(std::mem::take(&mut session.workspaces), &saved.panes);
+        let resumed = spawned.resumed;
+        let mut pending = Vec::new();
+        for (old, p) in &spawned.ids {
+            let sp = &saved.panes[old];
+            if matches!(sp.agent.as_deref(), Some("claude" | "codex")) && sp.was_working {
+                let name = sp
+                    .bus_name
+                    .clone()
+                    .or_else(|| sp.name.clone())
+                    .unwrap_or_else(|| format!("{} in {}", sp.agent.as_deref().unwrap(), p.id));
+                pending.push((Arc::clone(p), name));
+            }
+        }
+        let count = spawned.ids.len();
+        session.workspaces = spawned.workspaces;
         session.raised = None;
         {
             let mut s = self.session.lock().unwrap();
@@ -488,6 +514,10 @@ impl Daemon {
         }
         let _ = self.ui_events.send(crate::ui::UiEvent::Session);
         let _ = self.ui_events.send(crate::ui::UiEvent::Panes);
+        // Only sleeping workspaces were saved (a plain stop-daemon keeps them): nothing to report.
+        if !had_panes {
+            return count;
+        }
         let daemon = Arc::clone(self);
         tokio::spawn(async move {
             let mut jobs = tokio::task::JoinSet::new();
@@ -521,7 +551,7 @@ impl Daemon {
                 eprintln!("orchd: restart summary: {e}");
             }
         });
-        ids.len()
+        count
     }
 }
 

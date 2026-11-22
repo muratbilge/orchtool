@@ -2,6 +2,7 @@
 //! layout and a detach never loses it); clients render it and ask orchd for changes.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -55,6 +56,82 @@ pub struct Session {
     /// The last `Raise`: TUIs switch to this workspace when `seq` grows.
     #[serde(default)]
     pub raised: Option<Raised>,
+    /// Workspaces put to sleep (`orch ws sleep`): their programs ended; what is needed to bring
+    /// them back is kept here, so it travels with the layout through `restore.json` and
+    /// `autosave.json` and a sleeping workspace stays asleep across an orchd restart or crash.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sleeping: Vec<Sleeping>,
+}
+
+/// What ran in a pane, enough to start it again: written for `orch stop-daemon --restart`,
+/// the autosave and a sleeping workspace.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SavedPane {
+    pub argv: Vec<String>,
+    pub cwd: String,
+    pub rows: u16,
+    pub cols: u16,
+    #[serde(default)]
+    pub name: Option<String>,
+    /// The agent seen in the pane (claude / codex), also when it was started inside a shell.
+    #[serde(default)]
+    pub agent: Option<String>,
+    /// Its name on the bus: the restarted agent takes it again (unread mail, open questions).
+    #[serde(default)]
+    pub bus_name: Option<String>,
+    /// Positive screen detection at save time; old snapshots never opt into automatic input.
+    #[serde(default)]
+    pub was_working: bool,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// Actual agent argv, including an agent launched interactively inside a shell.
+    #[serde(default)]
+    pub agent_argv: Option<Vec<String>>,
+    /// A Codex pane without a known conversation that was the only Codex pane in its folder:
+    /// `codex resume --last` (per folder) can only mean this one, so nobody has to pick.
+    #[serde(default)]
+    pub sole_codex_in_cwd: bool,
+}
+
+/// A workspace that is asleep. `workspace` keeps its id, label, tab ids, splits and sizes;
+/// its pane ids are those of the ended panes (they never come back: pane ids don't repeat).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Sleeping {
+    pub workspace: Workspace,
+    /// Its place among the workspaces when it was put to sleep (it wakes up there again).
+    pub position: usize,
+    /// When it was put to sleep (unix ms).
+    pub slept_ms: i64,
+    /// Old pane id → how to bring it back.
+    pub panes: HashMap<String, SleptPane>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SleptPane {
+    #[serde(flatten)]
+    pub saved: SavedPane,
+    /// The agent was paused on its usage limit; the reset time (unix seconds) when known.
+    #[serde(default)]
+    pub limited: bool,
+    #[serde(default)]
+    pub limit_reset: Option<i64>,
+    /// `orch auto-continue` for the pane (on unless it was switched off).
+    #[serde(default = "yes")]
+    pub auto_continue: bool,
+    /// Put to sleep with `--force` while it was busy (working, a dialog, a question, a task):
+    /// it gets a note on wake that its turn was interrupted.
+    #[serde(default)]
+    pub interrupted: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+impl Sleeping {
+    pub fn agents(&self) -> impl Iterator<Item = &SleptPane> {
+        self.panes.values().filter(|p| p.saved.agent.is_some())
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -289,6 +366,22 @@ impl Session {
             .iter()
             .find(|w| w.id == key)
             .or_else(|| self.workspaces.iter().find(|w| w.label == key))
+    }
+
+    /// A sleeping workspace by id, else by label.
+    pub fn sleeping(&self, key: &str) -> Option<&Sleeping> {
+        self.sleeping
+            .iter()
+            .find(|s| s.workspace.id == key)
+            .or_else(|| self.sleeping.iter().find(|s| s.workspace.label == key))
+    }
+
+    /// Labels stay unique across awake and sleeping workspaces (task targets use them).
+    pub fn label_taken(&self, label: &str, except_id: Option<&str>) -> bool {
+        self.workspaces
+            .iter()
+            .chain(self.sleeping.iter().map(|s| &s.workspace))
+            .any(|w| w.label == label && Some(w.id.as_str()) != except_id)
     }
 
     pub fn workspace_mut(&mut self, key: &str) -> Option<&mut Workspace> {

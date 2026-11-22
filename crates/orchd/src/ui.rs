@@ -38,7 +38,10 @@ impl Daemon {
     }
 
     /// Apply a change to the session and announce it.
-    fn edit<R>(&self, f: impl FnOnce(&mut Session) -> Result<R, ApiError>) -> Result<R, ApiError> {
+    pub(crate) fn edit<R>(
+        &self,
+        f: impl FnOnce(&mut Session) -> Result<R, ApiError>,
+    ) -> Result<R, ApiError> {
         let r = {
             let mut s = self.session.lock().unwrap();
             let r = f(&mut s)?;
@@ -65,7 +68,7 @@ impl Daemon {
     fn unique_label(s: &Session, base: &str) -> String {
         let mut label = base.to_string();
         let mut n = 1;
-        while s.workspaces.iter().any(|w| w.label == label) {
+        while s.label_taken(&label, None) {
             n += 1;
             label = format!("{base}-{n}");
         }
@@ -152,7 +155,7 @@ impl Daemon {
         Ok(())
     }
 
-    pub async fn ui_op(&self, op: UiOp) -> Result<Value, ApiError> {
+    pub async fn ui_op(self: &Arc<Self>, op: UiOp) -> Result<Value, ApiError> {
         let mut created: Option<PaneInfo> = None;
         match op {
             UiOp::NewWorkspace { label, spawn } => {
@@ -232,6 +235,27 @@ impl Daemon {
                 };
                 self.close_panes(panes).await?;
             }
+            UiOp::CloseWorkspace { workspace } if self.forget_sleeping(&workspace)? => {}
+            UiOp::SleepWorkspace {
+                workspace,
+                force,
+                dry_run,
+            } => {
+                // In its own task: when the caller's own pane is in the workspace, its
+                // connection drops half-way and the sleep must still finish.
+                let d = Arc::clone(self);
+                return tokio::spawn(
+                    async move { d.sleep_workspace(&workspace, force, dry_run).await },
+                )
+                .await
+                .map_err(|e| err("bus", e.to_string()))?;
+            }
+            UiOp::WakeWorkspace { workspace } => {
+                let d = Arc::clone(self);
+                return tokio::spawn(async move { d.wake_workspace(&workspace).await })
+                    .await
+                    .map_err(|e| err("bus", e.to_string()))?;
+            }
             UiOp::CloseWorkspace { workspace } => {
                 let panes: Vec<String> = {
                     let s = self.session.lock().unwrap();
@@ -274,10 +298,8 @@ impl Daemon {
                 Ok(())
             })?,
             UiOp::RenameWorkspace { workspace, label } => self.edit(|s| {
-                if s.workspaces
-                    .iter()
-                    .any(|w| w.label == label && w.id != workspace)
-                {
+                let id = s.workspace(&workspace).map(|w| w.id.clone());
+                if s.label_taken(&label, id.as_deref().or(Some(&workspace))) {
                     return Err(err("label_taken", label.clone()));
                 }
                 s.workspace_mut(&workspace)

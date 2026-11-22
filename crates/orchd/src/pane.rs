@@ -352,6 +352,20 @@ impl Pane {
         detect::detect(&text, self.agent(&text).as_deref())
     }
 
+    /// A job the pane's shell runs in the foreground (a build, an editor): its process group
+    /// leader's pid and name. `None` when the pane's own program is in the foreground.
+    pub fn foreground_job(&self) -> Option<(u32, String)> {
+        let leader = self.master.lock().unwrap().process_group_leader()?;
+        let leader = u32::try_from(leader).ok()?;
+        if Some(leader) == self.pid {
+            return None;
+        }
+        let name = std::fs::read_to_string(format!("/proc/{leader}/comm"))
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|_| format!("pid {leader}"));
+        Some((leader, name))
+    }
+
     /// The visible screen text.
     pub fn visible_text(&self) -> String {
         self.term.lock().unwrap().visible_text()

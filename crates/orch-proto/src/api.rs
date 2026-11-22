@@ -239,6 +239,33 @@ pub enum UiOp {
     Raise {
         pane: String,
     },
+    /// Put a workspace to sleep: its layout and how to resume each agent are kept, then its
+    /// programs end. Refused (`ws_busy`) while something in it is busy, unless `force`.
+    /// `dry_run` only reports the plan. Replies `{session, plan, slept}`.
+    SleepWorkspace {
+        workspace: String,
+        #[serde(default)]
+        force: bool,
+        #[serde(default)]
+        dry_run: bool,
+    },
+    /// Bring a sleeping workspace back: the layout is recreated, agents resume.
+    /// Replies `{session, workspace, panes, failed}`.
+    WakeWorkspace {
+        workspace: String,
+    },
+}
+
+/// What putting a workspace to sleep would do: `blockers` refuse it unless forced (work that
+/// would be interrupted or lost), `notes` say how each pane comes back.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SleepPlan {
+    pub workspace: String,
+    pub label: String,
+    #[serde(default)]
+    pub blockers: Vec<String>,
+    #[serde(default)]
+    pub notes: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

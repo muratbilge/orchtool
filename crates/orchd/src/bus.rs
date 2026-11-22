@@ -485,9 +485,11 @@ impl Bus {
     }
 
     /// Retire questions whose orch pane is gone, or whose agent has been silent for six hours.
+    /// Panes in `asleep` (sleeping workspaces) count as live and never go stale.
     pub fn expire_questions(
         &self,
         live: &std::collections::HashSet<String>,
+        asleep: &std::collections::HashSet<String>,
         now: i64,
     ) -> Result<usize> {
         let db = self.db.lock().unwrap();
@@ -509,6 +511,9 @@ impl Bus {
         };
         let mut expired = Vec::new();
         for (id, pane, seen) in rows {
+            if pane.as_ref().is_some_and(|p| asleep.contains(p)) {
+                continue;
+            }
             if now.saturating_sub(seen) > 6 * 3600 * 1000
                 || pane
                     .as_deref()
@@ -1037,18 +1042,27 @@ mod expiration_tests {
         let live = HashSet::from(["orch:p1".to_string()]);
         let now = bus.agents().unwrap()[0].last_seen_ms;
         assert_eq!(
-            bus.expire_questions(&live, now + 6 * 3600 * 1000).unwrap(),
+            bus.expire_questions(&live, &HashSet::new(), now + 6 * 3600 * 1000)
+                .unwrap(),
             0
         );
         assert_eq!(
-            bus.expire_questions(&live, now + 6 * 3600 * 1000 + 1)
+            bus.expire_questions(&live, &HashSet::new(), now + 6 * 3600 * 1000 + 1)
                 .unwrap(),
             1
         );
         assert_eq!(bus.question(q.id).unwrap().unwrap().state, "expired");
         let q = bus.ask("a", "again?", &[]).unwrap();
-        assert_eq!(bus.expire_questions(&HashSet::new(), now).unwrap(), 1);
+        assert_eq!(
+            bus.expire_questions(&HashSet::new(), &HashSet::new(), now)
+                .unwrap(),
+            1
+        );
         assert_eq!(bus.question(q.id).unwrap().unwrap().state, "expired");
-        assert_eq!(bus.expire_questions(&HashSet::new(), now).unwrap(), 0);
+        assert_eq!(
+            bus.expire_questions(&HashSet::new(), &HashSet::new(), now)
+                .unwrap(),
+            0
+        );
     }
 }

@@ -186,14 +186,20 @@ impl Daemon {
             .filter(|p| p.exit_code().is_none())
             .map(|p| format!("orch:{}", p.id))
             .collect();
+        // An agent in a sleeping workspace keeps its questions: answered, they wait for it.
+        let asleep = self
+            .asleep_panes()
+            .into_iter()
+            .map(|p| format!("orch:{p}"))
+            .collect();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as i64;
-        self.bus.expire_questions(&live, now)
+        self.bus.expire_questions(&live, &asleep, now)
     }
 
-    async fn handle(&self, req: Request) -> Result<Value, ApiError> {
+    async fn handle(self: &Arc<Self>, req: Request) -> Result<Value, ApiError> {
         match req {
             Request::ReportSession {
                 pane,
@@ -400,8 +406,10 @@ impl Daemon {
                         err("save_failed", format!("saving the layout failed: {e}"))
                     })?;
                 } else {
-                    // "End everything": the next orchd starts empty.
+                    // "End everything": the next orchd starts empty, except for sleeping
+                    // workspaces: they were put away to come back later.
                     self.autosave.forget();
+                    self.keep_sleeping();
                 }
                 self.shutdown.notify_one();
                 Ok(json!({ "stopping": true }))

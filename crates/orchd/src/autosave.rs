@@ -128,7 +128,7 @@ impl Autosave {
 
 impl Daemon {
     /// Takes a snapshot and writes it if it changed. Blocking (reads /proc and the bus).
-    fn autosave_now(&self, close: bool) {
+    pub(crate) fn autosave_now(&self, close: bool) {
         let a = &self.autosave;
         if !a.enabled.load(Ordering::SeqCst) || a.closed.load(Ordering::SeqCst) {
             return;
@@ -140,6 +140,32 @@ impl Daemon {
         match crate::restore::layout_bytes(&saved) {
             Ok(data) => a.write(data, close),
             Err(e) => eprintln!("orchd: autosave: {e}"),
+        }
+    }
+
+    /// After a plain `stop-daemon` forgot the layout: an autosave with only the sleeping
+    /// workspaces (and the id counter), so the next orchd starts with no panes but keeps them.
+    pub fn keep_sleeping(&self) {
+        let session = self.session();
+        let Some(path) = self.autosave.path() else {
+            return;
+        };
+        if session.sleeping.is_empty() {
+            return;
+        }
+        let saved = crate::restore::Saved {
+            session: orch_proto::layout::Session {
+                next_id: session.next_id,
+                sleeping: session.sleeping,
+                ..Default::default()
+            },
+            panes: Default::default(),
+        };
+        let written = crate::restore::layout_bytes(&saved)
+            .map_err(std::io::Error::from)
+            .and_then(|data| crate::restore::write_atomic(path, &data));
+        if let Err(e) = written {
+            eprintln!("orchd: keeping the sleeping workspaces failed: {e}");
         }
     }
 

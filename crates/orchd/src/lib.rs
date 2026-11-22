@@ -10,6 +10,7 @@ pub mod render;
 pub mod restore;
 mod resume_argv;
 pub mod server;
+pub mod sleep;
 pub mod term;
 pub mod ui;
 pub mod watchdog;
