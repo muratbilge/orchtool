@@ -59,6 +59,8 @@ struct State {
     last: Option<Vec<u8>>,
     /// The last error logged: the same error is logged once, not every minute.
     last_err: Option<String>,
+    /// Session version of the layout last written.
+    version: u64,
 }
 
 impl Autosave {
@@ -70,25 +72,21 @@ impl Autosave {
         self.path.get().map(PathBuf::as_path)
     }
 
-    /// Writes `data` unless it is what the file already holds. `close` also ends autosaving
-    /// (the final save on a signal) in the same critical section.
-    fn write(&self, data: Vec<u8>, close: bool) {
-        let mut st = self.state.lock().unwrap();
-        let result = match self.path.get() {
-            Some(path)
-                if self.enabled.load(Ordering::SeqCst) && !self.closed.load(Ordering::SeqCst) =>
-            {
-                if st.last.as_deref() == Some(&data[..]) && path.exists() {
-                    Ok(())
-                } else {
-                    crate::restore::write_atomic(path, &data).map(|_| st.last = Some(data))
-                }
-            }
-            _ => Ok(()),
+    /// Writes `data` (the layout at session `version`) unless it is what the file already
+    /// holds. `close` also ends autosaving (the final save on a signal) in the same critical
+    /// section. A snapshot older than the one last written is dropped: snapshots are taken
+    /// before this lock, so a slow periodic one must not overwrite a newer one.
+    fn write(&self, data: Vec<u8>, version: u64, close: bool) {
+        let enabled = self.enabled.load(Ordering::SeqCst);
+        let result = if enabled {
+            self.write_checked(data, version, close)
+        } else {
+            Ok(())
         };
         if close {
             self.closed.store(true, Ordering::SeqCst);
         }
+        let mut st = self.state.lock().unwrap();
         match result {
             Ok(()) => st.last_err = None,
             Err(e) => {
@@ -99,6 +97,23 @@ impl Autosave {
                 }
             }
         }
+    }
+
+    fn write_checked(&self, data: Vec<u8>, version: u64, _close: bool) -> std::io::Result<()> {
+        let mut st = self.state.lock().unwrap();
+        let Some(path) = self.path.get() else {
+            return Ok(());
+        };
+        if self.closed.load(Ordering::SeqCst) || version < st.version {
+            return Ok(());
+        }
+        if st.last.as_deref() == Some(&data[..]) && path.exists() {
+            return Ok(());
+        }
+        crate::restore::write_atomic(path, &data)?;
+        st.last = Some(data);
+        st.version = version;
+        Ok(())
     }
 
     fn last_written(&self) -> Option<crate::restore::Saved> {
@@ -137,36 +152,26 @@ impl Daemon {
         if close {
             keep_panes_that_just_died(&mut saved, a.last_written().as_ref());
         }
+        let version = saved.session.version;
         match crate::restore::layout_bytes(&saved) {
-            Ok(data) => a.write(data, close),
+            Ok(data) => a.write(data, version, close),
             Err(e) => eprintln!("orchd: autosave: {e}"),
         }
     }
 
-    /// After a plain `stop-daemon` forgot the layout: an autosave with only the sleeping
-    /// workspaces (and the id counter), so the next orchd starts with no panes but keeps them.
-    pub fn keep_sleeping(&self) {
-        let session = self.session();
-        let Some(path) = self.autosave.path() else {
-            return;
-        };
-        if session.sleeping.is_empty() {
-            return;
+    /// The layout as it is now, written at once and confirmed (a wake commits through this):
+    /// errors come back to the caller instead of the log.
+    pub(crate) fn autosave_sync(&self) -> std::io::Result<()> {
+        let a = &self.autosave;
+        if a.closed.load(Ordering::SeqCst) {
+            return Err(std::io::Error::other("orchd is stopping"));
         }
-        let saved = crate::restore::Saved {
-            session: orch_proto::layout::Session {
-                next_id: session.next_id,
-                sleeping: session.sleeping,
-                ..Default::default()
-            },
-            panes: Default::default(),
-        };
-        let written = crate::restore::layout_bytes(&saved)
-            .map_err(std::io::Error::from)
-            .and_then(|data| crate::restore::write_atomic(path, &data));
-        if let Err(e) = written {
-            eprintln!("orchd: keeping the sleeping workspaces failed: {e}");
+        if crate::fault::on("autosave_write") {
+            return Err(std::io::Error::other("injected autosave failure"));
         }
+        let saved = self.snapshot(false);
+        let data = crate::restore::layout_bytes(&saved).map_err(std::io::Error::from)?;
+        a.write_checked(data, saved.session.version, false)
     }
 
     /// SIGTERM / SIGINT: one last snapshot while every pane still runs, then no more writes.
@@ -235,6 +240,16 @@ fn keep_panes_that_just_died(
 /// Start-up: `restore.json` from a planned restart if there is one (read once, as before),
 /// else the autosave from an unplanned stop, guarded against a restore loop.
 pub fn restore_at_start(daemon: &Arc<Daemon>, dir: &Path) {
+    // Sleeping workspaces first: they decide which saved workspaces must not come back awake.
+    let mut sleepers = daemon.load_sleepers();
+    // In the layout at once: from the first moment their panes count as asleep (their open
+    // questions must not expire while the rest starts).
+    daemon.preload_sleepers(&sleepers);
+    restore_awake(daemon, dir, &mut sleepers);
+    daemon.install_sleepers(sleepers);
+}
+
+fn restore_awake(daemon: &Arc<Daemon>, dir: &Path, sleepers: &mut crate::sleep::Sleepers) {
     let restart = dir.join("restore.json");
     let auto = dir.join(FILE);
     let marker = dir.join(RESTORING);
@@ -253,7 +268,8 @@ pub fn restore_at_start(daemon: &Arc<Daemon>, dir: &Path) {
         // The planned restart is newer than any autosave.
         let _ = std::fs::remove_file(&auto);
         match serde_json::from_slice::<crate::restore::Saved>(&data) {
-            Ok(saved) => {
+            Ok(mut saved) => {
+                daemon.reconcile_sleepers(sleepers, Some(&mut saved));
                 let n = daemon.restore_layout(saved, Source::Restart);
                 eprintln!("orchd: restored the layout with {n} pane(s) from restore.json (planned restart)");
             }
@@ -273,7 +289,8 @@ pub fn restore_at_start(daemon: &Arc<Daemon>, dir: &Path) {
         .and_then(|d| {
             serde_json::from_slice::<crate::restore::Saved>(&d).map_err(|e| e.to_string())
         }) {
-        Ok(saved) => {
+        Ok(mut saved) => {
+            daemon.reconcile_sleepers(sleepers, Some(&mut saved));
             let n = daemon.restore_layout(saved, Source::Recovery);
             let _ = std::fs::remove_file(&marker);
             eprintln!(

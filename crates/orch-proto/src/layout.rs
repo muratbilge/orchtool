@@ -91,6 +91,10 @@ pub struct SavedPane {
     /// `codex resume --last` (per folder) can only mean this one, so nobody has to pick.
     #[serde(default)]
     pub sole_codex_in_cwd: bool,
+    /// A usage-limit "continue" still due for this agent (unix seconds of the reset): typed
+    /// after that time unless auto-continue was switched off meanwhile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continue_at: Option<i64>,
 }
 
 /// A workspace that is asleep. `workspace` keeps its id, label, tab ids, splits and sizes;
@@ -104,6 +108,20 @@ pub struct Sleeping {
     pub slept_ms: i64,
     /// Old pane id → how to bring it back.
     pub panes: HashMap<String, SleptPane>,
+    /// A wake in progress: old pane id → new pane id, written before any owner (task, bus
+    /// name) moves; `committed` once the awake layout holding the new panes is durable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wake: Option<WakeState>,
+    /// Panes that survived SIGKILL when it was put to sleep: it can't wake while they run.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stuck: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WakeState {
+    pub map: HashMap<String, String>,
+    #[serde(default)]
+    pub committed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -361,19 +379,31 @@ impl Session {
         format!("{prefix}{}", self.next_id)
     }
 
+    /// Exact ids win over labels across awake and sleeping workspaces: a key that is the id of
+    /// a sleeping workspace never resolves to an awake one by label, and the other way round.
+    fn key_is_id(&self, key: &str) -> bool {
+        self.workspaces.iter().any(|w| w.id == key)
+            || self.sleeping.iter().any(|s| s.workspace.id == key)
+    }
+
     pub fn workspace(&self, key: &str) -> Option<&Workspace> {
-        self.workspaces
-            .iter()
-            .find(|w| w.id == key)
-            .or_else(|| self.workspaces.iter().find(|w| w.label == key))
+        if self.key_is_id(key) {
+            return self.workspaces.iter().find(|w| w.id == key);
+        }
+        self.workspaces.iter().find(|w| w.label == key)
     }
 
     /// A sleeping workspace by id, else by label.
     pub fn sleeping(&self, key: &str) -> Option<&Sleeping> {
-        self.sleeping
-            .iter()
-            .find(|s| s.workspace.id == key)
-            .or_else(|| self.sleeping.iter().find(|s| s.workspace.label == key))
+        if self.key_is_id(key) {
+            return self.sleeping.iter().find(|s| s.workspace.id == key);
+        }
+        self.sleeping.iter().find(|s| s.workspace.label == key)
+    }
+
+    pub fn sleeping_mut(&mut self, key: &str) -> Option<&mut Sleeping> {
+        let id = self.sleeping(key)?.workspace.id.clone();
+        self.sleeping.iter_mut().find(|s| s.workspace.id == id)
     }
 
     /// Labels stay unique across awake and sleeping workspaces (task targets use them).
@@ -385,12 +415,8 @@ impl Session {
     }
 
     pub fn workspace_mut(&mut self, key: &str) -> Option<&mut Workspace> {
-        let idx = self
-            .workspaces
-            .iter()
-            .position(|w| w.id == key)
-            .or_else(|| self.workspaces.iter().position(|w| w.label == key))?;
-        self.workspaces.get_mut(idx)
+        let id = self.workspace(key)?.id.clone();
+        self.workspaces.iter_mut().find(|w| w.id == id)
     }
 
     /// (workspace index, tab index) holding `pane`.
@@ -548,6 +574,37 @@ mod tests {
         assert!(s.remove_pane("p1"));
         assert!(s.workspaces.is_empty());
         assert!(!s.remove_pane("p1"));
+    }
+
+    #[test]
+    fn ids_win_over_labels_across_awake_and_sleeping() {
+        let ws = |id: &str, label: &str| Workspace {
+            id: id.into(),
+            label: label.into(),
+            cwd: "/".into(),
+            tabs: vec![],
+            active_tab: 0,
+        };
+        let mut s = Session::default();
+        s.workspaces.push(ws("w1", "main"));
+        s.workspaces.push(ws("w3", "w2"));
+        s.sleeping.push(Sleeping {
+            workspace: ws("w2", "w1"),
+            position: 0,
+            slept_ms: 0,
+            panes: HashMap::new(),
+            wake: None,
+            stuck: vec![],
+        });
+        // "w1" is an awake id: never the sleeper labelled "w1".
+        assert_eq!(s.workspace("w1").unwrap().label, "main");
+        assert!(s.sleeping("w1").is_none());
+        // "w2" is the sleeper's id: never the awake workspace labelled "w2".
+        assert!(s.workspace("w2").is_none());
+        assert_eq!(s.sleeping("w2").unwrap().workspace.label, "w1");
+        assert_eq!(s.workspace("main").unwrap().id, "w1");
+        assert_eq!(s.workspace_mut("w1").unwrap().label, "main");
+        assert!(s.sleeping_mut("w1").is_none());
     }
 
     #[test]

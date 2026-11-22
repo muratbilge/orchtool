@@ -81,6 +81,7 @@ async fn main() -> anyhow::Result<()> {
     // previous orchd saved, with fresh panes. Autosaving starts only once that is done.
     let _ = daemon.restore_path.set(dir.join("restore.json"));
     daemon.autosave.set_path(dir.join(orchd::autosave::FILE));
+    daemon.sleep_store.set_dir(dir.clone());
     orchd::autosave::restore_at_start(&daemon, &dir);
     orchd::autosave::start(Arc::clone(&daemon));
     orchd::tasks::start(Arc::clone(&daemon));

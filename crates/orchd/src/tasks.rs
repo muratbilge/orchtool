@@ -40,6 +40,7 @@ impl Daemon {
     }
     fn task_ready(&self, p: &Pane) -> bool {
         if self.bus.task_input_uncertain(&p.id).unwrap_or(true)
+            || self.in_transition(&p.id)
             || p.exit_code().is_some()
             || p.detect() != Detected::Idle
         {

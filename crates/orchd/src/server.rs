@@ -42,6 +42,8 @@ pub struct Daemon {
     pub task_gate: tokio::sync::Mutex<()>,
     /// Set once shutdown starts: panes dying from `kill_all` are not task failures.
     pub stopping: std::sync::atomic::AtomicBool,
+    /// A `daemon.stop` is waiting for transitions to end: no new sleep / wake starts.
+    pub(crate) stopping_soon: std::sync::atomic::AtomicBool,
     pub bus: Arc<Bus>,
     pub(crate) session: Mutex<orch_proto::layout::Session>,
     pub(crate) ui_events: tokio::sync::broadcast::Sender<crate::ui::UiEvent>,
@@ -57,6 +59,13 @@ pub struct Daemon {
     pub autosave: crate::autosave::Autosave,
     /// Auto-sleep's idle tracking (`autosleep.rs`).
     pub(crate) auto_sleep: crate::autosleep::State,
+    /// The durable record of sleeping workspaces (`sleepstore.rs`).
+    pub sleep_store: crate::sleepstore::Store,
+    /// Workspaces going to sleep or waking right now (by id): no layout change, input, task or
+    /// nudge reaches them, and no second transition starts. A leaf lock.
+    pub(crate) transitions: Mutex<std::collections::HashSet<String>>,
+    /// Usage-limit continuations still due after a wake: pane → reset (unix seconds).
+    pub(crate) deferred: Mutex<HashMap<String, i64>>,
 }
 
 #[derive(Debug)]
@@ -81,6 +90,7 @@ impl Daemon {
         Arc::new(Self {
             task_gate: tokio::sync::Mutex::new(()),
             stopping: std::sync::atomic::AtomicBool::new(false),
+            stopping_soon: std::sync::atomic::AtomicBool::new(false),
             bus,
             session: Mutex::new(orch_proto::layout::Session::default()),
             ui_events: tokio::sync::broadcast::channel(256).0,
@@ -92,6 +102,9 @@ impl Daemon {
             restore_path: Default::default(),
             autosave: Default::default(),
             auto_sleep: Default::default(),
+            sleep_store: Default::default(),
+            transitions: Default::default(),
+            deferred: Default::default(),
         })
     }
 
@@ -132,10 +145,15 @@ impl Daemon {
         }
         // Pane ids never repeat, not even across orchd restarts: agent identities and
         // nudges are keyed by pane, so a reused id would hand an old identity to a new program.
-        let n = self
-            .bus
-            .next_counter("next_pane")
-            .unwrap_or_else(|_| self.next_pane.fetch_add(1, Ordering::SeqCst) + 1_000_000);
+        // No durable counter, no pane: a fallback sequence would start at the same number on
+        // the next start and hand out ids still held by sleepers and tasks.
+        let n = if crate::fault::on("pane_counter") {
+            Err(anyhow::anyhow!("injected counter failure"))
+        } else {
+            self.bus.next_counter("next_pane")
+        }
+        .map_err(|e| err("spawn_failed", format!("no unique pane id: {e:#}")))?;
+        self.next_pane.store(n, Ordering::SeqCst);
         let pane = Pane::spawn(format!("p{n}"), req, self.scrollback)
             .map_err(|e| err("spawn_failed", format!("{e:#}")))?;
         self.panes.lock().unwrap().insert(n, Arc::clone(&pane));
@@ -146,6 +164,12 @@ impl Daemon {
     /// The pane is only forgotten once its program is really gone.
     pub(crate) async fn kill(&self, key: &str) -> Result<(), ApiError> {
         let pane = self.find(key)?;
+        if crate::fault::value("kill_fail").is_some_and(|name| pane.name.as_deref() == Some(name)) {
+            return Err(err(
+                "kill_failed",
+                format!("{} survived (injected)", pane.id),
+            ));
+        }
         let mut exit = pane.subscribe_exit();
         for step in 0..3 {
             if pane.exit_code().is_some() {
@@ -187,7 +211,7 @@ impl Daemon {
     async fn wake_into(self: &Arc<Self>, v: &mut Value, ws: &str) {
         let d = Arc::clone(self);
         let key = ws.to_string();
-        match tokio::spawn(async move { d.wake_workspace(&key).await }).await {
+        match tokio::spawn(async move { d.wake_workspace(&key, false).await }).await {
             Ok(Ok(r)) => {
                 let id = r["workspace"].as_str().unwrap_or_default().to_string();
                 v["woke"] = json!(self.session().workspace(&id).map(|w| w.label.clone()));
@@ -373,6 +397,7 @@ impl Daemon {
             }
             Request::Send(s) => {
                 let pane = self.find(&s.pane)?;
+                self.not_in_transition(&pane.id)?;
                 let enter_delay = send_enter_delay(pane.kind().as_deref(), &s.text);
                 if pane.exit_code().is_some() {
                     return Err(err("exited", "pane has exited"));
@@ -416,11 +441,27 @@ impl Daemon {
             }
             Request::Kill { pane } => {
                 let id = self.find(&pane)?.id.clone();
+                self.not_in_transition(&id)?;
                 self.kill(&id).await?;
                 self.unplace(&id);
                 Ok(json!({ "pane": id }))
             }
             Request::StopDaemon { restart } => {
+                // Not in the middle of a sleep or wake (their own records stay consistent, but
+                // a half-done transition is better finished first).
+                self.stopping_soon.store(true, Ordering::SeqCst);
+                let mut waited = 0;
+                while !self.transitions.lock().unwrap().is_empty() {
+                    if waited >= 200 {
+                        self.stopping_soon.store(false, Ordering::SeqCst);
+                        return Err(err(
+                            "ws_transition",
+                            "a workspace is going to sleep or waking; try again",
+                        ));
+                    }
+                    waited += 1;
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
                 // Saved while every pane still runs, before anything stops: if saving fails,
                 // nothing is killed and the caller hears why.
                 if restart {
@@ -432,15 +473,15 @@ impl Daemon {
                         err("save_failed", format!("saving the layout failed: {e}"))
                     })?;
                 } else {
-                    // "End everything": the next orchd starts empty, except for sleeping
-                    // workspaces: they were put away to come back later.
+                    // "End everything": the next orchd starts with no panes. Sleeping
+                    // workspaces live in their own record (sleepstore.rs), which this leaves alone.
                     self.autosave.forget();
-                    self.keep_sleeping();
                 }
                 self.shutdown.notify_one();
                 Ok(json!({ "stopping": true }))
             }
             Request::RegisterAgent(r) => {
+                self.name_free_for(&r)?;
                 if let Some(id) = r.pane.as_deref().and_then(|p| p.strip_prefix("orch:")) {
                     if let Ok(p) = self.find(id) {
                         p.set_kind(&r.kind);
@@ -807,6 +848,12 @@ async fn pane_idle(daemon: &Daemon, pane: &str) -> Option<bool> {
 
 async fn nudge(daemon: &Daemon, agent: &str, pane: &str, text: &str) {
     let _gate = daemon.task_gate.lock().await;
+    if pane
+        .strip_prefix("orch:")
+        .is_some_and(|id| daemon.in_transition(id))
+    {
+        return;
+    }
     if pane_idle(daemon, pane).await != Some(true) {
         return;
     }

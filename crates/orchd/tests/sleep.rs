@@ -13,6 +13,8 @@ struct D {
     child: Child,
     socket: PathBuf,
     dir: PathBuf,
+    /// ORCHD_FAULT for the next start (failure injection; empty = none).
+    fault: String,
 }
 
 impl Drop for D {
@@ -24,6 +26,10 @@ impl Drop for D {
 }
 
 fn spawn_orchd(dir: &Path, socket: &Path) -> Child {
+    spawn_faulty(dir, socket, "")
+}
+
+fn spawn_faulty(dir: &Path, socket: &Path, fault: &str) -> Child {
     Command::new(env!("CARGO_BIN_EXE_orchd"))
         .arg("--socket")
         .arg(socket)
@@ -35,6 +41,9 @@ fn spawn_orchd(dir: &Path, socket: &Path) -> Child {
         .env("ORCHD_AUTOSAVE_INTERVAL_MS", "200")
         .env("ORCHD_TASK_IDLE_MS", "300")
         .env("ORCHD_AUTO_SLEEP_TICK_MS", "100")
+        .env("ORCHD_WAKE_GRACE_MS", "300")
+        .env("ORCHD_LIMIT_CHECK_MS", "100")
+        .env("ORCHD_FAULT", fault)
         .spawn()
         .unwrap()
 }
@@ -51,9 +60,38 @@ async fn daemon(tag: &str) -> D {
     std::fs::create_dir_all(dir.join("home")).unwrap();
     let socket = dir.join("s.sock");
     let child = spawn_orchd(&dir, &socket);
-    let d = D { child, socket, dir };
+    let d = D {
+        child,
+        socket,
+        dir,
+        fault: String::new(),
+    };
     conn(&d).await;
     d
+}
+
+/// The private daemon again, now with `fault` (the old one must be gone or is killed).
+async fn restart_with(d: &mut D, fault: &str) {
+    // Let the debounced autosave catch up with the layout first.
+    if d.child.try_wait().unwrap().is_none() {
+        tokio::time::sleep(Duration::from_millis(600)).await;
+    }
+    let _ = d.child.kill();
+    let _ = d.child.wait();
+    d.fault = fault.to_string();
+    d.child = spawn_faulty(&d.dir, &d.socket, fault);
+    conn(d).await;
+}
+
+/// Waits for the daemon to die by itself (an injected crash).
+fn wait_dead(d: &mut D) {
+    for _ in 0..400 {
+        if d.child.try_wait().unwrap().is_some() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    panic!("the daemon did not crash at the injected point");
 }
 
 async fn conn(d: &D) -> Conn {
@@ -346,7 +384,8 @@ async fn sleep_and_wake_keep_the_layout_and_resume_the_agent() {
         read(&d, "idle", "args").lines().count() == 2
     })
     .await;
-    assert_eq!(read(&d, "idle", "args").lines().nth(1), Some("--continue"));
+    // No verified session id: Claude's resume picker, never "the latest one in this folder".
+    assert_eq!(read(&d, "idle", "args").lines().nth(1), Some("--resume"));
     let v = req(&d, Request::ListAgents {}).await.unwrap();
     let row = v["agents"]
         .as_array()
@@ -662,6 +701,7 @@ async fn mail_tasks_and_questions_wait_for_a_sleeping_agent() {
         &d,
         UiOp::WakeWorkspace {
             workspace: ws.clone(),
+            partial: false,
         },
     )
     .await;
@@ -813,6 +853,7 @@ async fn codex_without_a_session_id_wakes_at_its_picker() {
         &d,
         UiOp::WakeWorkspace {
             workspace: "cx".into(),
+            partial: false,
         },
     )
     .await;
@@ -1040,4 +1081,651 @@ async fn a_restart_gives_every_workspace_a_full_period() {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     assert_eq!(session(&d).await.sleeping.len(), 2, "then they do sleep");
+}
+
+// ---------- review findings (Codex, 2026-11-22) ----------
+
+async fn sleep_op(d: &D, key: &str, force: bool) -> Result<Value, ClientError> {
+    req(
+        d,
+        Request::Ui(UiOp::SleepWorkspace {
+            workspace: key.into(),
+            force,
+            dry_run: false,
+        }),
+    )
+    .await
+}
+
+async fn wake_op(d: &D, key: &str, partial: bool) -> Result<Value, ClientError> {
+    req(
+        d,
+        Request::Ui(UiOp::WakeWorkspace {
+            workspace: key.into(),
+            partial,
+        }),
+    )
+    .await
+}
+
+fn code(e: ClientError) -> String {
+    match e {
+        ClientError::Remote(b) => b.code,
+        other => format!("{other:?}"),
+    }
+}
+
+/// #1: the sleeper record is written and confirmed before any pane ends; a failed write puts
+/// the workspace back and ends nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn f1_a_failed_save_puts_nothing_to_sleep() {
+    let mut d = daemon("f1").await;
+    let (ws, agent, sh) = proj(&d).await;
+    restart_with(&mut d, "store_write").await;
+    let s = session(&d).await;
+    let w = s.workspace("proj").unwrap().clone();
+    let panes: Vec<String> = w.tabs.iter().flat_map(|t| t.root.panes()).collect();
+    assert_ne!(w.id, "", "{ws} {agent} {sh}");
+    let e = sleep_op(&d, "proj", false).await.unwrap_err();
+    assert_eq!(code(e), "save_failed");
+    let s = session(&d).await;
+    assert!(s.sleeping.is_empty());
+    assert!(s.workspace("proj").is_some(), "back in the layout");
+    let running = running_panes(&d).await;
+    for p in &panes {
+        assert!(running.contains(p), "{p} must still run");
+    }
+}
+
+/// #1/#3: killed right after the record is committed (before the panes end and before the
+/// awake layout is rewritten): the next orchd keeps it asleep, the stale layout loses.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn f1_a_crash_after_the_commit_keeps_it_asleep() {
+    let mut d = daemon("f1crash").await;
+    proj(&d).await;
+    tokio::time::sleep(Duration::from_millis(400)).await; // an autosave with proj awake
+    restart_with(&mut d, "sleep_after_commit").await;
+    let _ = sleep_op(&d, "proj", false).await;
+    wait_dead(&mut d);
+    restart_with(&mut d, "").await;
+    let s = session(&d).await;
+    assert!(s.sleeping("proj").is_some(), "asleep");
+    assert!(s.workspace("proj").is_none(), "not also awake");
+    wake_op(&d, "proj", false).await.unwrap();
+    assert!(session(&d).await.workspace("proj").is_some());
+}
+
+/// #2: a plain stop never touches the sleeper record, and waits for a sleep in progress.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn f2_a_plain_stop_waits_for_a_sleep_and_keeps_the_record() {
+    let mut d = daemon("f2").await;
+    proj(&d).await;
+    restart_with(&mut d, "sleep_pause_ms=800").await;
+    let socket = d.socket.clone();
+    let sleeping = tokio::spawn(async move {
+        let mut c = Conn::unix(&socket).await.unwrap();
+        c.request(&Request::Ui(UiOp::SleepWorkspace {
+            workspace: "proj".into(),
+            force: false,
+            dry_run: false,
+        }))
+        .await
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let out = orch_cli(&d, &["stop-daemon"]);
+    assert!(out.status.success(), "{out:?}");
+    // Its reply may race the shutdown; what counts is the record below.
+    let _ = sleeping.await;
+    d.child.wait().unwrap();
+    assert!(!d.dir.join("autosave.json").exists());
+    restart_with(&mut d, "").await;
+    assert!(session(&d).await.sleeping("proj").is_some());
+}
+
+/// #3: the record lives apart from the layout files: a layout file rewritten without sleepers
+/// (as an older orchd does), a garbage restore.json, or a corrupt newest slot lose nothing
+/// older than the newest generation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn f3_layout_files_and_a_downgrade_never_hold_the_only_record() {
+    let mut d = daemon("f3").await;
+    proj(&d).await;
+    sleep_op(&d, "proj", false).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let auto = std::fs::read_to_string(d.dir.join("autosave.json")).unwrap();
+    assert!(
+        !auto.contains("\"sleeping\""),
+        "layout files carry no sleepers"
+    );
+    // What main's orchd would leave: its own layout file, no sleepers; plus a garbage
+    // restore.json.
+    let _ = d.child.kill();
+    let _ = d.child.wait();
+    std::fs::remove_file(d.dir.join("autosave.json")).unwrap();
+    std::fs::write(d.dir.join("restore.json"), b"{ not json").unwrap();
+    restart_with(&mut d, "").await;
+    assert!(
+        session(&d).await.sleeping("proj").is_some(),
+        "after a downgrade"
+    );
+    // A second generation, then the newest slot corrupted: the predecessor is used.
+    shell_ws(&d, "second").await;
+    sleep_op(&d, "second", false).await.unwrap();
+    let _ = d.child.kill();
+    let _ = d.child.wait();
+    let newest = ["sleeping.a.json", "sleeping.b.json"]
+        .iter()
+        .map(|n| d.dir.join(n))
+        .max_by_key(|p| {
+            serde_json::from_slice::<Value>(&std::fs::read(p).unwrap_or_default())
+                .map(|v| v["generation"].as_u64().unwrap_or(0))
+                .unwrap_or(0)
+        })
+        .unwrap();
+    std::fs::write(&newest, b"garbage").unwrap();
+    restart_with(&mut d, "").await;
+    let s = session(&d).await;
+    assert!(s.sleeping("proj").is_some(), "the predecessor generation");
+    assert_eq!(std::fs::read(&newest).unwrap(), b"garbage", "left alone");
+}
+
+/// #4: a wake is all or nothing; a pane that can't start (its name is taken, its agent
+/// exits at once) keeps every record, and the wake can be retried. --partial wakes the rest
+/// and keeps the failed one asleep.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn f4_a_pane_that_cannot_start_keeps_its_record() {
+    let mut d = daemon("f4").await;
+    let agent = fake(&d, "idle");
+    let mut named = spawn(&["bash".into(), "--norc".into()]);
+    named.name = Some("keep".into());
+    let v = op(
+        &d,
+        UiOp::NewWorkspace {
+            label: Some("pair".into()),
+            spawn: spawn(&[agent]),
+        },
+    )
+    .await;
+    let a = v["pane"]["id"].as_str().unwrap().to_string();
+    register(&d, &a, "pair-claude").await;
+    op(
+        &d,
+        UiOp::Split {
+            pane: a.clone(),
+            dir: Dir::Right,
+            spawn: named.clone(),
+        },
+    )
+    .await;
+    wait_status(&d, &a, "idle").await;
+    sleep_op(&d, "pair", false).await.unwrap();
+    // The name is taken elsewhere now.
+    let v = req(
+        &d,
+        Request::NewPane(NewPane {
+            argv: vec!["bash".into(), "--norc".into()],
+            name: Some("keep".into()),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let other = v["id"].as_str().unwrap().to_string();
+    let e = wake_op(&d, "pair", false).await.unwrap_err();
+    assert_eq!(code(e), "wake_failed");
+    let s = session(&d).await;
+    assert_eq!(
+        s.sleeping("pair").unwrap().panes.len(),
+        2,
+        "both records kept"
+    );
+    assert!(s.workspace("pair").is_none());
+    req(&d, Request::Kill { pane: other }).await.unwrap();
+    wake_op(&d, "pair", false).await.unwrap();
+    assert!(session(&d).await.workspace("pair").is_some(), "retry works");
+    // An agent that exits at once did not start.
+    sleep_op(&d, "pair", false).await.unwrap();
+    let program = d.dir.join("idle").join("fake-claude");
+    let good = std::fs::read(&program).unwrap();
+    std::fs::write(&program, b"#!/bin/sh\nexit 1\n").unwrap();
+    let e = wake_op(&d, "pair", false).await.unwrap_err();
+    assert_eq!(code(e), "wake_failed");
+    assert_eq!(session(&d).await.sleeping("pair").unwrap().panes.len(), 2);
+    std::fs::write(&program, good).unwrap();
+    // --partial: the failed one stays asleep on its own.
+    restart_with(&mut d, "spawn_fail=keep").await;
+    let v = wake_op(&d, "pair", true).await.unwrap();
+    assert_eq!(v["failed"].as_array().unwrap().len(), 1);
+    let rest = v["rest"].as_str().unwrap().to_string();
+    let s = session(&d).await;
+    assert!(s.workspace("pair").is_some());
+    let r = s.sleeping(&rest).unwrap();
+    assert_eq!(r.panes.len(), 1);
+    assert_eq!(
+        r.panes.values().next().unwrap().saved.name.as_deref(),
+        Some("keep")
+    );
+}
+
+/// #5: killed in the middle of a wake (owners moved, layout not committed): the next orchd
+/// moves the running task and the bus name back, the question stays open, it is asleep and
+/// wakes again. Killed after the commit: awake, no sleeper left.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn f5_a_crash_mid_wake_keeps_tasks_names_and_questions_consistent() {
+    let mut d = daemon("f5").await;
+    let (_ws, agent, _sh) = proj(&d).await;
+    let t = req(
+        &d,
+        Request::TaskAdd {
+            target: "proj".into(),
+            text: "long job".into(),
+            created_by: "murat".into(),
+            after: None,
+            wake: false,
+        },
+    )
+    .await
+    .unwrap();
+    let task = t["id"].as_i64().unwrap();
+    wait_for("the task runs", || {
+        read(&d, "idle", "received").contains("long job")
+    })
+    .await;
+    let q = req(
+        &d,
+        Request::Ask {
+            from: "proj-claude".into(),
+            text: "ok?".into(),
+            options: vec![],
+        },
+    )
+    .await
+    .unwrap();
+    let qid = q["id"].as_i64().unwrap();
+    sleep_op(&d, "proj", true).await.unwrap();
+    restart_with(&mut d, "wake_after_owners").await;
+    let _ = wake_op(&d, "proj", false).await;
+    wait_dead(&mut d);
+    restart_with(&mut d, "").await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let s = session(&d).await;
+    assert!(s.sleeping("proj").is_some() && s.workspace("proj").is_none());
+    assert!(s.sleeping("proj").unwrap().wake.is_none());
+    let v = req(&d, Request::TaskList { all: true }).await.unwrap();
+    let row = v["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"] == task)
+        .unwrap()
+        .clone();
+    assert_eq!(row["state"], "running", "{row}");
+    assert_eq!(row["pane"], agent.as_str(), "back on its old pane");
+    let v = req(&d, Request::ListAgents {}).await.unwrap();
+    let a = v["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["name"] == "proj-claude")
+        .unwrap()
+        .clone();
+    assert_eq!(a["pane"], format!("orch:{agent}"));
+    let v = req(&d, Request::ListQuestions { all: false })
+        .await
+        .unwrap();
+    assert!(v["questions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|r| r["id"] == qid));
+    // After the commit.
+    restart_with(&mut d, "wake_after_commit").await;
+    let _ = wake_op(&d, "proj", false).await;
+    wait_dead(&mut d);
+    restart_with(&mut d, "").await;
+    let s = session(&d).await;
+    assert!(s.workspace("proj").is_some(), "awake");
+    assert!(s.sleeping.is_empty(), "no sleeper left");
+}
+
+/// #6: while it goes to sleep nothing changes its layout or reaches its panes; a pane that
+/// survives SIGKILL stays visible and blocks a second copy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn f6_a_sleep_reserves_its_workspace_and_keeps_survivors_visible() {
+    let mut d = daemon("f6").await;
+    let (_ws, agent, sh) = proj(&d).await;
+    restart_with(&mut d, "sleep_pause_ms=1000").await;
+    let s = session(&d).await;
+    let panes: Vec<String> = s
+        .workspace("proj")
+        .unwrap()
+        .tabs
+        .iter()
+        .flat_map(|t| t.root.panes())
+        .collect();
+    let socket = d.socket.clone();
+    let sleeping = tokio::spawn(async move {
+        let mut c = Conn::unix(&socket).await.unwrap();
+        c.request(&Request::Ui(UiOp::SleepWorkspace {
+            workspace: "proj".into(),
+            force: false,
+            dry_run: false,
+        }))
+        .await
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let e = req(
+        &d,
+        Request::Ui(UiOp::Split {
+            pane: panes[0].clone(),
+            dir: Dir::Down,
+            spawn: spawn(&["bash".into(), "--norc".into()]),
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(code(e), "ws_transition");
+    let e = req(
+        &d,
+        Request::Send(orch_proto::api::SendPane {
+            pane: panes[0].clone(),
+            text: "x".into(),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(code(e), "ws_transition");
+    sleeping.await.unwrap().unwrap();
+    let running = running_panes(&d).await;
+    assert!(
+        panes.iter().all(|p| !running.contains(p)),
+        "nothing left running"
+    );
+    let _ = (agent, sh);
+    // A pane that survives SIGKILL.
+    wake_op(&d, "proj", false).await.unwrap();
+    let mut named = spawn(&["bash".into(), "--norc".into()]);
+    named.name = Some("stubborn".into());
+    let ws = session(&d).await.workspace("proj").unwrap().id.clone();
+    op(
+        &d,
+        UiOp::NewTab {
+            workspace: ws,
+            spawn: named,
+        },
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(600)).await; // in the autosave
+    restart_with(&mut d, "kill_fail=stubborn").await;
+    // (A restart restores the layout; the sleep below is of the restored workspace.)
+    let v = sleep_op(&d, "proj", false).await.unwrap();
+    assert!(v["warnings"].to_string().contains("proj-stuck"), "{v}");
+    let s = session(&d).await;
+    let stuck = s.workspace("proj-stuck").expect("survivor visible");
+    let survivor = stuck.tabs[0].root.panes()[0].clone();
+    assert!(running_panes(&d).await.contains(&survivor));
+    let e = wake_op(&d, "proj", false).await.unwrap_err();
+    assert_eq!(code(e), "ws_stuck");
+}
+
+/// #7: auto-sleep re-checks at the commit: a viewer that attached after it decided stops
+/// it. A manual sleep refuses an agent whose hooks say it is working.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn f7_auto_sleep_revalidates_and_bus_working_blocks() {
+    let mut d = daemon("f7").await;
+    restart_with(&mut d, "auto_pause_ms=1500").await;
+    let (_, pane) = shell_ws(&d, "quiet").await;
+    assert!(orch_cli(&d, &["auto-sleep", "1s"]).status.success());
+    // Decided after ~1 s, then held 1.5 s before the commit: attach in that window.
+    tokio::time::sleep(Duration::from_millis(1600)).await;
+    let viewer = attach(&d, &pane).await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(session(&d).await.workspace("quiet").is_some(), "aborted");
+    drop(viewer);
+    assert!(orch_cli(&d, &["auto-sleep", "off"]).status.success());
+    restart_with(&mut d, "").await;
+    let (_, a, _) = proj(&d).await;
+    let _ = a;
+    req(
+        &d,
+        Request::SetStatus {
+            name: "proj-claude".into(),
+            status: "working".into(),
+            text: None,
+        },
+    )
+    .await
+    .unwrap();
+    let e = sleep_op(&d, "proj", false).await.unwrap_err();
+    assert_eq!(code(e), "ws_busy");
+}
+
+fn codex_clock(secs: i64) -> String {
+    let t = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+        + secs) as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    unsafe { libc::localtime_r(&t, &mut tm) };
+    let h = tm.tm_hour % 12;
+    format!(
+        "{}:{:02} {}",
+        if h == 0 { 12 } else { h },
+        tm.tm_min,
+        if tm.tm_hour < 12 { "AM" } else { "PM" }
+    )
+}
+
+/// #8: an agent with a usage-limit continue still due is never auto-slept (before or after a
+/// wake), and the due continue survives a restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn f8_a_due_limit_continue_is_not_stranded() {
+    let mut d = daemon("f8").await;
+    let program = d.dir.join("limited").join("fake-codex");
+    std::fs::create_dir_all(program.parent().unwrap()).unwrap();
+    let at = codex_clock(7200);
+    std::fs::write(
+        &program,
+        format!(
+            "#!/bin/sh\nstty -echo\nhere=$(dirname \"$0\")\nprintf '%s\\n' \"$*\" >> \"$here/args\"\nif [ $(wc -l < \"$here/args\") -eq 1 ]; then printf '• Ran cargo test\\n\\n■ You have hit your usage limit. Upgrade or try again at {at}.\\n\\n› Ask Codex to do anything\\n\\n  GPT-6-Astra medium · /tmp\\n'; else printf '› Ask Codex to do anything\\n'; fi\ncat > /dev/null\n"
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let v = op(
+        &d,
+        UiOp::NewWorkspace {
+            label: Some("lim".into()),
+            spawn: spawn(&[program.to_string_lossy().into_owned()]),
+        },
+    )
+    .await;
+    let pane = v["pane"]["id"].as_str().unwrap().to_string();
+    req(
+        &d,
+        Request::RegisterAgent(RegisterAgent {
+            kind: "codex".into(),
+            pane: Some(format!("orch:{pane}")),
+            name: Some("lim-codex".into()),
+            cwd: None,
+            instance: None,
+        }),
+    )
+    .await
+    .unwrap();
+    wait_status(&d, &pane, "limited").await;
+    shell_ws(&d, "quiet").await;
+    assert!(orch_cli(&d, &["auto-sleep", "1s"]).status.success());
+    for _ in 0..200 {
+        if session(&d).await.sleeping("quiet").is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let s = session(&d).await;
+    assert!(s.sleeping("quiet").is_some(), "the idle one sleeps");
+    assert!(s.workspace("lim").is_some(), "the limited one stays awake");
+    assert!(orch_cli(&d, &["auto-sleep", "off"]).status.success());
+    // Put away by hand, woken: the continue is due later, so it stays awake again...
+    sleep_op(&d, "lim", false).await.unwrap();
+    wake_op(&d, "lim", false).await.unwrap();
+    assert!(orch_cli(&d, &["auto-sleep", "1s"]).status.success());
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert!(session(&d).await.workspace("lim").is_some());
+    assert!(orch_cli(&d, &["auto-sleep", "off"]).status.success());
+    // ...and the due continue goes through a planned restart.
+    let out = orch_cli(&d, &["stop-daemon", "--restart"]);
+    assert!(out.status.success(), "{out:?}");
+    d.child.wait().unwrap();
+    let saved = std::fs::read_to_string(d.dir.join("restore.json")).unwrap();
+    assert!(saved.contains("continue_at"), "{saved}");
+}
+
+/// #9: a woken pane whose folder is gone keeps its record (not moved to the home folder).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn f9_a_missing_folder_keeps_the_record() {
+    let d = daemon("f9").await;
+    let folder = d.dir.join("project");
+    std::fs::create_dir_all(&folder).unwrap();
+    let mut sp = spawn(&["bash".into(), "--norc".into()]);
+    sp.cwd = Some(folder.to_string_lossy().into_owned());
+    op(
+        &d,
+        UiOp::NewWorkspace {
+            label: Some("gone".into()),
+            spawn: sp,
+        },
+    )
+    .await;
+    sleep_op(&d, "gone", false).await.unwrap();
+    std::fs::remove_dir_all(&folder).unwrap();
+    let e = wake_op(&d, "gone", false).await.unwrap_err();
+    assert_eq!(code(e), "wake_failed");
+    assert!(session(&d).await.sleeping("gone").is_some());
+}
+
+/// #10: a sleeping agent's bus name is reserved; nobody else can take it meanwhile.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn f10_a_sleeping_agents_name_is_reserved() {
+    let d = daemon("f10").await;
+    proj(&d).await;
+    let (_, other) = shell_ws(&d, "other").await;
+    sleep_op(&d, "proj", false).await.unwrap();
+    let e = req(
+        &d,
+        Request::RegisterAgent(RegisterAgent {
+            kind: "claude".into(),
+            pane: Some(format!("orch:{other}")),
+            name: Some("proj-claude".into()),
+            cwd: None,
+            instance: None,
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(code(e), "name_reserved");
+    wake_op(&d, "proj", false).await.unwrap();
+    let v = req(&d, Request::ListAgents {}).await.unwrap();
+    let a = v["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["name"] == "proj-claude")
+        .unwrap()
+        .clone();
+    assert_ne!(a["pane"], format!("orch:{other}"));
+}
+
+/// #11: ids win over labels across awake and sleeping workspaces.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn f11_ids_win_over_labels_for_close_sleep_and_wake() {
+    let d = daemon("f11").await;
+    let (a_id, _) = shell_ws(&d, "alpha").await;
+    // A workspace labelled like alpha's id, put to sleep.
+    let (b_id, _) = shell_ws(&d, &a_id).await;
+    sleep_op(&d, &b_id, false).await.unwrap();
+    // Closing alpha by its id closes alpha, not the sleeper labelled that way.
+    op(
+        &d,
+        UiOp::CloseWorkspace {
+            workspace: a_id.clone(),
+        },
+    )
+    .await;
+    let s = session(&d).await;
+    assert!(s.workspaces.iter().all(|w| w.id != a_id), "alpha closed");
+    assert_eq!(s.sleeping.len(), 1, "the sleeper is untouched");
+    // Its id still wakes it.
+    wake_op(&d, &b_id, false).await.unwrap();
+    assert!(session(&d).await.workspaces.iter().any(|w| w.id == b_id));
+}
+
+/// #12: no pane without a durable unique id.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn f12_no_pane_without_a_durable_id() {
+    let mut d = daemon("f12").await;
+    restart_with(&mut d, "pane_counter").await;
+    let e = req(
+        &d,
+        Request::NewPane(NewPane {
+            argv: vec!["bash".into(), "--norc".into()],
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(code(e), "spawn_failed");
+}
+
+/// #13: a slow sleep (a pane that only goes with SIGKILL) holds up no other workspace's task.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn f13_a_slow_sleep_does_not_stall_other_tasks() {
+    let d = daemon("f13").await;
+    let (_, _, _) = proj(&d).await;
+    op(
+        &d,
+        UiOp::NewWorkspace {
+            label: Some("slow".into()),
+            spawn: spawn(&[
+                "sh".into(),
+                "-c".into(),
+                "trap '' HUP TERM; while :; do sleep 1; done".into(),
+            ]),
+        },
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let socket = d.socket.clone();
+    let sleeping = tokio::spawn(async move {
+        let mut c = Conn::unix(&socket).await.unwrap();
+        c.request(&Request::Ui(UiOp::SleepWorkspace {
+            workspace: "slow".into(),
+            force: true,
+            dry_run: false,
+        }))
+        .await
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let started = std::time::Instant::now();
+    req(
+        &d,
+        Request::TaskAdd {
+            target: "proj".into(),
+            text: "quick one".into(),
+            created_by: "murat".into(),
+            after: None,
+            wake: false,
+        },
+    )
+    .await
+    .unwrap();
+    wait_for("the other task runs", || {
+        read(&d, "idle", "received").contains("quick one")
+    })
+    .await;
+    assert!(!sleeping.is_finished(), "the slow sleep is still going");
+    assert!(started.elapsed() < Duration::from_millis(2500));
+    sleeping.await.unwrap().unwrap();
 }

@@ -673,6 +673,8 @@ mod tests {
                 },
             )]
             .into(),
+            wake: None,
+            stuck: vec![],
         });
         s
     }

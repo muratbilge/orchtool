@@ -122,7 +122,7 @@ impl Daemon {
             .session()
             .workspaces
             .iter()
-            .find(|w| w.cwd == info.cwd)
+            .find(|w| w.cwd == info.cwd && !self.ws_in_transition(&w.id))
             .map(|w| w.id.clone());
         match ws {
             Some(ws) => self.add_tab(&ws, info),
@@ -155,7 +155,38 @@ impl Daemon {
         Ok(())
     }
 
+    /// The workspace a layout change would touch, if it is going to sleep or waking.
+    fn op_blocked(&self, op: &UiOp) -> Result<(), ApiError> {
+        let s = self.session();
+        let ws = |key: &str| {
+            s.workspace(key)
+                .map(|w| w.id.clone())
+                .or_else(|| s.sleeping(key).map(|x| x.workspace.id.clone()))
+        };
+        let of_pane = |pane: &str| s.locate(pane).map(|(wi, _)| s.workspaces[wi].id.clone());
+        let target = match op {
+            UiOp::NewTab { workspace, .. }
+            | UiOp::CloseTab { workspace, .. }
+            | UiOp::CloseWorkspace { workspace }
+            | UiOp::RenameWorkspace { workspace, .. }
+            | UiOp::RenameTab { workspace, .. } => ws(workspace),
+            UiOp::Split { pane, .. }
+            | UiOp::ClosePane { pane }
+            | UiOp::Resize { pane, .. }
+            | UiOp::ToggleZoom { pane } => of_pane(pane),
+            _ => None,
+        };
+        if target.is_some_and(|id| self.ws_in_transition(&id)) {
+            return Err(err(
+                "ws_transition",
+                "that workspace is going to sleep or waking; try again",
+            ));
+        }
+        Ok(())
+    }
+
     pub async fn ui_op(self: &Arc<Self>, op: UiOp) -> Result<Value, ApiError> {
+        self.op_blocked(&op)?;
         let mut created: Option<PaneInfo> = None;
         match op {
             UiOp::NewWorkspace { label, spawn } => {
@@ -250,9 +281,9 @@ impl Daemon {
                 .await
                 .map_err(|e| err("bus", e.to_string()))?;
             }
-            UiOp::WakeWorkspace { workspace } => {
+            UiOp::WakeWorkspace { workspace, partial } => {
                 let d = Arc::clone(self);
-                return tokio::spawn(async move { d.wake_workspace(&workspace).await })
+                return tokio::spawn(async move { d.wake_workspace(&workspace, partial).await })
                     .await
                     .map_err(|e| err("bus", e.to_string()))?;
             }

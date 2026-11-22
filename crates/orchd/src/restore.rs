@@ -290,7 +290,12 @@ pub fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
         .open(&tmp)?;
     std::io::Write::write_all(&mut f, data)?;
     f.sync_all()?;
-    std::fs::rename(&tmp, path)
+    std::fs::rename(&tmp, path)?;
+    // The rename itself survives a power loss only once the folder is synced.
+    if let Some(dir) = path.parent() {
+        std::fs::File::open(dir)?.sync_all()?;
+    }
+    Ok(())
 }
 
 fn map_node(n: &Node, ids: &HashMap<String, String>) -> Node {
@@ -358,6 +363,7 @@ pub(crate) fn saved_pane(
         session_id,
         agent_argv: process.map(|p| p.argv),
         sole_codex_in_cwd: false,
+        continue_at: None,
     }
 }
 
@@ -465,7 +471,11 @@ impl Daemon {
 
     /// `log`: explain panes without a verified Codex id (not for the autosave, every minute).
     pub(crate) fn snapshot(&self, log: bool) -> Saved {
-        let session = self.session.lock().unwrap().clone();
+        let mut session = self.session.lock().unwrap().clone();
+        // Sleeping workspaces have their own record (sleepstore.rs); the layout files, which an
+        // older orchd also reads and rewrites, never carry them.
+        session.sleeping.clear();
+        let deferred = self.deferred.lock().unwrap().clone();
         let mut panes = HashMap::new();
         let agents = self.bus.agents().unwrap_or_default();
         // If the bus cannot be read, fail closed rather than continuing a pending human ask.
@@ -474,7 +484,9 @@ impl Daemon {
             if p.exit_code().is_some() {
                 continue;
             }
-            panes.insert(p.id.clone(), saved_pane(&p, &agents, questions.as_deref()));
+            let mut sp = saved_pane(&p, &agents, questions.as_deref());
+            sp.continue_at = deferred.get(&p.id).copied();
+            panes.insert(p.id.clone(), sp);
         }
         mark_sole_codex_logged(&mut panes, log);
         Saved { session, panes }
@@ -489,6 +501,8 @@ impl Daemon {
     pub fn restore_layout(self: &Arc<Self>, mut saved: Saved, source: Source) -> usize {
         mark_sole_codex(&mut saved.panes);
         let mut session = saved.session;
+        // Sleepers come from their own record (reconciled before this), never from here.
+        session.sleeping.clear();
         let had_panes = !session.workspaces.is_empty();
         let spawned = self.spawn_saved(std::mem::take(&mut session.workspaces), &saved.panes);
         let resumed = spawned.resumed;
@@ -505,11 +519,30 @@ impl Daemon {
             }
         }
         let count = spawned.ids.len();
+        if !spawned.failed.is_empty() {
+            eprintln!(
+                "orchd: restore: {} pane(s) did not come back: {}",
+                spawned.failed.len(),
+                spawned.failed.join(", ")
+            );
+        }
+        // A usage-limit continue that was still due keeps its time.
+        for (old, p) in &spawned.ids {
+            if let Some(reset) = saved.panes[old].continue_at {
+                let name = saved.panes[old]
+                    .bus_name
+                    .clone()
+                    .unwrap_or_else(|| p.id.clone());
+                crate::sleep::schedule_continue(self, Arc::clone(p), name, reset, String::new());
+            }
+        }
         session.workspaces = spawned.workspaces;
         session.raised = None;
         {
             let mut s = self.session.lock().unwrap();
             session.version = s.version + 1;
+            // The sleepers already loaded stay.
+            session.sleeping = std::mem::take(&mut s.sleeping);
             *s = session;
         }
         let _ = self.ui_events.send(crate::ui::UiEvent::Session);
@@ -600,6 +633,7 @@ mod tests {
             session_id: None,
             agent_argv: None,
             sole_codex_in_cwd: false,
+            continue_at: None,
         }
     }
 

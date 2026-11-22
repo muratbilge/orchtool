@@ -270,6 +270,10 @@ pub enum UiOp {
     /// Replies `{session, workspace, panes, failed}`.
     WakeWorkspace {
         workspace: String,
+        /// Wake with the panes that start; the ones that don't stay asleep in a workspace of
+        /// their own ("<label>-rest"). Without it a wake is all or nothing.
+        #[serde(default)]
+        partial: bool,
     },
 }
 

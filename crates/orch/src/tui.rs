@@ -2740,7 +2740,13 @@ impl App {
         {
             self.flash("waking…");
             self.wake_req = Some(id.clone());
-            self.ui("wake", UiOp::WakeWorkspace { workspace: id });
+            self.ui(
+                "wake",
+                UiOp::WakeWorkspace {
+                    workspace: id,
+                    partial: false,
+                },
+            );
             return Mode::Normal;
         }
         let action = sel
@@ -3274,6 +3280,8 @@ mod tests {
             position: 1,
             slept_ms: 0,
             panes: Default::default(),
+            wake: None,
+            stuck: vec![],
         });
         app.ws_id = Some("w1".into());
         assert!(app
@@ -3314,6 +3322,8 @@ mod tests {
             position: 0,
             slept_ms: 0,
             panes: Default::default(),
+            wake: None,
+            stuck: vec![],
         });
         app.pick_start_workspace();
         assert!(matches!(app.mode, Mode::Workspaces(0)));

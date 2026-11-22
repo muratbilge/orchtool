@@ -98,6 +98,91 @@ pub fn start(daemon: Arc<Daemon>) {
     });
 }
 
+type Sig = Vec<(String, String, u64)>;
+type Sample = Result<(Sig, bool), String>;
+
+/// One look at a workspace: its activity signature and whether it is in use right now.
+/// `Err` when anything could not be read (then it is not idle).
+fn sample(
+    d: &Daemon,
+    session: &orch_proto::layout::Session,
+    ws_id: &str,
+    working: &HashSet<String>,
+    own_transition: bool,
+) -> Sample {
+    let w = session
+        .workspace(ws_id)
+        .ok_or_else(|| "the workspace is gone".to_string())?;
+    let mut active = session.raised.as_ref().is_some_and(|r| r.workspace == w.id)
+        || (!own_transition && d.ws_in_transition(&w.id));
+    let deferred = d.deferred.lock().unwrap().clone();
+    let mut sig = Vec::new();
+    for id in w.tabs.iter().flat_map(|t| t.root.panes()) {
+        let p = d.find(&id).map_err(|_| format!("{id} is gone"))?;
+        if p.exit_code().is_some() {
+            return Err(format!("{id} has exited"));
+        }
+        let text = p.visible_text();
+        let (inputs, clients) = p.activity();
+        // A usage-limit continue still due: it must not be stranded asleep.
+        let pending = deferred.contains_key(&id)
+            || crate::limits::info(&id).is_some_and(|(reset, on)| reset.is_some() && on);
+        if clients > 0
+            || pending
+            || detect::detect(&text, p.agent(&text).as_deref()) == Detected::Working
+            || working.contains(&format!("orch:{id}"))
+        {
+            active = true;
+        }
+        sig.push((id, orch_proto::api::text_hash(&text), inputs));
+    }
+    Ok((sig, active))
+}
+
+fn working_panes(d: &Daemon) -> Result<HashSet<String>, String> {
+    Ok(d.bus
+        .agents()
+        .map_err(|e| format!("bus: {e:#}"))?
+        .into_iter()
+        .filter(|a| a.status == "working")
+        .filter_map(|a| a.pane)
+        .collect())
+}
+
+/// What auto-sleep saw when it decided; checked again right before the sleep commits.
+#[derive(Clone)]
+pub struct AutoCheck {
+    pub period: Duration,
+    sig: Sig,
+}
+
+impl AutoCheck {
+    /// Still idle exactly as sampled, still enabled with the same period, not exempt.
+    pub fn still_idle(&self, d: &Daemon, ws_id: &str) -> Result<(), String> {
+        if d.auto_sleep_ms() != Some(self.period.as_millis() as u64) {
+            return Err("auto-sleep was changed".into());
+        }
+        let exempt = d
+            .bus
+            .kv_get(&format!("{KEEP_AWAKE}{ws_id}"))
+            .map_err(|e| format!("bus: {e:#}"))?;
+        if exempt.is_some() {
+            return Err("it is kept awake".into());
+        }
+        let working = working_panes(d)?;
+        let session = d.session();
+        // The sleep asking holds the workspace's reservation itself.
+        let (sig, active) = sample(d, &session, ws_id, &working, true)?;
+        if active {
+            return Err("it is in use".into());
+        }
+        if sig != self.sig {
+            return Err("there was activity".into());
+        }
+        Ok(())
+    }
+}
+
 async fn check(d: &Arc<Daemon>) {
     let Some(ms) = d.auto_sleep_ms() else {
         d.auto_sleep.track.lock().unwrap().clear();
@@ -105,45 +190,28 @@ async fn check(d: &Arc<Daemon>) {
     };
     let period = Duration::from_millis(ms);
     let gen = d.auto_sleep.gen.load(Ordering::SeqCst);
-    let session = d.session();
-    let raised = session.raised.as_ref().map(|r| r.workspace.clone());
-    let working: HashSet<String> = d
-        .bus
-        .agents()
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|a| a.status == "working")
-        .filter_map(|a| a.pane)
-        .collect();
-    let keep: HashSet<String> = d
-        .bus
-        .kv_keys(KEEP_AWAKE)
-        .unwrap_or_default()
-        .into_iter()
-        .collect();
-    // Read every pane first (pane / terminal locks), then the tracking table (a leaf).
-    let mut seen = Vec::new();
-    for w in &session.workspaces {
-        let mut active = raised.as_deref() == Some(w.id.as_str());
-        let mut sig = Vec::new();
-        for id in w.tabs.iter().flat_map(|t| t.root.panes()) {
-            match d.find(&id) {
-                Ok(p) if p.exit_code().is_none() => {
-                    let text = p.visible_text();
-                    let (inputs, clients) = p.activity();
-                    if clients > 0
-                        || detect::detect(&text, p.agent(&text).as_deref()) == Detected::Working
-                        || working.contains(&format!("orch:{id}"))
-                    {
-                        active = true;
-                    }
-                    sig.push((id, orch_proto::api::text_hash(&text), inputs));
-                }
-                _ => sig.push((id, String::new(), 0)),
-            }
+    // A read that fails decides nothing: every period starts again.
+    let reads = working_panes(d).and_then(|w| {
+        d.bus
+            .kv_keys(KEEP_AWAKE)
+            .map(|k| (w, k.into_iter().collect::<HashSet<String>>()))
+            .map_err(|e| format!("bus: {e:#}"))
+    });
+    let (working, keep) = match reads {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("orchd: auto-sleep: {e}");
+            d.auto_sleep.track.lock().unwrap().clear();
+            return;
         }
-        seen.push((w.id.clone(), sig, active));
-    }
+    };
+    let session = d.session();
+    // Read every pane first (pane / terminal locks), then the tracking table (a leaf).
+    let seen: Vec<(String, Sample)> = session
+        .workspaces
+        .iter()
+        .map(|w| (w.id.clone(), sample(d, &session, &w.id, &working, false)))
+        .collect();
     let now = Instant::now();
     let mut due = Vec::new();
     {
@@ -151,8 +219,15 @@ async fn check(d: &Arc<Daemon>) {
         if d.auto_sleep.gen.load(Ordering::SeqCst) != gen {
             return;
         }
-        track.retain(|id, _| seen.iter().any(|(w, _, _)| w == id));
-        for (id, sig, active) in seen {
+        track.retain(|id, _| seen.iter().any(|(w, _)| w == id));
+        for (id, r) in seen {
+            let (sig, active) = match r {
+                Ok(r) => r,
+                Err(_) => {
+                    track.remove(&id);
+                    continue;
+                }
+            };
             let t = track.entry(id.clone()).or_insert_with(|| Track {
                 since: now,
                 sig: sig.clone(),
@@ -161,27 +236,28 @@ async fn check(d: &Arc<Daemon>) {
                 t.since = now;
                 t.sig = sig;
             } else if now.duration_since(t.since) >= period && !keep.contains(&id) {
-                due.push(id);
+                due.push((id, t.sig.clone()));
             }
         }
     }
-    for id in due {
+    for (id, sig) in due {
         if d.auto_sleep.gen.load(Ordering::SeqCst) != gen {
             return;
         }
-        // The same checks as a plain `orch ws sleep`: never forced.
-        let result = d.sleep_workspace(&id, false, false, Some(period)).await;
+        // The same checks as a plain `orch ws sleep` (never forced), then this sample again.
+        let check = AutoCheck { period, sig };
+        let result = d.sleep_workspace(&id, false, false, Some(check)).await;
         let mut track = d.auto_sleep.track.lock().unwrap();
         match result {
             Ok(_) => {
                 track.remove(&id);
             }
             Err(e) => {
-                // Busy (a dialog, a question, a task, a job): try again after a full period.
+                // Busy, in use or changed: a new full period.
                 if let Some(t) = track.get_mut(&id) {
                     t.since = Instant::now();
                 }
-                if e.code != "ws_busy" {
+                if !matches!(e.code, "ws_busy" | "auto_aborted" | "ws_transition") {
                     eprintln!("orchd: auto-sleep {id}: {}", e.message);
                 }
             }
