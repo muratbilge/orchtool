@@ -1,5 +1,17 @@
 # Status
 
+## 2026-11-22 — Sleep: sixth-check fixes (ended panes, lone Codex beside a sleeper) — Claude (Opus)
+
+- **Ended panes:** the start-up filter also leaves out every pane id in a sleeper's saved tab trees, so a pane
+  whose program ended before the sleep (no restartable record) is not run again from a stale autosave. A wake
+  still starts only panes with a record.
+- **Codex `--last`:** after main's `mark_sole_codex`, an awake Codex pane in a folder where a loaded sleeper has
+  a Codex pane is not alone there: picker, not `resume --last`. With no sleepers the decision is main's. A wake
+  never uses `--last` (unchanged).
+- Sweep (bus names, tasks, questions, labels): already counted sleepers. Pane names: a new awake pane may take a
+  sleeping pane's name; its wake then fails (all or nothing, sleeper kept) until one is renamed. Not changed.
+Tests `h1_…`, `h2_…` (two).
+
 ## 2026-11-22 — Sleep: fifth-check fixes (in-memory start-up filter, wake-bound confirmer) — Claude (Opus)
 
 - **A1/A2:** no layout file is rewritten or set aside at start-up any more. `restore_layout` calls

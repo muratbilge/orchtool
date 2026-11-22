@@ -34,8 +34,8 @@ Built in Rust (stable) by Claude Code and Codex with Murat Bilge steering, for o
   end (a failed write, folder sync included, ends nothing). Restarts, crashes and a plain `stop-daemon` keep it;
   the restart path itself (`restore.json`, the autosave) is unchanged. The sleeper record is the truth for
   its panes: if orchd dies before the autosave has caught up with a sleep or a wake (about 2 s), the restore
-  leaves those panes out of whatever layout it reads (in memory; no file is rewritten), so they are never
-  started twice, and the workspace comes back asleep (wake it again). A wake drops the sleeper only once the autosave holds the
+  leaves those panes out of whatever layout it reads (in memory; no file is rewritten), also ones whose program
+  had already ended before the sleep, so they are never started twice, and the workspace comes back asleep (wake it again). A wake drops the sleeper only once the autosave holds the
   woken workspace; a woken pane that ends before that is not waited for, and the workspace is never held
   reserved for more than 30 s. A wake is all or nothing: if a pane can't be
   started, none is and the sleeper stays as it was; a started pane that then can't be ended keeps running
@@ -113,7 +113,7 @@ Rust stable via rustup with rustfmt and clippy (`rust-toolchain.toml`). The scri
   If identity is unavailable or origin validation fails, orch logs why. A Codex pane that is the
   only Codex pane in its folder then comes back with `codex resume --last` (Codex's `--last` is per
   folder, so it cannot mean another pane); with several Codex panes in one folder it comes back at
-  `codex resume` (the picker), **not** `--last`. Existing explicit resume IDs still work. No
+  `codex resume` (the picker), **not** `--last`; a sleeping Codex pane in that folder counts too. Existing explicit resume IDs still work. No
   timestamp, newest-file, or shared app-server FD guessing. Private tests must pass `--socket`
   before `hook`, or export `ORCHD_SOCKET`; keep HOME separate. Neither config file is edited by
   the build/install scripts.
