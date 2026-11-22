@@ -92,10 +92,11 @@ not an option index.
 | 12 | the pane's program has exited | **not sent** |
 | 13 | the program is not reading its input | **not sent** |
 | 14 | no such pane / question / task / task target, or the pane is not in a workspace (`focus`) | **not sent** |
+| 15 | `ws sleep`: the workspace is busy (see "Sleeping workspaces") | **not done** |
 | 20 | orchd unreachable: not running, did not start, or did not answer | not sent when the connection failed; **unknown** when it broke mid-request |
 | 3, 4 | Kabuk's wrapper (no `orch`, no folder) | not sent |
 
-"Certainly not sent": 2, 3, 4, 10–14. An SSH timeout, 1 and 20 are **unsure**: Kabuk must not conclude "changed"
+"Certainly not sent": 2, 3, 4, 10–15. An SSH timeout, 1 and 20 are **unsure**: Kabuk must not conclude "changed"
 or "taken" from them, nor release its own answer ledger.
 
 ## 4. Guarantees
@@ -200,3 +201,41 @@ serialized task key. P6A uses this generator because private sockets are unavail
 sandbox. On the integration host, also capture a real `orch --socket <private> watch --once` and
 validate it. Copy the regenerated fixture into Kabuk and run its parser tests before release;
 that cross-repository step is still required, not implied by orchtool's unit test passing.
+
+## Sleeping workspaces (2026-11-22, additive)
+
+A workspace can sleep: its programs end (memory freed), its layout and how to resume each agent are kept in
+orchd, and it can be woken later with its agents resumed. Nothing in `v` changes; old Kabuk builds simply do not
+show sleeping workspaces.
+
+- **Stream:** new top-level key `sleeping`: array, in the order they were put to sleep. Each entry:
+  `{id, label, cwd, position, slept_ms, panes, tabs:[{id, label}], agents:[{name, kind, limited, interrupted}]}`.
+  `position` = its index among `workspaces` when it fell asleep (it wakes up there again, so the bar can show it
+  in place); `slept_ms` unix ms; `panes` = how many panes come back; `agents[].name` is the bus name (null for
+  an agent that never registered), `limited` = it was paused on its usage limit (it gets "continue" after the
+  reset once awake), `interrupted` = put to sleep with `--force` while busy. A sleeping workspace is **not** in
+  `workspaces`, and its agents are **not** in `agents` (their panes are gone); `workspaces[].number` and
+  `agents[].workspace_number` count awake workspaces only. Labels are unique across both lists.
+- **Actions:**
+
+  | action | command | prints / exit |
+  |--------|---------|---------------|
+  | put to sleep | `"$O" ws sleep <id\|label>` | `asleep: <label> …`; **15** = busy, nothing done (stderr lists why, one reason per line after the first) |
+  | sleep anyway | `"$O" ws sleep <id\|label> --force` | busy agents are interrupted (they get a note on wake), running programs end and come back as fresh shells |
+  | what would happen | `"$O" ws sleep <id\|label> --dry-run` | the plan: `! <reason>` lines (blockers), `- <how it comes back>` lines; exit 0 |
+  | wake | `"$O" ws wake <id\|label>` | `awake: <label> (<new pane ids>)`; `already awake: …` for an awake one; 14 = no such workspace |
+  | forget a sleeping one | `"$O" ws close <id\|label>` | nothing to kill; its running tasks fail |
+
+  Sleeping an already sleeping workspace prints `already asleep: <label>` (exit 0). `ws focus` on a sleeping
+  workspace is 14 (wake it first).
+- **Exit code 15** (new outcome, additive): `ws sleep` refused because the workspace is busy: an agent works,
+  waits on a dialog (permission prompt / menu) or for Murat's answer to a question, runs an orch task, or a
+  program runs that cannot be resumed (a job in a shell, an editor, any non-shell program). Certainly not done.
+- **While asleep:** messages to its agents stay unread (the agent is told to read them when it wakes), tasks
+  for its label can still be added and stay queued (dispatched once an agent is back), running tasks stay
+  running (they follow the pane), open questions stay open and can be answered. Nothing wakes a workspace by
+  itself; Kabuk should offer Wake on a sleeping entry.
+- **Timeline:** orchd posts `msg` rows to murat in thread `sleep` ("<label> is asleep: …", "<label> is awake:
+  …"), and in thread `limits` for a limited agent continued after a wake.
+- **Fixture:** `crates/orch/tests/fixtures/watch-v1.json` was regenerated with one sleeping workspace; copy it
+  into Kabuk (`app/src/test/resources/orch-watch.json`) the same day.

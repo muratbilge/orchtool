@@ -24,11 +24,17 @@ Built in Rust (stable) by Claude Code and Codex with Murat Bilge steering, for o
   restores it when there is no `restore.json` and agents that were working get a note that their last tool call
   and background work were lost. A plain `orch stop-daemon` removes it (the next orchd starts empty). A restore
   that does not finish is not tried again: the file is kept as `autosave.json.failed`. Questions from agents
-  whose pane is gone expire by themselves. Starts on demand from `orch`, or as a user service (`contrib/orchd.service`).
+  whose pane is gone expire by themselves. A workspace you don't need now can **sleep** (`orch ws sleep <label>`, TUI
+  `S` or the `w` list): its layout and how to resume each agent are kept, its programs end and their memory is
+  free; `orch ws wake <label>` (or Enter on it in the `w` list) brings it back with the agents resumed. It stays
+  asleep across restarts and crashes, also a plain `stop-daemon`. orchd refuses (exit 15) while an agent in it
+  works, waits on a dialog or a question, runs a task, or a program runs that can't be resumed; `--force`
+  sleeps anyway (busy agents get a note on wake), `--dry-run` shows the plan. Mail, queued tasks and open
+  questions for a sleeping agent wait for it; nothing wakes a workspace by itself. Starts on demand from `orch`, or as a user service (`contrib/orchd.service`).
 - **`orch`**, the CLI and the TUI (`ratatui`; mouse and touch: tap a pane or a tab, `+` for a new tab, `☰` for
   the workspace list). Panes: `new`, `ls`, `attach`, `send`, `read` (`--unwrapped` joins soft-wrapped
   rows), `kill`, `focus`, `auto-continue`; layout: `ws` and `tab`
-  (focus, new, rename, close, by id); bus: `agents`, `tail`, `msg`, `inbox`, `questions`, `question close`, `answer`,
+  (focus, new, rename, close, sleep, wake, by id); bus: `agents`, `tail`, `msg`, `inbox`, `questions`, `question close`, `answer`,
   `ask`, `status`, `hook`; `watch --json` streams everything for clients; `--host H` talks to an orchd on another
   machine through `ssh H orch proxy`; `ping` and `latency` measure the round trip.
 - **`orch-mcp`**, an MCP server for agents on the bus: `send_message`, `read_inbox`, `ask_human`,
@@ -103,7 +109,7 @@ commands, the exit codes and the shared fixture `crates/orch/tests/fixtures/watc
 
 Exit codes (`orch --help`): 0 done · 1 other error · 2 usage · 10 the screen changed, nothing sent · 11 answered
 already · 12 the program exited · 13 the program isn't reading input · 14 no such pane, question, workspace or
-tab · 20 orchd unreachable.
+tab · 15 `ws sleep`: the workspace is busy, nothing done · 20 orchd unreachable.
 
 ## License
 

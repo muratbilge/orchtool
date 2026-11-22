@@ -1,5 +1,21 @@
 # Status
 
+## 2026-11-22 — Workspaces sleep and wake — Claude (Opus, standing in for Codex)
+
+Murat: "we should be able to close and reopen the workspaces for efficiency". `orch ws sleep <ws>` keeps the
+workspace's layout (ids, tabs, splits, sizes, labels) and each pane's `restore.json` record in the layout itself
+(`Session::sleeping`, so `restore.json` / `autosave.json` carry it), writes the autosave at once, then ends its
+programs. `orch ws wake <ws>` starts them again through the restart code (`restore::spawn_saved`, shared with
+`restore_layout`), puts the workspace back at its old place, moves the agents' bus names to the new panes and
+tells an agent what it missed once it is at its prompt. Refused with `ws_busy` / exit 15 while an agent works,
+waits on a dialog or a question, runs a task, or a program runs that can't be resumed (`--force`, `--dry-run`).
+Mail, queued/running tasks and open questions wait (no expiry while asleep); a limited agent is continued after
+its reset once awake; nothing wakes by itself. Survives restart, crash and a plain `stop-daemon` (which now
+keeps an autosave with only the sleeping workspaces). TUI: `S`, `☾ sleep workspace…` and sleeping rows (Enter
+wakes) in the `w` list; a refusal turns into a forced confirmation. Watch: additive top-level `sleeping`
+(kabuk-contract-v2.md, fixture regenerated). Tests: `crates/orchd/tests/sleep.rs` (5, fake agents) + TUI/watch
+unit tests. Not installed; not tried with a real Claude/Codex resume or Kabuk.
+
 ## 2026-11-17 — P7: the layout survives an unplanned stop — Claude (Opus, standing in for Codex)
 
 orchd now keeps `autosave.json` (restore.json format, 0600, atomic) next to its socket: 2 s after a layout
