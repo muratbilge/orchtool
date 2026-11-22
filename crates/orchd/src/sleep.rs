@@ -90,9 +90,9 @@ pub fn wake_argv(sp: &SavedPane) -> (Vec<String>, Vec<(String, String)>) {
 /// How an agent will come back, in words (for the plan).
 fn resume_words(sp: &SavedPane) -> String {
     let kind = sp.agent.as_deref().unwrap_or("agent");
-    if !wake_start(sp).agent {
+    if let Some(why) = wake_start(sp).refused {
         return format!(
-            "{kind} will not be started: its start command can't be rebuilt safely (comes back as a shell with a note)"
+            "{kind} will not be started: its start command can't be rebuilt safely: {why} (comes back as a shell with a note)"
         );
     }
     match &sp.session_id {
@@ -524,11 +524,10 @@ impl Daemon {
             return (argv, env, true);
         }
         let s = crate::agent_start::start(sp, crate::agent_start::Target::Explicit);
-        if !s.agent {
+        if let Some(why) = s.refused {
             let kind = sp.agent.as_deref().unwrap_or("agent");
             eprintln!(
-                "orchd: {old}: {kind} not restarted, the pane is a shell with a note: {}",
-                crate::agent_start::note_lines(sp, kind)[1..].join("; ")
+                "orchd: {old}: {kind} not restarted ({why}); the pane is a shell with a note"
             );
         }
         (s.argv, s.env, s.agent)
@@ -1199,20 +1198,18 @@ impl Daemon {
         let _ = self.ui_events.send(crate::ui::UiEvent::Panes);
         let not_started: Vec<Value> = ok
             .iter()
-            .filter(|(_, sp, _)| sp.saved.agent.is_some() && !wake_start(&sp.saved).agent)
-            .map(|(old, sp, p)| {
+            .filter_map(|(old, sp, p)| {
+                let why = wake_start(&sp.saved).refused?;
                 let kind = sp.saved.agent.as_deref().unwrap_or("agent");
-                let lines = crate::agent_start::note_lines(&sp.saved, kind);
                 eprintln!(
-                    "orchd: wake {label}: {} (was {old}): {kind} not started, the pane is a shell with a note: {}",
-                    p.id,
-                    lines[1..].join("; ")
+                    "orchd: wake {label}: {} (was {old}): {kind} not started ({why}); the pane is a shell with a note",
+                    p.id
                 );
-                json!({
+                Some(json!({
                     "pane": p.id, "old": old, "kind": kind,
                     "name": sp.saved.bus_name.clone().or_else(|| sp.saved.name.clone()),
-                    "note": lines,
-                })
+                    "reason": why,
+                }))
             })
             .collect();
         self.after_wake_all(&ok, &w.label);

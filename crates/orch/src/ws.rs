@@ -258,8 +258,9 @@ pub async fn ws(c: &mut Conn, cmd: WsCmd) -> Result<()> {
                     .as_str()
                     .unwrap_or_else(|| n["kind"].as_str().unwrap_or("agent"));
                 println!(
-                    "not started: {who} in {}: its start command could not be rebuilt safely; the pane is a shell showing the saved command",
-                    n["pane"].as_str().unwrap_or_default()
+                    "not started: {who} in {}: its start command could not be rebuilt safely ({}); the pane shows a note",
+                    n["pane"].as_str().unwrap_or_default(),
+                    n["reason"].as_str().unwrap_or_default()
                 );
             }
             if v["confirmed"] == false {

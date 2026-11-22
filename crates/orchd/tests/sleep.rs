@@ -45,8 +45,23 @@ fn spawn_faulty(dir: &Path, socket: &Path, fault: &str) -> Child {
         .env("ORCHD_LIMIT_CHECK_MS", "100")
         .env("ORCHD_WAKE_CONFIRM_MS", "3000")
         .env("ORCHD_FAULT", fault)
+        .stderr(daemon_log(dir))
         .spawn()
         .unwrap()
+}
+
+/// The daemon's stderr: inherited, or appended to `<dir>/orchd.log` once a test created
+/// `<dir>/log-to-file` (to check what the daemon logs).
+fn daemon_log(dir: &Path) -> std::process::Stdio {
+    if !dir.join("log-to-file").exists() {
+        return std::process::Stdio::inherit();
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("orchd.log"))
+        .unwrap()
+        .into()
 }
 
 async fn daemon(tag: &str) -> D {
@@ -2824,7 +2839,7 @@ async fn k1_an_unknown_option_beside_a_sleeper_is_not_restarted() {
         a,
         "--sandbox".into(),
         "read-only".into(),
-        "--some-unknown-flag".into(),
+        "--some-unknown-flag=s3cr3t-token".into(),
     ];
     agent_ws(&d, "awk", &argv, &folder(&d, "proj"), "codex").await;
     wait_for("A started", || read(&d, "cxa", "args").lines().count() == 1).await;
@@ -2832,8 +2847,18 @@ async fn k1_an_unknown_option_beside_a_sleeper_is_not_restarted() {
     agent_ws(&d, "slp", &[b], Path::new("/tmp"), "codex").await;
     wait_for("B started", || read(&d, "cxb", "args").lines().count() == 1).await;
     sleep_op(&d, "slp", false).await.unwrap();
+    std::fs::write(d.dir.join("log-to-file"), b"").unwrap();
     planned_restart(&mut d).await;
-    note_shown(&d, "awk", "--some-unknown-flag").await;
+    note_shown(&d, "awk", "--some-unknown-flag=s3cr3t-token").await;
+    let log = std::fs::read_to_string(d.dir.join("orchd.log")).unwrap();
+    assert!(
+        log.contains("codex not restarted (an option of its command is not recognised)"),
+        "{log}"
+    );
+    assert!(
+        !log.contains("s3cr3t"),
+        "the log has no command line: {log}"
+    );
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(
         read(&d, "cxa", "args").lines().count(),
@@ -2846,13 +2871,15 @@ async fn k1_an_unknown_option_beside_a_sleeper_is_not_restarted() {
 /// wake output names it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn k2_an_unknown_option_is_not_started_on_wake() {
-    let d = daemon("k2").await;
+    let mut d = daemon("k2").await;
+    std::fs::write(d.dir.join("log-to-file"), b"").unwrap();
+    restart_with(&mut d, "").await;
     let a = codex_at(&d, "cxa");
     let argv = vec![
         a,
         "--sandbox".into(),
         "read-only".into(),
-        "--some-unknown-flag".into(),
+        "--some-unknown-flag=s3cr3t-token".into(),
     ];
     agent_ws(&d, "awk", &argv, &folder(&d, "proj"), "codex").await;
     wait_for("A started", || read(&d, "cxa", "args").lines().count() == 1).await;
@@ -2867,7 +2894,18 @@ async fn k2_an_unknown_option_is_not_started_on_wake() {
     assert!(out.status.success(), "{out:?}");
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.contains("not started: awk-codex"), "{text}");
-    note_shown(&d, "awk", "--some-unknown-flag").await;
+    assert!(
+        !text.contains("s3cr3t") && !v["plan"].to_string().contains("s3cr3t"),
+        "{text} {}",
+        v["plan"]
+    );
+    note_shown(&d, "awk", "--some-unknown-flag=s3cr3t-token").await;
+    let log = std::fs::read_to_string(d.dir.join("orchd.log")).unwrap();
+    assert!(log.contains("codex not started (an option"), "{log}");
+    assert!(
+        !log.contains("s3cr3t"),
+        "the log has no command line: {log}"
+    );
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(
         read(&d, "cxa", "args").lines().count(),
@@ -2922,4 +2960,68 @@ async fn k4_a_complete_command_keeps_its_options() {
         second_start(&d, "cxa").await,
         "resume --sandbox read-only --approve-for-me"
     );
+}
+
+// ---------- tenth check ----------
+
+/// 2: a relative program path (`./codex` from the pane's folder): on wake not started.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn l2_a_relative_program_path_is_not_started() {
+    let d = daemon("l2").await;
+    codex_at(&d, "cxa");
+    agent_ws(
+        &d,
+        "rel",
+        &["./codex".into(), "--approve-for-me".into()],
+        &d.dir.join("cxa"),
+        "codex",
+    )
+    .await;
+    wait_for("A started", || read(&d, "cxa", "args").lines().count() == 1).await;
+    let v = sleep_op(&d, "rel", false).await.unwrap();
+    assert!(
+        v["plan"]["notes"].to_string().contains("relative path"),
+        "{v}"
+    );
+    orch_cli(&d, &["ws", "wake", "rel"]);
+    note_shown(&d, "rel", "./codex --approve-for-me").await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(read(&d, "cxa", "args").lines().count(), 1, "not started");
+}
+
+/// 3: a saved line with quotes, a backslash, `$(...)` and a newline: shown as text in the pane
+/// (whatever the pane's shell), nothing of it runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn l3_the_note_shows_odd_text_and_runs_none_of_it() {
+    let d = daemon("l3").await;
+    codex_on_path(&d);
+    let pwned = d.dir.join("pwned");
+    let script = format!(
+        "cd . && codex it\\'s \\x; X=\"$(true)\"\necho \"$(touch {})\"; exec bash",
+        pwned.display()
+    );
+    std::fs::write(
+        d.dir.join("bin").join("codex"),
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$(dirname \"$0\")/args\"\nexec sleep 600\n",
+    )
+    .unwrap();
+    agent_ws(
+        &d,
+        "odd",
+        &["bash".into(), "-lc".into(), script],
+        &folder(&d, "proj"),
+        "codex",
+    )
+    .await;
+    wait_for("started", || read(&d, "bin", "args").lines().count() == 1).await;
+    // The wrapper itself made `pwned` when it first ran; start clean.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let _ = std::fs::remove_file(&pwned);
+    sleep_op(&d, "odd", true).await.unwrap();
+    orch_cli(&d, &["ws", "wake", "odd"]);
+    let screen = note_shown(&d, "odd", "\\x; X=\"$(true)\"").await;
+    assert!(screen.contains("$(touch"), "{screen}");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!pwned.exists(), "nothing of the saved text ran");
+    assert_eq!(read(&d, "bin", "args").lines().count(), 1, "not started");
 }

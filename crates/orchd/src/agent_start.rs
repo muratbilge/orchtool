@@ -15,12 +15,14 @@ const SHELLS: [&str; 5] = ["bash", "zsh", "sh", "fish", "dash"];
 const PICK: &str = "\u{1}orch-pick";
 
 /// What a pane runs: its argv and extra environment. `agent` is false when the agent is not
-/// started (the pane is a shell showing the note).
+/// started (the pane is a shell showing the note); `refused` then says why (no command text:
+/// it goes to logs and `orch ws wake`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Start {
     pub argv: Vec<String>,
     pub env: Vec<(String, String)>,
     pub agent: bool,
+    pub refused: Option<&'static str>,
 }
 
 /// Which conversation to name: `Verified` = the verified id, else the picker (a wake);
@@ -55,14 +57,19 @@ pub fn start(sp: &SavedPane, target: Target) -> Start {
             argv: sp.argv.clone(),
             env: Vec::new(),
             agent: true,
+            refused: None,
         };
     };
-    let Some(argv) = rebuild(sp, kind, target) else {
-        return Start {
-            argv: note(sp, kind),
-            env: Vec::new(),
-            agent: false,
-        };
+    let argv = match rebuild(sp, kind, target) {
+        Ok(argv) => argv,
+        Err(why) => {
+            return Start {
+                argv: note(sp, kind, why),
+                env: Vec::new(),
+                agent: false,
+                refused: Some(why),
+            }
+        }
     };
     if shell_pane(sp) {
         let shell = pane_shell(sp);
@@ -80,6 +87,7 @@ pub fn start(sp: &SavedPane, target: Target) -> Start {
             argv: vec![shell, "-lc".into(), script],
             env: Vec::new(),
             agent: true,
+            refused: None,
         };
     }
     Start {
@@ -90,54 +98,63 @@ pub fn start(sp: &SavedPane, target: Target) -> Start {
             .map(|n| ("ORCH_AGENT".to_string(), n.clone()))
             .collect(),
         agent: true,
+        refused: None,
     }
 }
 
 /// The agent command, only when it parses completely: the discovered agent argv, else the
-/// pane's own command, else (shell pane) its wrapper's first command when the wrapper sets
-/// nothing but orch's own `ORCH_AGENT` before it. Its program word must be the agent's
-/// (`claude`/`codex`, any folder) and is kept as written; the resume parser refuses any
-/// option it does not know. Latest-conversation selectors become the picker.
-pub fn rebuild(sp: &SavedPane, kind: &str, target: Target) -> Option<Vec<String>> {
+/// pane's own command, else (shell pane) its wrapper's first command. A shell pane's own
+/// command line must set nothing (see [`wrapper_sets_nothing`]), also when the agent's argv
+/// was discovered. The program word must be the agent's (`claude`/`codex`), a bare name or an
+/// absolute path (a relative path would be resolved from the pane's folder, not necessarily
+/// the one it ran from), kept as written; the resume parser refuses any option it does not
+/// know. Latest-conversation selectors become the picker. The error is the reason, no text of
+/// the command.
+pub fn rebuild(sp: &SavedPane, kind: &str, target: Target) -> Result<Vec<String>, &'static str> {
+    if shell_pane(sp) && !wrapper_sets_nothing(&sp.argv, kind) {
+        return Err("its shell command line sets variables or can't be read");
+    }
     let parsed = match &sp.agent_argv {
         Some(a) => a.clone(),
-        None if shell_pane(sp) => {
-            if !plain_wrapper(&sp.argv) {
-                return None;
-            }
-            crate::resume_argv::shell_agent(&sp.argv, kind)?
-        }
+        None if shell_pane(sp) => crate::resume_argv::shell_agent(&sp.argv, kind)
+            .ok_or("its agent command is not known")?,
         None => sp.argv.clone(),
     };
-    if base(parsed.first()?) != kind {
-        return None;
+    let exe = parsed.first().ok_or("its agent command is not known")?;
+    if base(exe) != kind {
+        return Err("its program is not claude/codex by name");
+    }
+    if exe.contains('/') && !exe.starts_with('/') {
+        return Err("its program is a relative path");
     }
     let discovered = match (&sp.session_id, target) {
         (Some(id), _) => Some(id.as_str()),
         (None, Target::Verified) => Some(PICK),
         (None, Target::Explicit) => None,
     };
-    let mut argv = crate::resume_argv::rewrite(&parsed, kind, discovered)?;
+    let mut argv = crate::resume_argv::rewrite(&parsed, kind, discovered)
+        .ok_or("an option of its command is not recognised")?;
     argv.retain(|a| a != PICK);
-    Some(no_latest_selector(argv, kind))
+    Ok(no_latest_selector(argv, kind))
 }
 
-/// A wrapper script (`<shell> -c '<script>'`) whose first command sets no variables other than
-/// orch's own `ORCH_AGENT` (another assignment could change how the agent runs).
-fn plain_wrapper(argv: &[String]) -> bool {
-    let Some(at) = argv
-        .iter()
-        .position(|a| a.starts_with('-') && a.ends_with('c'))
-    else {
-        return false;
+/// A shell pane's command line sets no variable that could change how the agent runs: a plain
+/// shell (no `-c` script), or a script that can be read and whose first command is the agent
+/// itself with no assignment other than orch's own `ORCH_AGENT`. Anything else (`cd … &&`,
+/// `export …;`, `env X=… codex`, `$…`, a `-c` without a script) counts as not known.
+fn wrapper_sets_nothing(argv: &[String], kind: &str) -> bool {
+    let script_flag = |a: &String| a.starts_with('-') && !a.starts_with("--") && a.contains('c');
+    let Some(at) = argv.iter().skip(1).position(script_flag).map(|i| i + 1) else {
+        return true;
     };
     let Some(Ok(words)) = argv.get(at + 1).map(|s| shell_words::split(s)) else {
         return false;
     };
-    words
-        .iter()
-        .take_while(|w| w.contains('='))
-        .all(|w| w.starts_with("ORCH_AGENT="))
+    crate::resume_argv::shell_agent(argv, kind).is_some()
+        && words
+            .iter()
+            .take_while(|w| w.contains('='))
+            .all(|w| w.starts_with("ORCH_AGENT="))
 }
 
 /// The latest-conversation selectors of a parsed agent command made into the picker: Claude
@@ -169,11 +186,12 @@ fn pane_shell(sp: &SavedPane) -> String {
         .unwrap_or_else(|| "/bin/bash".into())
 }
 
-/// The lines of the note (also logged).
-pub fn note_lines(sp: &SavedPane, kind: &str) -> Vec<String> {
+/// The lines of the note, shown only in the pane (the saved command can carry credentials:
+/// logs and `orch ws wake` get the reason only).
+pub fn note_lines(sp: &SavedPane, kind: &str, why: &str) -> Vec<String> {
     let mut lines = vec![
         format!(
-            "orch: {kind} was not restarted: its start command could not be reconstructed safely."
+            "orch: {kind} was not restarted: its start command could not be reconstructed safely ({why})."
         ),
         format!("Saved command: {}", shell_words::join(&sp.argv)),
     ];
@@ -186,20 +204,22 @@ pub fn note_lines(sp: &SavedPane, kind: &str) -> Vec<String> {
     lines
 }
 
-/// A plain shell in the pane's folder that first prints the note. Only the quoted note is
-/// printed; nothing of the saved command runs.
-fn note(sp: &SavedPane, kind: &str) -> Vec<String> {
-    let shell = pane_shell(sp);
-    let quoted: Vec<String> = note_lines(sp, kind)
-        .iter()
-        .map(|l| shell_words::quote(l).into_owned())
-        .collect();
-    let script = format!(
-        "printf '%s\\n' {}; exec {}",
-        quoted.join(" "),
-        shell_words::quote(&shell)
-    );
-    vec![shell, "-lc".into(), script]
+/// The script of the note: fixed, POSIX `sh`. The lines and the shell to continue in are its
+/// arguments, never part of the script text, so no shell's quoting rules apply to them.
+pub const NOTE_SCRIPT: &str = "shell=$1; shift; printf '%s\\n' \"$@\"; exec \"$shell\"";
+
+/// `/bin/sh` printing the note, then the pane's shell (the user's login shell for a direct
+/// agent pane) in the pane's folder. Nothing of the saved command runs.
+fn note(sp: &SavedPane, kind: &str, why: &str) -> Vec<String> {
+    let mut argv = vec![
+        "/bin/sh".to_string(),
+        "-c".into(),
+        NOTE_SCRIPT.into(),
+        "orch-note".into(),
+        pane_shell(sp),
+    ];
+    argv.extend(note_lines(sp, kind, why));
+    argv
 }
 
 #[cfg(test)]
@@ -391,48 +411,148 @@ mod tests {
                 }
                 None => {
                     assert!(!s.agent, "{:?}", pane.argv);
-                    let script = &s.argv[2];
-                    assert!(script.starts_with("printf '%s\\n' "), "{script}");
-                    assert!(script.contains("could not be reconstructed safely"));
-                    assert!(script.contains("Saved command: "));
+                    let why = s.refused.expect("a reason");
+                    assert_eq!(
+                        &s.argv[..4],
+                        &v(&["/bin/sh", "-c", NOTE_SCRIPT, "orch-note"])[..]
+                    );
+                    assert!(s.argv[5].contains(why));
+                    assert_eq!(
+                        s.argv[6],
+                        format!("Saved command: {}", shell_words::join(&pane.argv))
+                    );
                     if let Some(i) = &pane.session_id {
-                        assert!(script.contains(&format!("Conversation id: {i}")));
+                        assert!(s.argv.contains(&format!("Conversation id: {i}")));
                     }
-                    // Only printf and exec of the shell: the saved text is quoted, not run.
-                    let words = shell_words::split(script).unwrap();
-                    assert_eq!(words[0], "printf");
-                    assert_eq!(words[words.len() - 2], "exec");
                 }
             }
         }
     }
 
-    /// The note shell: the pane's own shell for a shell pane, the login shell for a direct one;
-    /// no ORCH_AGENT, and the saved line is shown shell-quoted.
+    /// Tenth check 1 and 2: a shell command line that sets a variable (or can't be read) gives
+    /// the note also when the agent's argv was discovered; a relative program path gives the
+    /// note; a bare name or an absolute path starts.
     #[test]
-    fn the_note_shows_the_saved_line_and_runs_nothing_of_it() {
-        let mut p = saved(&["zsh", "-c", "cd . && codex"], Some("codex"));
-        p.bus_name = Some("x-codex".into());
-        let s = start(&p, Target::Verified);
-        assert!(!s.agent && s.env.is_empty());
-        assert_eq!(&s.argv[..2], &v(&["zsh", "-lc"])[..]);
-        let mut words = shell_words::split(&s.argv[2]).unwrap();
-        // The `;` after the last quoted line sticks to it when split into words.
-        words[3] = words[3].trim_end_matches(';').to_string();
+    fn wrapper_variables_and_relative_programs_are_refused() {
+        let with = |argv: &[&str], agent: &[&str]| {
+            let mut p = saved(argv, Some("codex"));
+            p.agent_argv = Some(v(agent));
+            start(&p, Target::Verified)
+        };
+        for (argv, agent) in [
+            (
+                &["bash", "-lc", "CODEX_HOME=/x codex; exec bash"][..],
+                &["/opt/x/codex"][..],
+            ),
+            (
+                &["bash", "-lc", "export CODEX_HOME=/x; codex"][..],
+                &["codex"][..],
+            ),
+            (
+                &["bash", "-lc", "env CODEX_HOME=/x codex"][..],
+                &["codex"][..],
+            ),
+            (&["bash", "-lc", "cd p && codex"][..], &["codex"][..]),
+            (&["bash", "-lc", "X=$(cat f) codex"][..], &["codex"][..]),
+            (&["bash", "-c"][..], &["codex"][..]),
+            (&["bash", "-lc", "'unclosed"][..], &["codex"][..]),
+            // Relative program paths.
+            (&["bash", "--norc"][..], &["./bin/codex"][..]),
+            (&["bash", "--norc"][..], &["bin/codex"][..]),
+        ] {
+            let s = with(argv, agent);
+            assert!(!s.agent, "{argv:?} {agent:?}");
+        }
+        // Main's own restart (no sleeper) has both behaviours today: the wrapper's variable is
+        // dropped, and a relative program is run again as written from the pane's folder.
+        let mut env = saved(
+            &["bash", "-lc", "CODEX_HOME=/x codex; exec bash"],
+            Some("codex"),
+        );
+        env.agent_argv = Some(v(&["/opt/x/codex"]));
         assert_eq!(
-            words,
+            restart_spec(&env).0,
+            v(&["bash", "-lc", "/opt/x/codex resume; exec bash"])
+        );
+        let mut rel = saved(&["bash", "--norc"], Some("codex"));
+        rel.agent_argv = Some(v(&["bin/codex", "--approve-for-me"]));
+        assert_eq!(
+            restart_spec(&rel).0,
             v(&[
-                "printf",
-                "%s\\n",
-                "orch: codex was not restarted: its start command could not be reconstructed safely.",
-                "Saved command: zsh -c 'cd . && codex'",
-                "exec",
-                "zsh",
+                "bash",
+                "-lc",
+                "bin/codex resume --approve-for-me; exec bash"
             ])
         );
-        let direct = saved(&["codex", "--nope"], Some("codex"));
-        let s = start(&direct, Target::Verified);
-        assert_eq!(s.argv[1], "-lc");
-        assert!(SHELLS.contains(&base(&s.argv[0])) || std::env::var("SHELL").is_ok());
+        assert_eq!(
+            restart_spec(&saved(&["./bin/codex"], Some("codex"))).0,
+            v(&["./bin/codex", "resume"])
+        );
+        let s = start(&saved(&["./bin/codex"], Some("codex")), Target::Verified);
+        assert_eq!(s.refused, Some("its program is a relative path"));
+        // Allowed: a plain shell, orch's own ORCH_AGENT, a bare name, an absolute path.
+        for (argv, agent) in [
+            (
+                &["bash", "--norc"][..],
+                &["codex", "--sandbox", "read-only"][..],
+            ),
+            (
+                &["bash", "-lc", "ORCH_AGENT=x codex; exec bash"][..],
+                &["/opt/x/codex"][..],
+            ),
+        ] {
+            let s = with(argv, agent);
+            assert!(s.agent, "{argv:?} {agent:?}");
+        }
+        assert!(start(&saved(&["/opt/x/codex"], Some("codex")), Target::Verified).agent);
+    }
+
+    /// Tenth check 3: the note's lines are process arguments of a fixed POSIX script; quotes,
+    /// backslashes, `$(...)`, newlines come out exactly as text and nothing runs.
+    #[test]
+    fn the_note_prints_any_saved_text_verbatim_and_runs_nothing() {
+        let dir = std::env::temp_dir().join(format!("orch-note-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pwned = dir.join("pwned");
+        let nasty = format!(
+            "cd . && codex 'it'\\''s' \\x \"$(touch {})\" `touch {}`\nsecond line; exec fish",
+            pwned.display(),
+            pwned.display()
+        );
+        let mut p = saved(&["fish", "-c", &nasty], Some("codex"));
+        p.session_id = Some("sid-1".into());
+        let s = start(&p, Target::Verified);
+        assert!(!s.agent);
+        assert_eq!(
+            &s.argv[..4],
+            &v(&["/bin/sh", "-c", NOTE_SCRIPT, "orch-note"])[..]
+        );
+        assert_eq!(s.argv[4], "fish", "continues in the pane's own shell");
+        let lines = s.argv[5..].to_vec();
+        // Run the note itself, with `true` as the shell to continue in.
+        let out = std::process::Command::new(&s.argv[0])
+            .args(&s.argv[1..4])
+            .arg("true")
+            .args(&lines)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        assert_eq!(
+            String::from_utf8(out.stdout).unwrap(),
+            lines.join("\n") + "\n"
+        );
+        assert!(lines
+            .iter()
+            .any(|l| l.contains("$(touch") && l.contains('\n')));
+        assert!(lines.contains(&"Conversation id: sid-1".to_string()));
+        assert!(!pwned.exists(), "nothing of the saved text ran");
+        let _ = std::fs::remove_dir_all(&dir);
+        // A direct agent pane continues in the login shell.
+        let s = start(
+            &saved(&["codex", "--nope"], Some("codex")),
+            Target::Verified,
+        );
+        assert_eq!(s.argv[0], "/bin/sh");
+        assert!(s.env.is_empty());
     }
 }
