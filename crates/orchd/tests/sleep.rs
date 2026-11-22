@@ -3,7 +3,7 @@
 use orch_proto::api::{NewPane, RegisterAgent, Request, Spawn, UiOp};
 use orch_proto::client::{ClientError, Conn};
 use orch_proto::layout::{Dir, Node, Session};
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
@@ -43,6 +43,7 @@ fn spawn_faulty(dir: &Path, socket: &Path, fault: &str) -> Child {
         .env("ORCHD_AUTO_SLEEP_TICK_MS", "100")
         .env("ORCHD_WAKE_GRACE_MS", "300")
         .env("ORCHD_LIMIT_CHECK_MS", "100")
+        .env("ORCHD_WAKE_CONFIRM_MS", "3000")
         .env("ORCHD_FAULT", fault)
         .spawn()
         .unwrap()
@@ -81,6 +82,18 @@ async fn restart_with(d: &mut D, fault: &str) {
     d.fault = fault.to_string();
     d.child = spawn_faulty(&d.dir, &d.socket, fault);
     conn(d).await;
+}
+
+/// The daemon again with a fault that kills it during start-up (it never serves): waits for that.
+async fn start_crashing(d: &mut D, fault: &str) {
+    if d.child.try_wait().unwrap().is_none() {
+        tokio::time::sleep(Duration::from_millis(600)).await;
+    }
+    let _ = d.child.kill();
+    let _ = d.child.wait();
+    d.fault = fault.to_string();
+    d.child = spawn_faulty(&d.dir, &d.socket, fault);
+    wait_dead(d);
 }
 
 /// Waits for the daemon to die by itself (an injected crash).
@@ -1227,14 +1240,17 @@ async fn f5_a_crash_mid_wake_keeps_tasks_names_and_questions_consistent() {
         .unwrap()
         .iter()
         .any(|r| r["id"] == qid));
-    // Killed after the autosave holds the new panes, before the sleeper is dropped: awake.
+    // Killed after the autosave holds the new panes, before the sleeper is dropped: the
+    // sleeper record wins (the stale awake copy is never started), one copy, and it wakes.
     restart_with(&mut d, "wake_before_drop").await;
     let _ = wake_op(&d, "proj").await;
     wait_dead(&mut d);
     restart_with(&mut d, "").await;
     let s = session(&d).await;
-    assert!(s.workspace("proj").is_some(), "awake");
-    assert!(s.sleeping.is_empty(), "no sleeper left");
+    assert!(s.sleeping("proj").is_some(), "asleep");
+    assert!(s.workspace("proj").is_none(), "no awake copy as well");
+    wake_op(&d, "proj").await.unwrap();
+    assert!(session(&d).await.sleeping.is_empty());
 }
 
 /// The running pane named `name`.
@@ -1511,10 +1527,14 @@ async fn r1_a_folder_sync_failure_is_a_failed_sleep() {
     let s = session(&d).await;
     assert!(s.workspace("proj").is_some() && s.sleeping("proj").is_none());
     assert_eq!(running_panes(&d).await, before, "nothing ended");
+    // Known limit: the slot that failed its folder sync may still be on disk, then the next
+    // start finds it asleep (its record was complete); never two copies.
     restart_with(&mut d, "").await;
     let s = session(&d).await;
-    assert!(s.workspace("proj").is_some(), "awake");
-    assert!(s.sleeping("proj").is_none(), "not also asleep");
+    assert!(
+        s.workspace("proj").is_some() != s.sleeping("proj").is_some(),
+        "one copy"
+    );
 }
 
 /// #2: a planned restart that could not save its layout leaves orchd running with sleep and
@@ -1875,8 +1895,8 @@ async fn rstore_a_damaged_slot_blocks_writes() {
 // ---------- second re-check (Codex, 2026-11-22): one crash-safe reconcile by pane lineage ----------
 
 /// #1: killed right after the sleeper slot was renamed into place (before it was published or
-/// anything ended): the workspace is still in the autosave, that awake copy wins, the sleeper
-/// record goes. One copy.
+/// anything ended): the record on disk is the truth, the stale awake copy in the autosave is
+/// never started. One copy, asleep.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn c1_a_crash_right_after_the_rename_keeps_one_copy() {
     let mut d = daemon("c1").await;
@@ -1886,11 +1906,11 @@ async fn c1_a_crash_right_after_the_rename_keeps_one_copy() {
     wait_dead(&mut d);
     restart_with(&mut d, "").await;
     let s = session(&d).await;
-    assert!(s.workspace("proj").is_some(), "awake");
-    assert!(s.sleeping.is_empty(), "no sleeper as well");
-    // The dropped sleeper is gone from the record too.
+    assert!(s.sleeping("proj").is_some(), "asleep");
+    assert!(s.workspace("proj").is_none(), "no awake copy as well");
     restart_with(&mut d, "").await;
-    assert!(session(&d).await.sleeping.is_empty());
+    let s = session(&d).await;
+    assert!(s.sleeping("proj").is_some() && s.workspace("proj").is_none());
 }
 
 /// #6: a send admitted before a sleep is protected until its Enter: the sleep waits for it.
@@ -2034,4 +2054,297 @@ async fn d5_sleepers_are_never_duplicated() {
     assert_eq!(session(&d).await.sleeping.len(), 1);
     wake_op(&d, "proj").await.unwrap();
     assert!(session(&d).await.sleeping.is_empty());
+}
+
+// ---------- fourth check (cut-down branch) ----------
+
+/// The newest sleeper record on disk.
+fn record(d: &D) -> Value {
+    ["sleeping.a.json", "sleeping.b.json"]
+        .iter()
+        .filter_map(|n| std::fs::read(d.dir.join(n)).ok())
+        .filter_map(|b| serde_json::from_slice::<Value>(&b).ok())
+        .max_by_key(|v| v["generation"].as_u64().unwrap_or(0))
+        .unwrap()
+}
+
+/// A workspace "two" with two tabs: pane A (tab 1) and pane B (tab 2), both shells; asleep, the
+/// daemon stopped. Returns (A, B).
+async fn two_tabs_asleep(d: &mut D) -> (String, String) {
+    let (ws, a) = shell_ws(d, "two").await;
+    let v = op(
+        d,
+        UiOp::NewTab {
+            workspace: ws,
+            spawn: spawn(&["bash".into(), "--norc".into()]),
+        },
+    )
+    .await;
+    let b = v["pane"]["id"].as_str().unwrap().to_string();
+    sleep_op(d, "two", false).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let _ = d.child.kill();
+    let _ = d.child.wait();
+    (a, b)
+}
+
+/// An autosave holding the sleeper's workspace as it was before the sleep, with the given tabs
+/// (by pane) only: a stale awake copy (the autosave had not caught up when orchd died).
+fn stale_autosave(d: &D, keep: &[&str], break_pane: Option<&str>) {
+    let rec = record(d);
+    let x = &rec["sleeping"][0];
+    let mut ws = x["workspace"].clone();
+    let tabs: Vec<Value> = ws["tabs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|t| keep.iter().any(|p| t["root"]["pane"] == *p))
+        .cloned()
+        .collect();
+    ws["tabs"] = Value::Array(tabs);
+    ws["active_tab"] = json!(0);
+    let mut panes = serde_json::Map::new();
+    for p in keep {
+        let mut sp = x["panes"][*p].clone();
+        if break_pane == Some(*p) {
+            sp["argv"] = json!(["/nonexistent/orch-test-program"]);
+        }
+        panes.insert(p.to_string(), sp);
+    }
+    let saved = json!({
+        "session": {"version": 1, "workspaces": [ws], "next_id": rec["next_id"]},
+        "panes": panes,
+    });
+    std::fs::write(
+        d.dir.join("autosave.json"),
+        serde_json::to_vec(&saved).unwrap(),
+    )
+    .unwrap();
+}
+
+fn asleep_with(s: &Session, label: &str, n: usize) -> bool {
+    s.sleeping(label).is_some_and(|x| x.panes.len() == n) && s.workspace(label).is_none()
+}
+
+/// A: the slot holds A+B, the autosave only A (it had not caught up): the sleeper record wins,
+/// nothing of it is started, both panes stay asleep.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e5_a_stale_autosave_with_part_of_a_sleeper_loses() {
+    let mut d = daemon("e5a").await;
+    let (a, _b) = two_tabs_asleep(&mut d).await;
+    stale_autosave(&d, &[&a], None);
+    restart_with(&mut d, "").await;
+    let s = session(&d).await;
+    assert!(asleep_with(&s, "two", 2), "asleep with both panes");
+    wake_op(&d, "two").await.unwrap();
+    assert_eq!(session(&d).await.workspace("two").unwrap().tabs.len(), 2);
+}
+
+/// A: the stale copy holds both panes, one of which can't be started: still asleep with both.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e5_a_stale_copy_with_a_failing_pane_loses_nothing() {
+    let mut d = daemon("e5b").await;
+    let (a, b) = two_tabs_asleep(&mut d).await;
+    stale_autosave(&d, &[&a, &b], Some(&b));
+    restart_with(&mut d, "").await;
+    assert!(asleep_with(&session(&d).await, "two", 2));
+}
+
+/// A: an interrupted wake whose awake layout reached the autosave, then record writes fail at
+/// the next start (its cleanup can't be written): one copy only, now and after another start.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e5_a_failed_cleanup_never_leaves_two_copies() {
+    let mut d = daemon("e5c").await;
+    shell_ws(&d, "one").await;
+    sleep_op(&d, "one", false).await.unwrap();
+    restart_with(&mut d, "wake_before_drop").await;
+    let _ = wake_op(&d, "one").await;
+    wait_dead(&mut d);
+    restart_with(&mut d, "store_write").await;
+    restart_with(&mut d, "").await;
+    let s = session(&d).await;
+    let awake = s
+        .workspaces
+        .iter()
+        .filter(|w| w.label.starts_with("one"))
+        .count();
+    let asleep = s
+        .sleeping
+        .iter()
+        .filter(|x| x.workspace.label.starts_with("one"))
+        .count();
+    assert_eq!(
+        awake + asleep,
+        1,
+        "one copy: {awake} awake, {asleep} asleep"
+    );
+    if asleep == 1 {
+        wake_op(&d, "one").await.unwrap();
+    }
+    let s = session(&d).await;
+    assert_eq!(
+        s.workspaces
+            .iter()
+            .filter(|w| w.label.starts_with("one"))
+            .count(),
+        1
+    );
+    assert!(s.sleeping.is_empty());
+}
+
+/// A: a second crash right after the start that took the stale copy out (before any new
+/// autosave): the next start still has it asleep with both panes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e5_a_second_crash_before_the_first_new_autosave() {
+    let mut d = daemon("e5d").await;
+    let (a, _b) = two_tabs_asleep(&mut d).await;
+    stale_autosave(&d, &[&a], None);
+    start_crashing(&mut d, "after_install").await;
+    restart_with(&mut d, "").await;
+    assert!(asleep_with(&session(&d).await, "two", 2));
+}
+
+/// B: a split of a pane given by its name is counted through placement like one by id.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e6_a_split_by_pane_name_is_placed_before_a_sleep() {
+    let mut d = daemon("e6").await;
+    restart_with(&mut d, "split_pause_ms=800,store_slow_ms=600").await;
+    let mut named = spawn(&["bash".into(), "--norc".into()]);
+    named.name = Some("nm".into());
+    op(
+        &d,
+        UiOp::NewWorkspace {
+            label: Some("byname".into()),
+            spawn: named,
+        },
+    )
+    .await;
+    let socket = d.socket.clone();
+    let splitting = tokio::spawn(async move {
+        let mut c = Conn::unix(&socket).await.unwrap();
+        c.request(&Request::Ui(UiOp::Split {
+            pane: "nm".into(),
+            dir: Dir::Down,
+            spawn: Spawn {
+                argv: vec!["bash".into(), "--norc".into()],
+                cwd: Some("/tmp".into()),
+                ..Default::default()
+            },
+        }))
+        .await
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    sleep_op(&d, "byname", false).await.unwrap();
+    let new_pane = splitting
+        .await
+        .unwrap()
+        .ok()
+        .and_then(|v| v["pane"]["id"].as_str().map(str::to_string));
+    if let Some(p) = new_pane {
+        assert!(
+            !running_panes(&d).await.contains(&p),
+            "the split's pane is not left running outside the layout"
+        );
+        assert!(session(&d)
+            .await
+            .sleeping("byname")
+            .unwrap()
+            .panes
+            .contains_key(&p));
+    }
+}
+
+/// C: one woken pane ends before the first autosave holds the woken workspace: the wake still
+/// completes, the reservation is released, the sibling takes input, stop-daemon works.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e7_a_pane_ending_before_the_checkpoint_does_not_hold_the_wake() {
+    let mut d = daemon("e7").await;
+    let dir = d.dir.join("quit");
+    std::fs::create_dir_all(&dir).unwrap();
+    let program = dir.join("fake-claude");
+    let trigger = dir.join("trigger");
+    std::fs::write(
+        &program,
+        format!(
+            "#!/bin/sh\nstty -echo\nprintf 'Done\\n⏵⏵ auto mode on (shift+tab to cycle)\\n'\nwhile [ ! -f {} ]; do sleep 0.05; done\n",
+            trigger.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let v = op(
+        &d,
+        UiOp::NewWorkspace {
+            label: Some("pairq".into()),
+            spawn: spawn(&[program.to_string_lossy().into_owned()]),
+        },
+    )
+    .await;
+    let q = v["pane"]["id"].as_str().unwrap().to_string();
+    register(&d, &q, "pairq-claude").await;
+    op(
+        &d,
+        UiOp::Split {
+            pane: q.clone(),
+            dir: Dir::Right,
+            spawn: spawn(&["bash".into(), "--norc".into()]),
+        },
+    )
+    .await;
+    wait_status(&d, &q, "idle").await;
+    sleep_op(&d, "pairq", false).await.unwrap();
+    // No autosave can be written for now (a folder in its place).
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let auto = d.dir.join("autosave.json");
+    let _ = std::fs::remove_file(&auto);
+    std::fs::create_dir_all(auto.join("blocked")).unwrap();
+    let socket = d.socket.clone();
+    let waking = tokio::spawn(async move {
+        let mut c = Conn::unix(&socket).await.unwrap();
+        c.request(&Request::Ui(UiOp::WakeWorkspace {
+            workspace: "pairq".into(),
+        }))
+        .await
+    });
+    for _ in 0..200 {
+        if session(&d).await.workspace("pairq").is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    // The woken agent ends; then autosaves work again.
+    std::fs::write(&trigger, b"x").unwrap();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    std::fs::remove_dir_all(&auto).unwrap();
+    let started = std::time::Instant::now();
+    waking.await.unwrap().unwrap();
+    assert!(started.elapsed() < Duration::from_secs(10));
+    let s = session(&d).await;
+    let alive: Vec<String> = s
+        .workspace("pairq")
+        .unwrap()
+        .tabs
+        .iter()
+        .flat_map(|t| t.root.panes())
+        .collect();
+    let running = running_panes(&d).await;
+    let sib = alive
+        .into_iter()
+        .find(|p| running.contains(p))
+        .expect("the sibling runs");
+    req(
+        &d,
+        Request::Send(orch_proto::api::SendPane {
+            pane: sib,
+            text: "echo hi".into(),
+            enter: true,
+            ..Default::default()
+        }),
+    )
+    .await
+    .expect("the sibling takes input");
+    assert!(session(&d).await.sleeping.is_empty(), "the sleeper went");
+    let out = orch_cli(&d, &["stop-daemon"]);
+    assert!(out.status.success(), "{out:?}");
+    d.child.wait().unwrap();
 }

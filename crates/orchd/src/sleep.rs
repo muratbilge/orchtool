@@ -222,13 +222,11 @@ fn unique_label(s: &Session, base: &str) -> String {
 /// A sleep's plan, each pane's record, and the pane ids the workspace held.
 type Inspected = (SleepPlan, HashMap<String, SleptPane>, Vec<String>);
 
-/// The sleepers read at start-up, and the panes of each workspace in the layout file the
-/// restore is about to use (to recognise an awake copy of a sleeper afterwards).
+/// The sleepers read at start-up.
 #[derive(Default)]
 pub struct Sleepers {
     list: Vec<Sleeping>,
     next_id: u64,
-    layout: HashMap<String, HashSet<String>>,
 }
 
 /// What a commit changes: the whole new sleeper list, and awake workspaces taken out (by id).
@@ -557,46 +555,92 @@ impl Daemon {
         } else {
             None
         };
-        if let Some(saved) = file
-            .and_then(|f| std::fs::read(f).ok())
-            .and_then(|d| serde_json::from_slice::<crate::restore::Saved>(&d).ok())
-        {
-            for w in saved.session.workspaces {
-                sl.layout.insert(
-                    w.id.clone(),
-                    w.tabs.iter().flat_map(|t| t.root.panes()).collect(),
-                );
+        // The sleeper record is the truth for its panes: any of them (its old pane ids, or the
+        // new ids of an interrupted wake) still in that layout file is a stale awake copy and is
+        // taken out of it before the restore reads it, so it is never started. Only done when a
+        // sleeper overlaps the file.
+        let mine: HashSet<String> = sl
+            .list
+            .iter()
+            .flat_map(|x| {
+                x.panes
+                    .keys()
+                    .cloned()
+                    .chain(x.wake.iter().flat_map(|w| w.map.values().cloned()))
+            })
+            .collect();
+        if let Some(file) = file.filter(|_| !mine.is_empty()) {
+            if let Some(mut saved) = std::fs::read(&file)
+                .ok()
+                .and_then(|d| serde_json::from_slice::<crate::restore::Saved>(&d).ok())
+            {
+                let stale = saved
+                    .session
+                    .workspaces
+                    .iter()
+                    .flat_map(|w| w.tabs.iter().flat_map(|t| t.root.panes()))
+                    .any(|p| mine.contains(&p));
+                if stale {
+                    saved.panes.retain(|id, _| !mine.contains(id));
+                    let keep: HashMap<String, String> = saved
+                        .session
+                        .workspaces
+                        .iter()
+                        .flat_map(|w| w.tabs.iter().flat_map(|t| t.root.panes()))
+                        .filter(|p| !mine.contains(p))
+                        .map(|p| (p.clone(), p))
+                        .collect();
+                    saved.session.workspaces = saved
+                        .session
+                        .workspaces
+                        .iter()
+                        .filter_map(|w| mapped(w, &keep))
+                        .collect();
+                    let written = if crate::fault::on("strip_write") {
+                        Err(std::io::Error::other("injected"))
+                    } else {
+                        crate::restore::layout_bytes(&saved)
+                            .map_err(std::io::Error::from)
+                            .and_then(|d| crate::restore::write_atomic(&file, &d))
+                    };
+                    match written {
+                        Ok(()) => eprintln!(
+                            "orchd: {} held panes of a sleeping workspace; they stay asleep",
+                            file.display()
+                        ),
+                        Err(e) => {
+                            // Never start a sleeper's panes: the whole file is set aside
+                            // (kept, not restored) rather than restored with them.
+                            let aside = file.with_extension("json.sleeper-conflict");
+                            let _ = std::fs::rename(&file, &aside);
+                            eprintln!(
+                                "orchd: taking a sleeper's panes out of {} failed ({e}); it is kept as {} and not restored",
+                                file.display(),
+                                aside.display()
+                            );
+                        }
+                    }
+                }
             }
         }
+        crate::fault::crash_at("after_sleep_strip");
         *self.loading_sleepers.lock().unwrap() = sl.list.clone();
         sl
     }
 
-    /// Start-up, after the restore. A sleeper whose panes (its old ones, or the new ones of its
-    /// wake) are in the layout the restore used has an awake copy running now (a crash came
-    /// before the autosave caught up with a sleep, or after a wake's autosave but before the
-    /// sleeper was dropped): that copy wins and the sleeper goes. Two sleepers of one workspace
-    /// id: the first one stays. An interrupted wake without an awake copy moves its tasks and
-    /// names back (its map stays if that fails, for the next start). Ids an older orchd handed
-    /// out meanwhile are renumbered. The record is rewritten if anything changed.
+    /// Start-up, after the restore (which, see `load_sleepers`, started none of a sleeper's
+    /// panes). No sleeper is retired here. Two sleepers of one workspace id: the first one
+    /// stays. An interrupted wake moves its tasks and names back to the old panes (its map stays
+    /// if that fails, for the next start). Ids an older orchd handed out meanwhile are
+    /// renumbered. The record is rewritten if anything changed.
     pub fn install_sleepers(&self, sl: Sleepers) {
         let mut dirty = false;
         let mut seen: HashSet<String> = HashSet::new();
         let mut list = Vec::new();
         for mut x in sl.list {
-            let mine: HashSet<String> = x
-                .panes
-                .keys()
-                .cloned()
-                .chain(x.wake.iter().flat_map(|w| w.map.values().cloned()))
-                .collect();
-            let awake_copy = sl
-                .layout
-                .get(&x.workspace.id)
-                .is_some_and(|p| p.iter().any(|p| mine.contains(p)));
-            if awake_copy || !seen.insert(x.workspace.id.clone()) {
+            if !seen.insert(x.workspace.id.clone()) {
                 eprintln!(
-                    "orchd: {} came back awake (or is a duplicate); its sleeper record is dropped",
+                    "orchd: a second sleeper record of {} is dropped",
                     x.workspace.label
                 );
                 dirty = true;
@@ -655,6 +699,7 @@ impl Daemon {
                 eprintln!("orchd: {}", e.message);
             }
         }
+        crate::fault::crash_at("after_install");
     }
 
     /// Moves the owners of `x`'s panes (running tasks, bus names) along `map` (old → new), or
@@ -827,6 +872,15 @@ impl Daemon {
     ) -> Result<Value, ApiError> {
         let session = self.session();
         let ws_id = match (session.workspace(key), session.sleeping(key)) {
+            (Some(w), _) if session.sleeping.iter().any(|x| x.workspace.id == w.id) => {
+                return Err(err(
+                    "ws_transition",
+                    format!(
+                        "{} was just woken and is not in the autosave yet; try again shortly",
+                        w.label
+                    ),
+                ))
+            }
             (Some(w), _) => w.id.clone(),
             (None, Some(s)) => {
                 return Ok(json!({
@@ -1191,8 +1245,11 @@ impl Daemon {
         }))
     }
 
-    /// Waits until the autosave file holds `panes`, then drops the sleeper. If that takes longer
-    /// than `CONFIRM_FOR` it goes on in the background and returns false.
+    /// Waits until the autosave file holds the woken workspace with its new panes placed, then
+    /// drops the sleeper. A new pane that has ended meanwhile is no longer waited for (it is in
+    /// no future autosave); with none left the sleeper is dropped at once. The reservation is
+    /// released when that happens or after `CONFIRM_FOR`, whichever comes first; the sleeper is
+    /// still dropped later if it takes longer. Returns whether it was dropped within that time.
     async fn confirm_wake(
         self: &Arc<Self>,
         ws_id: &str,
@@ -1201,9 +1258,20 @@ impl Daemon {
     ) -> bool {
         let d = Arc::clone(self);
         let (id, want) = (ws_id.to_string(), panes.to_vec());
-        let job = tokio::spawn(async move {
-            let _reserved = reserved;
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let mut reserved = Some(reserved);
+            let mut done_tx = Some(done_tx);
+            let wait = std::env::var("ORCHD_WAKE_CONFIRM_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .map_or(CONFIRM_FOR, Duration::from_millis);
+            let deadline = tokio::time::Instant::now() + wait;
             loop {
+                let live: Vec<&String> = want
+                    .iter()
+                    .filter(|p| d.find(p).is_ok_and(|p| p.exit_code().is_none()))
+                    .collect();
                 let saved = d
                     .autosave
                     .path()
@@ -1211,28 +1279,44 @@ impl Daemon {
                     .and_then(|b| serde_json::from_slice::<crate::restore::Saved>(&b).ok());
                 // Placed in its workspace there (the snapshot's pane records also list panes
                 // not yet placed).
-                let placed = saved.is_some_and(|s| {
-                    s.session.workspaces.iter().any(|w| {
-                        w.id == id
-                            && want
-                                .iter()
-                                .all(|p| w.tabs.iter().any(|t| t.root.contains(p)))
-                    }) && want.iter().all(|p| s.panes.contains_key(p))
-                });
+                let placed = live.is_empty()
+                    || saved.is_some_and(|s| {
+                        s.session.workspaces.iter().any(|w| {
+                            w.id == id
+                                && live
+                                    .iter()
+                                    .all(|p| w.tabs.iter().any(|t| t.root.contains(p)))
+                        }) && live.iter().all(|p| s.panes.contains_key(*p))
+                    });
                 if placed {
                     crate::fault::crash_at("wake_before_drop");
-                    match d.commit_sleeper(&id, |_| false).await {
-                        Ok(()) => return,
-                        Err(e) if e.code == "no_workspace" => return,
+                    let dropped = if crate::fault::on("drop_fail") {
+                        Err(err("save_failed", "injected"))
+                    } else {
+                        d.commit_sleeper(&id, |_| false).await
+                    };
+                    match dropped {
+                        Ok(()) => break,
+                        Err(e) if e.code == "no_workspace" => break,
                         Err(e) => {
                             eprintln!("orchd: dropping the sleeper of a wake: {}", e.message)
                         }
                     }
                 }
+                if tokio::time::Instant::now() >= deadline {
+                    // Never held longer than this: the workspace is usable again; a sleep of
+                    // it is refused while its sleeper record is still there.
+                    reserved.take();
+                    done_tx.take();
+                }
                 tokio::time::sleep(Duration::from_millis(250)).await;
             }
+            drop(reserved);
+            if let Some(tx) = done_tx {
+                let _ = tx.send(());
+            }
         });
-        tokio::time::timeout(CONFIRM_FOR, job).await.is_ok()
+        done_rx.await.is_ok()
     }
 
     /// Ends the panes a failed wake started. One that can't be ended keeps running outside any

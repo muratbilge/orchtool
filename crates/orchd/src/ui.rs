@@ -191,7 +191,28 @@ impl Daemon {
         target.map(|id| self.admit_ws_op(&id)).transpose()
     }
 
+    /// A pane given by name (or id) becomes its canonical pane id, so the guard below and the
+    /// placement afterwards act on the same pane.
+    fn canonical(&self, mut op: UiOp) -> UiOp {
+        let fix = |p: &mut String| {
+            if let Ok(pane) = self.find(p) {
+                *p = pane.id.clone();
+            }
+        };
+        match &mut op {
+            UiOp::Split { pane, .. }
+            | UiOp::ClosePane { pane }
+            | UiOp::Resize { pane, .. }
+            | UiOp::ToggleZoom { pane }
+            | UiOp::Focus { pane }
+            | UiOp::Raise { pane } => fix(pane),
+            _ => {}
+        }
+        op
+    }
+
     pub async fn ui_op(self: &Arc<Self>, op: UiOp) -> Result<Value, ApiError> {
+        let op = self.canonical(op);
         let _op = self.op_guard(&op)?;
         let mut created: Option<PaneInfo> = None;
         match op {
