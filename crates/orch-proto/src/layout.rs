@@ -95,6 +95,10 @@ pub struct SavedPane {
     /// after that time unless auto-continue was switched off meanwhile.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continue_at: Option<i64>,
+    /// The pane's lineage (see orchd's `Pane::origin`); older records lack it and are
+    /// identified by the pane id they are saved under.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
 }
 
 /// A workspace that is asleep. `workspace` keeps its id, label, tab ids, splits and sizes;

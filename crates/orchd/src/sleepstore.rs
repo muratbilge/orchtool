@@ -82,13 +82,8 @@ impl Store {
         let _ = self.dir.set(dir);
     }
 
-    /// Reads both slots. A slot that exists but can't be read or has an unknown format is
-    /// left alone **and blocks writes** (it may be the newest generation, or a newer orchd's):
-    /// sleep and wake then fail with `save_failed` until it is moved away.
-    pub fn load(&self) -> Loaded {
-        let Some(dir) = self.dir.get() else {
-            return Loaded::Missing;
-        };
+    /// Both slots: the newest usable record (slot, record) and what was wrong with the others.
+    fn scan(dir: &Path) -> (Option<(usize, Record)>, Vec<String>, bool) {
         let mut best: Option<(usize, Record)> = None;
         let mut problems = Vec::new();
         let mut any = false;
@@ -121,6 +116,18 @@ impl Store {
                 Err(e) => problems.push(format!("{} is damaged ({e})", path.display())),
             }
         }
+        (best, problems, any)
+    }
+
+    /// Reads both slots. A slot that exists but can't be read or has an unknown format is
+    /// left alone **and blocks writes** (it may be the newest generation, or a newer orchd's).
+    /// The block is checked again before every write: once the bad slot is moved away (or
+    /// fixed), writes go on without a restart.
+    pub fn load(&self) -> Loaded {
+        let Some(dir) = self.dir.get() else {
+            return Loaded::Missing;
+        };
+        let (best, problems, any) = Self::scan(dir);
         let problem = (!problems.is_empty()).then(|| problems.join("; "));
         let mut st = self.state.lock().unwrap();
         if let Some(p) = &problem {
@@ -135,6 +142,35 @@ impl Store {
             }
             None if any => Loaded::Unusable(problem.unwrap_or_default()),
             None => Loaded::Missing,
+        }
+    }
+
+    /// A blocked store looks at its slots again; clear once no slot is bad any more.
+    fn recheck(&self, st: &mut State) {
+        let (Some(dir), Some(_)) = (self.dir.get(), &st.blocked) else {
+            return;
+        };
+        let (best, problems, _) = Self::scan(dir);
+        if problems.is_empty() {
+            st.blocked = None;
+            if let Some((i, r)) = best {
+                if r.generation >= st.generation {
+                    st.generation = r.generation;
+                    st.newest = i;
+                }
+            }
+        } else {
+            st.blocked = Some(problems.join("; "));
+        }
+    }
+
+    /// Whether a write would be attempted (checked before a wake starts anything).
+    pub fn writable(&self) -> Result<(), String> {
+        let mut st = self.state.lock().unwrap();
+        self.recheck(&mut st);
+        match &st.blocked {
+            Some(why) => Err(format!("the sleeper record can't be written: {why}")),
+            None => Ok(()),
         }
     }
 
@@ -158,6 +194,7 @@ impl Store {
                 std::io::Error::other("no folder for the sleeper record"),
             );
         };
+        self.recheck(st);
         if let Some(why) = &st.blocked {
             return fail(false, std::io::Error::other(format!("not written: {why}")));
         }
@@ -200,6 +237,7 @@ impl Store {
         // From here the new slot is visible: whatever happens, it is the newest generation.
         st.generation = record.generation;
         st.newest = slot;
+        crate::fault::crash_at("store_crash_after_rename");
         if crate::fault::on("store_after_rename_once")
             && !AFTER_RENAME_FIRED.swap(true, Ordering::SeqCst)
         {

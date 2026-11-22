@@ -364,6 +364,7 @@ pub(crate) fn saved_pane(
         agent_argv: process.map(|p| p.argv),
         sole_codex_in_cwd: false,
         continue_at: None,
+        origin: Some(p.origin()),
     }
 }
 
@@ -379,6 +380,40 @@ pub(crate) struct Spawned {
     pub errors: Vec<String>,
     /// Agents (claude / codex) started again.
     pub resumed: usize,
+}
+
+/// A saved pane's lineage: its `origin`, or (older records) the id it is saved under.
+pub fn lineage(key: &str, sp: &SavedPane) -> String {
+    sp.origin.clone().unwrap_or_else(|| key.to_string())
+}
+
+/// The lineages of every pane record in a saved layout.
+pub fn lineages(saved: &Saved) -> std::collections::HashSet<String> {
+    saved.panes.iter().map(|(k, sp)| lineage(k, sp)).collect()
+}
+
+/// Removes every pane whose lineage is in `drop` (its record and its place in the layout; a
+/// tab / workspace left without panes goes too).
+pub fn prune(saved: &mut Saved, drop: &std::collections::HashSet<String>) {
+    saved.panes.retain(|k, sp| !drop.contains(&lineage(k, sp)));
+    let keep: HashMap<String, String> =
+        saved.panes.keys().map(|k| (k.clone(), k.clone())).collect();
+    saved.session.workspaces = saved
+        .session
+        .workspaces
+        .iter()
+        .filter_map(|w| crate::sleep::mapped(w, &keep))
+        .collect();
+}
+
+/// Two retry layouts as one (the second's panes that are already in the first are left out).
+pub fn merge(mut a: Saved, mut b: Saved) -> Saved {
+    let have = lineages(&a);
+    prune(&mut b, &have);
+    a.session.workspaces.append(&mut b.session.workspaces);
+    a.panes.extend(b.panes);
+    a.session.next_id = a.session.next_id.max(b.session.next_id);
+    a
 }
 
 /// The panes in `errors` (records exist, start failed) as a layout of their own: their
@@ -410,34 +445,60 @@ fn unrestored_of(
 }
 
 impl Daemon {
+    /// A usage-limit continue that was still due keeps its time, whichever way the pane came
+    /// back (a restore, or a later retry).
+    fn schedule_saved_continues(
+        self: &Arc<Self>,
+        spawned: &Spawned,
+        panes: &HashMap<String, SavedPane>,
+    ) {
+        for (old, p) in &spawned.ids {
+            if let Some(reset) = panes.get(old).and_then(|sp| sp.continue_at) {
+                let name = panes[old].bus_name.clone().unwrap_or_else(|| p.id.clone());
+                crate::sleep::schedule_continue(self, Arc::clone(p), name, reset, String::new());
+            }
+        }
+    }
+
     /// A layout kept because its panes could not be started before (`unrestored-*.json`):
     /// added to the running layout (ids / labels taken meanwhile are renumbered). Returns how
     /// many came back and what still could not be started.
     pub fn restore_more(self: &Arc<Self>, mut saved: Saved) -> (usize, Option<Saved>) {
         {
             let s = self.session.lock().unwrap();
-            let used_ws: std::collections::HashSet<String> = s
+            let mut used_ws: std::collections::HashSet<String> = s
                 .workspaces
                 .iter()
                 .map(|w| w.id.clone())
                 .chain(s.sleeping.iter().map(|x| x.workspace.id.clone()))
                 .collect();
-            let used_tabs: std::collections::HashSet<String> = s
+            let mut used_tabs: std::collections::HashSet<String> = s
                 .workspaces
                 .iter()
                 .chain(s.sleeping.iter().map(|x| &x.workspace))
                 .flat_map(|w| w.tabs.iter().map(|t| t.id.clone()))
                 .collect();
             drop(s);
+            let num = |id: &str| id.get(1..).and_then(|n| n.parse::<u64>().ok()).unwrap_or(0);
             let _ = self.edit(|s| {
+                // The live counter goes past every id the kept layout brings along.
+                s.next_id = s.next_id.max(saved.session.next_id);
+                for w in &saved.session.workspaces {
+                    s.next_id = s.next_id.max(num(&w.id));
+                    for t in &w.tabs {
+                        s.next_id = s.next_id.max(num(&t.id));
+                    }
+                }
                 for w in &mut saved.session.workspaces {
                     if used_ws.contains(&w.id) {
                         w.id = s.new_id("w");
                     }
+                    used_ws.insert(w.id.clone());
                     for t in &mut w.tabs {
                         if used_tabs.contains(&t.id) {
                             t.id = s.new_id("t");
                         }
+                        used_tabs.insert(t.id.clone());
                     }
                     if s.label_taken(&w.label, None) {
                         let base = w.label.clone();
@@ -454,6 +515,7 @@ impl Daemon {
         let original = saved.session.workspaces.clone();
         let spawned = self.spawn_saved(std::mem::take(&mut saved.session.workspaces), &saved.panes);
         let count = spawned.ids.len();
+        self.schedule_saved_continues(&spawned, &saved.panes);
         let next = self.session().next_id;
         let unrestored = unrestored_of(&original, &spawned.errors, &saved.panes, next);
         let _ = self.edit(|s| {
@@ -498,10 +560,12 @@ impl Daemon {
                         rows: Some(sp.rows.max(2)),
                         cols: Some(sp.cols.max(2)),
                     };
+                    // The same lineage as the saved pane (start-up reconciles by it).
+                    let origin = sp.origin.clone().unwrap_or_else(|| old.clone());
                     // A folder that is gone: start in the home folder instead.
                     let pane = self
-                        .new_pane(req(Some(sp.cwd.clone())))
-                        .or_else(|_| self.new_pane(req(None)));
+                        .new_pane_as(req(Some(sp.cwd.clone())), Some(&origin), None)
+                        .or_else(|_| self.new_pane_as(req(None), Some(&origin), None));
                     match pane {
                         Ok(p) => {
                             if matches!(sp.agent.as_deref(), Some("claude" | "codex")) {
@@ -626,16 +690,7 @@ impl Daemon {
                 spawned.failed.join(", ")
             );
         }
-        // A usage-limit continue that was still due keeps its time.
-        for (old, p) in &spawned.ids {
-            if let Some(reset) = saved.panes[old].continue_at {
-                let name = saved.panes[old]
-                    .bus_name
-                    .clone()
-                    .unwrap_or_else(|| p.id.clone());
-                crate::sleep::schedule_continue(self, Arc::clone(p), name, reset, String::new());
-            }
-        }
+        self.schedule_saved_continues(&spawned, &saved.panes);
         session.workspaces = spawned.workspaces;
         session.raised = None;
         {
@@ -734,6 +789,7 @@ mod tests {
             agent_argv: None,
             sole_codex_in_cwd: false,
             continue_at: None,
+            origin: None,
         }
     }
 
