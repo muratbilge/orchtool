@@ -1,5 +1,18 @@
 # Status
 
+## 2026-11-22 — Sleep: fifth-check fixes (in-memory start-up filter, wake-bound confirmer) — Claude (Opus)
+
+- **A1/A2:** no layout file is rewritten or set aside at start-up any more. `restore_layout` calls
+  `skip_asleep` on the layout it parsed (the planned file or the autosave it fell back to): the loaded
+  sleepers' panes are left out, other workspaces stay; with no sleepers it returns at once.
+- **C3:** the wake confirmation is bound to its wake's pane map; the sleeper is removed only if it still
+  carries that map (checked in the same commit), and it stops once that sleeper is gone or changed. The 30 s
+  reservation bound is a timer of its own, so a stalled read or commit can't hold it longer.
+- Known limits (README): pane-id reuse by the inherited counter fallback; every woken pane exiting before the
+  next autosave.
+Tests `g5_…` (two), `g7_…`.
+
+
 ## 2026-11-22 — Sleep: fourth-check fixes (start-up rule, split by name, wake confirmation) — Claude (Opus)
 
 - **Start-up rule (finding 5):** the sleeper record always wins. `load_sleepers` takes every pane of a sleeper

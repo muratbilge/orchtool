@@ -33,9 +33,9 @@ Built in Rust (stable) by Claude Code and Codex with Murat Bilge steering, for o
   alternating generations, the newest valid one used), written and synced before any of the workspace's programs
   end (a failed write, folder sync included, ends nothing). Restarts, crashes and a plain `stop-daemon` keep it;
   the restart path itself (`restore.json`, the autosave) is unchanged. The sleeper record is the truth for
-  its panes: if orchd dies before the autosave has caught up with a sleep or a wake (about 2 s), the next start
-  takes those panes out of the layout file before restoring it, so they are never started twice, and the
-  workspace comes back asleep (wake it again). A wake drops the sleeper only once the autosave holds the
+  its panes: if orchd dies before the autosave has caught up with a sleep or a wake (about 2 s), the restore
+  leaves those panes out of whatever layout it reads (in memory; no file is rewritten), so they are never
+  started twice, and the workspace comes back asleep (wake it again). A wake drops the sleeper only once the autosave holds the
   woken workspace; a woken pane that ends before that is not waited for, and the workspace is never held
   reserved for more than 30 s. A wake is all or nothing: if a pane can't be
   started, none is and the sleeper stays as it was; a started pane that then can't be ended keeps running
@@ -48,7 +48,11 @@ Built in Rust (stable) by Claude Code and Codex with Murat Bilge steering, for o
   away is enough while it was not the newest record, otherwise (or after a repaired slot) restart orchd to load
   it. Known limits: if the folder sync after a record's rename fails, the sleep is reported failed and nothing
   ends, but that record may still be on disk, so after a restart the workspace can come back asleep; and a
-  repaired slot carrying the same generation number as the one loaded is not told apart. Starts on demand from `orch`, or as a user service (`contrib/orchd.service`).
+  repaired slot carrying the same generation number as the one loaded is not told apart; when SQLite can't
+  hand out pane ids, the inherited in-memory fallback can repeat an id across starts and the restore then also
+  leaves out an unrelated pane with a sleeper's old id; and if every woken pane exits before the next
+  autosave, the sleeper is retired without a checkpoint (a crash right then could start a program that already
+  ran from an older autosave). Starts on demand from `orch`, or as a user service (`contrib/orchd.service`).
 - **`orch`**, the CLI and the TUI (`ratatui`; mouse and touch: tap a pane or a tab, `+` for a new tab, `☰` for
   the workspace list). Panes: `new`, `ls`, `attach`, `send`, `read` (`--unwrapped` joins soft-wrapped
   rows), `kill`, `focus`, `auto-continue`; layout: `ws` and `tab`
