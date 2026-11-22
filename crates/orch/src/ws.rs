@@ -46,19 +46,8 @@ pub enum WsCmd {
         dry_run: bool,
     },
     /// Wake a sleeping workspace: the layout comes back, agents resume their conversation.
-    /// All or nothing: if a pane can't start, everything stays asleep (exit 1, retry later)
-    Wake {
-        workspace: String,
-        /// Wake with the panes that start; the others stay asleep as "<label>-rest"
-        #[arg(long)]
-        partial: bool,
-    },
-    /// Exempt a workspace from auto-sleep (`orch auto-sleep`): on | off (without: show)
-    KeepAwake {
-        workspace: String,
-        #[arg(value_parser = ["on", "off"])]
-        state: Option<String>,
-    },
+    /// All or nothing: if a pane can't start, none is and it stays asleep (exit 1, retry later)
+    Wake { workspace: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -244,11 +233,10 @@ pub async fn ws(c: &mut Conn, cmd: WsCmd) -> Result<()> {
                 println!("asleep: {label} (wake: orch ws wake {label})");
             }
         }
-        WsCmd::Wake { workspace, partial } => {
+        WsCmd::Wake { workspace } => {
             let v = c
                 .request(&Request::Ui(UiOp::WakeWorkspace {
                     workspace: workspace.clone(),
-                    partial,
                 }))
                 .await?;
             let s: Session = serde_json::from_value(v["session"].clone())?;
@@ -265,34 +253,9 @@ pub async fn ws(c: &mut Conn, cmd: WsCmd) -> Result<()> {
                 .map(|a| a.iter().filter_map(|p| p.as_str()).collect())
                 .unwrap_or_default();
             println!("awake: {label} ({})", panes.join(" "));
-            if let Some(failed) = v["failed"].as_array().filter(|f| !f.is_empty()) {
-                eprintln!(
-                    "orch: {} pane(s) could not be started; they stay asleep in {}",
-                    failed.len(),
-                    v["rest"].as_str().unwrap_or("a workspace of their own")
-                );
+            if v["confirmed"] == false {
+                eprintln!("orch: not yet in the autosave; it is recorded as awake once it is");
             }
-        }
-        WsCmd::KeepAwake { workspace, state } => {
-            let s = session(c).await?;
-            let w = if workspace == "." {
-                own(&s)?
-            } else {
-                s.workspace(&workspace)
-                    .or_else(|| s.sleeping(&workspace).map(|x| &x.workspace))
-                    .ok_or_else(|| CliError::NotFound(format!("no workspace {workspace:?}")))?
-            };
-            let label = w.label.clone();
-            let v = c
-                .request(&Request::KeepAwake {
-                    workspace: w.id.clone(),
-                    on: state.map(|s| s == "on"),
-                })
-                .await?;
-            println!(
-                "{label}: keep-awake {}",
-                if v["keep_awake"] == true { "on" } else { "off" }
-            );
         }
         WsCmd::Close { workspace } => {
             let s = session(c).await?;

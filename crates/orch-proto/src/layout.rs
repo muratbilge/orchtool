@@ -91,14 +91,6 @@ pub struct SavedPane {
     /// `codex resume --last` (per folder) can only mean this one, so nobody has to pick.
     #[serde(default)]
     pub sole_codex_in_cwd: bool,
-    /// A usage-limit "continue" still due for this agent (unix seconds of the reset): typed
-    /// after that time unless auto-continue was switched off meanwhile.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub continue_at: Option<i64>,
-    /// The pane's lineage (see orchd's `Pane::origin`); older records lack it and are
-    /// identified by the pane id they are saved under.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub origin: Option<String>,
 }
 
 /// A workspace that is asleep. `workspace` keeps its id, label, tab ids, splits and sizes;
@@ -113,19 +105,14 @@ pub struct Sleeping {
     /// Old pane id → how to bring it back.
     pub panes: HashMap<String, SleptPane>,
     /// A wake in progress: old pane id → new pane id, written before any owner (task, bus
-    /// name) moves; `committed` once the awake layout holding the new panes is durable.
+    /// name) moves. The sleeper stays until the autosave holds the new panes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wake: Option<WakeState>,
-    /// Panes that survived SIGKILL when it was put to sleep: it can't wake while they run.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub stuck: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WakeState {
     pub map: HashMap<String, String>,
-    #[serde(default)]
-    pub committed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -598,7 +585,6 @@ mod tests {
             slept_ms: 0,
             panes: HashMap::new(),
             wake: None,
-            stuck: vec![],
         });
         // "w1" is an awake id: never the sleeper labelled "w1".
         assert_eq!(s.workspace("w1").unwrap().label, "main");

@@ -67,7 +67,13 @@ async fn main() -> anyhow::Result<()> {
 
     let bus = Arc::new(Bus::open(&db)?);
     let daemon = Daemon::new(scrollback, Arc::clone(&bus));
+    // Sleeping workspaces (their own record, which the restore below does not touch): loaded
+    // before anything runs, so their panes count as asleep from the start; reconciled with
+    // what the restore brought back right after it.
+    daemon.sleep_store.set_dir(dir.clone());
+    let sleepers = daemon.load_sleepers(&dir);
     start_nudger(Arc::clone(&daemon));
+    orchd::ui::start_detector(Arc::clone(&daemon));
     orchd::limits::start(Arc::clone(&daemon));
     // Before the restore: a SIGTERM while it runs waits for it (then saves the restored
     // layout) instead of killing orchd half-way, which would leave the loop-guard marker.
@@ -80,14 +86,10 @@ async fn main() -> anyhow::Result<()> {
     // previous orchd saved, with fresh panes. Autosaving starts only once that is done.
     let _ = daemon.restore_path.set(dir.join("restore.json"));
     daemon.autosave.set_path(dir.join(orchd::autosave::FILE));
-    daemon.sleep_store.set_dir(dir.clone());
     orchd::autosave::restore_at_start(&daemon, &dir);
-    // After the sleepers are loaded and reconciled: its first question sweep must not see a
-    // sleeper's pane as gone.
-    orchd::ui::start_detector(Arc::clone(&daemon));
+    daemon.install_sleepers(sleepers);
     orchd::autosave::start(Arc::clone(&daemon));
     orchd::tasks::start(Arc::clone(&daemon));
-    orchd::autosleep::start(Arc::clone(&daemon));
     let server = tokio::spawn(serve(listener, Arc::clone(&daemon)));
     let signalled = loop {
         tokio::select! {

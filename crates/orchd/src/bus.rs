@@ -608,44 +608,7 @@ impl Bus {
         }
     }
 
-    // ---------- persistent settings and counters (table kv) ----------
-
-    pub fn kv_get(&self, k: &str) -> Result<Option<String>> {
-        Ok(self
-            .db
-            .lock()
-            .unwrap()
-            .query_row("SELECT v FROM kv WHERE k = ?1", params![k], |r| {
-                r.get::<_, String>(0)
-            })
-            .optional()?)
-    }
-
-    /// `None` removes the key.
-    pub fn kv_set(&self, k: &str, v: Option<&str>) -> Result<()> {
-        let db = self.db.lock().unwrap();
-        match v {
-            Some(v) => db.execute(
-                "INSERT INTO kv(k, v) VALUES (?1, ?2) ON CONFLICT(k) DO UPDATE SET v = ?2",
-                params![k, v],
-            )?,
-            None => db.execute("DELETE FROM kv WHERE k = ?1", params![k])?,
-        };
-        Ok(())
-    }
-
-    /// Keys starting with `prefix` (with the prefix removed).
-    pub fn kv_keys(&self, prefix: &str) -> Result<Vec<String>> {
-        let db = self.db.lock().unwrap();
-        let mut st = db.prepare("SELECT k FROM kv WHERE substr(k, 1, length(?1)) = ?1")?;
-        let rows = st
-            .query_map(params![prefix], |r| r.get::<_, String>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows
-            .into_iter()
-            .map(|k| k[prefix.len()..].to_string())
-            .collect())
-    }
+    // ---------- persistent counters (table kv) ----------
 
     /// Atomically take the next value of a persistent counter (pane ids that never repeat).
     pub fn next_counter(&self, k: &str) -> Result<u64> {

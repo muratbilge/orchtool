@@ -33,8 +33,6 @@ pub struct Pane {
     master: Mutex<Box<dyn MasterPty + Send>>,
     input: mpsc::Sender<Vec<u8>>,
     queued: Arc<AtomicUsize>,
-    /// Inputs written so far (keys, pastes, sends): auto-sleep's "nothing typed into it".
-    inputs: AtomicU64,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     /// Bumped on every screen change.
     rev: watch::Sender<u64>,
@@ -49,10 +47,6 @@ pub struct Pane {
     /// Agent kind: from argv, or learned when an agent registers from inside this pane.
     kind: Mutex<Option<String>>,
     session_hint: Mutex<Option<(String, String)>>,
-    /// The pane's lineage: the id of the first pane in a chain of restarts, sleeps, wakes and
-    /// retries (pane ids never repeat, so this names one pane for good). Start-up reconciles
-    /// every saved record by it. Unset = its own id.
-    origin: std::sync::OnceLock<String>,
 }
 
 impl Pane {
@@ -119,7 +113,6 @@ impl Pane {
             master: Mutex::new(pair.master),
             input,
             queued: Arc::clone(&queued),
-            inputs: AtomicU64::new(0),
             killer: Mutex::new(child.clone_killer()),
             rev: watch::Sender::new(0),
             gen: AtomicU64::new(0),
@@ -129,7 +122,6 @@ impl Pane {
             next_client: AtomicU64::new(1),
             kind: Mutex::new(None),
             session_hint: Mutex::new(None),
-            origin: std::sync::OnceLock::new(),
         });
         *pane.kind.lock().unwrap() = detect::agent_kind(&pane.argv).map(str::to_string);
 
@@ -201,16 +193,7 @@ impl Pane {
             self.queued.fetch_sub(len, Ordering::SeqCst);
             return false;
         }
-        self.inputs.fetch_add(1, Ordering::Relaxed);
         true
-    }
-
-    /// For auto-sleep: (inputs written so far, attached clients).
-    pub fn activity(&self) -> (u64, usize) {
-        (
-            self.inputs.load(Ordering::Relaxed),
-            self.clients.lock().unwrap().len(),
-        )
     }
 
     /// Resize PTY and parser together under the terminal lock, so the reader never parses
@@ -381,17 +364,6 @@ impl Pane {
             .map(|s| s.trim().to_string())
             .unwrap_or_else(|_| format!("pid {leader}"));
         Some((leader, name))
-    }
-
-    pub fn set_origin(&self, origin: &str) {
-        let _ = self.origin.set(origin.to_string());
-    }
-
-    pub fn origin(&self) -> String {
-        self.origin
-            .get()
-            .cloned()
-            .unwrap_or_else(|| self.id.clone())
     }
 
     /// The visible screen text.

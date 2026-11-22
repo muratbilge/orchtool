@@ -6,9 +6,7 @@
 use crate::detect::{self, Detected};
 use crate::pane::Pane;
 use crate::server::Daemon;
-use orch_proto::api::{AgentRow, QuestionRow};
 use orch_proto::api::{NewPane, HUMAN};
-use orch_proto::layout::Workspace;
 use orch_proto::layout::{Node, Session};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -87,11 +85,6 @@ async fn continue_restored(pane: Arc<Pane>, name: String, note: &'static str) ->
 }
 
 const SHELLS: [&str; 5] = ["bash", "zsh", "sh", "fish", "dash"];
-
-/// A shell (bash, zsh, …) by its program path.
-pub(crate) fn is_shell(argv0: &str) -> bool {
-    SHELLS.contains(&base(argv0))
-}
 
 fn base(p: &str) -> &str {
     Path::new(p)
@@ -290,12 +283,7 @@ pub fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
         .open(&tmp)?;
     std::io::Write::write_all(&mut f, data)?;
     f.sync_all()?;
-    std::fs::rename(&tmp, path)?;
-    // The rename itself survives a power loss only once the folder is synced.
-    if let Some(dir) = path.parent() {
-        std::fs::File::open(dir)?.sync_all()?;
-    }
-    Ok(())
+    std::fs::rename(&tmp, path)
 }
 
 fn map_node(n: &Node, ids: &HashMap<String, String>) -> Node {
@@ -312,235 +300,94 @@ fn map_node(n: &Node, ids: &HashMap<String, String>) -> Node {
     }
 }
 
-/// What runs in one pane now, enough to start it again. `questions`: `None` when the bus could
-/// not be read (then an agent counts as asking: fail closed, no automatic input later).
-pub(crate) fn saved_pane(
-    p: &Pane,
-    agents: &[AgentRow],
-    questions: Option<&[QuestionRow]>,
-) -> SavedPane {
-    // The folder the program is in now (a shell may have cd'ed), else where it started.
-    let cwd = p
-        .pid
-        .and_then(|pid| std::fs::read_link(format!("/proc/{pid}/cwd")).ok())
-        .map(|c| c.to_string_lossy().into_owned())
-        .filter(|c| !c.ends_with(" (deleted)"))
-        .unwrap_or_else(|| p.cwd.clone());
-    let (rows, cols) = p.size();
-    let bus_name = agents
-        .iter()
-        .find(|a| a.pane.as_deref() == Some(format!("orch:{}", p.id).as_str()))
-        .map(|a| a.name.clone());
-    let screen = p.visible_text();
-    let agent = p.agent(&screen);
-    let asking = questions.is_none_or(|qs| qs.iter().any(|q| Some(&q.from) == bus_name.as_ref()));
-    let was_working = should_continue(
-        agent.as_deref(),
-        detect::detect(&screen, agent.as_deref()),
-        asking,
-    );
-    let process = agent.as_deref().and_then(|kind| {
-        crate::conversation::discover(
-            Path::new("/proc"),
-            p.pid?,
-            &crate::conversation::host_home()?,
-            kind,
-        )
-    });
-    let session_id = process
-        .as_ref()
-        .and_then(|p| p.session_id.clone())
-        .or_else(|| agent.as_deref().and_then(|k| p.session_id(k)));
-    SavedPane {
-        argv: p.argv.clone(),
-        cwd,
-        rows,
-        cols,
-        name: p.name.clone(),
-        agent,
-        bus_name,
-        was_working,
-        session_id,
-        agent_argv: process.map(|p| p.argv),
-        sole_codex_in_cwd: false,
-        continue_at: None,
-        origin: Some(p.origin()),
-    }
-}
-
-/// Panes started again for saved workspaces (restore and wake share this).
-pub(crate) struct Spawned {
-    /// The workspaces with their new pane ids; panes that did not come back are left out
-    /// (a tab / workspace without any is gone).
-    pub workspaces: Vec<Workspace>,
-    /// old pane id → new pane
-    pub ids: HashMap<String, Arc<Pane>>,
-    pub failed: Vec<String>,
-    /// Of those, the panes whose record exists but whose start failed (retryable).
-    pub errors: Vec<String>,
-    /// Agents (claude / codex) started again.
-    pub resumed: usize,
-}
-
-/// A saved pane's lineage: its `origin`, or (older records) the id it is saved under.
-pub fn lineage(key: &str, sp: &SavedPane) -> String {
-    sp.origin.clone().unwrap_or_else(|| key.to_string())
-}
-
-/// The lineages of every pane record in a saved layout.
-pub fn lineages(saved: &Saved) -> std::collections::HashSet<String> {
-    saved.panes.iter().map(|(k, sp)| lineage(k, sp)).collect()
-}
-
-/// Removes every pane whose lineage is in `drop` (its record and its place in the layout; a
-/// tab / workspace left without panes goes too).
-pub fn prune(saved: &mut Saved, drop: &std::collections::HashSet<String>) {
-    saved.panes.retain(|k, sp| !drop.contains(&lineage(k, sp)));
-    let keep: HashMap<String, String> =
-        saved.panes.keys().map(|k| (k.clone(), k.clone())).collect();
-    saved.session.workspaces = saved
-        .session
-        .workspaces
-        .iter()
-        .filter_map(|w| crate::sleep::mapped(w, &keep))
-        .collect();
-}
-
-/// Two retry layouts as one (the second's panes that are already in the first are left out).
-pub fn merge(mut a: Saved, mut b: Saved) -> Saved {
-    let have = lineages(&a);
-    prune(&mut b, &have);
-    a.session.workspaces.append(&mut b.session.workspaces);
-    a.panes.extend(b.panes);
-    a.session.next_id = a.session.next_id.max(b.session.next_id);
-    a
-}
-
-/// The panes in `errors` (records exist, start failed) as a layout of their own: their
-/// workspaces pruned to them, ids and labels as they were.
-fn unrestored_of(
-    original: &[Workspace],
-    errors: &[String],
-    panes: &HashMap<String, SavedPane>,
-    next_id: u64,
-) -> Option<Saved> {
-    if errors.is_empty() {
-        return None;
-    }
-    let keep: HashMap<String, String> = errors.iter().map(|p| (p.clone(), p.clone())).collect();
-    Some(Saved {
-        session: Session {
-            workspaces: original
-                .iter()
-                .filter_map(|w| crate::sleep::mapped(w, &keep))
-                .collect(),
-            next_id,
-            ..Default::default()
-        },
-        panes: errors
-            .iter()
-            .filter_map(|p| panes.get(p).map(|sp| (p.clone(), sp.clone())))
-            .collect(),
-    })
-}
-
 impl Daemon {
-    /// A usage-limit continue that was still due keeps its time, whichever way the pane came
-    /// back (a restore, or a later retry).
-    fn schedule_saved_continues(
-        self: &Arc<Self>,
-        spawned: &Spawned,
-        panes: &HashMap<String, SavedPane>,
-    ) {
-        for (old, p) in &spawned.ids {
-            if let Some(reset) = panes.get(old).and_then(|sp| sp.continue_at) {
-                let name = panes[old].bus_name.clone().unwrap_or_else(|| p.id.clone());
-                crate::sleep::schedule_continue(self, Arc::clone(p), name, reset, String::new());
+    /// The layout and its panes as they are now.
+    pub fn snapshot_layout(&self) -> Saved {
+        self.snapshot(true)
+    }
+
+    /// `log`: explain panes without a verified Codex id (not for the autosave, every minute).
+    pub(crate) fn snapshot(&self, log: bool) -> Saved {
+        let session = self.session.lock().unwrap().clone();
+        let mut panes = HashMap::new();
+        let agents = self.bus.agents().unwrap_or_default();
+        // If the bus cannot be read, fail closed rather than continuing a pending human ask.
+        let questions = self.bus.questions(false).ok();
+        for p in self.all_panes() {
+            if p.exit_code().is_some() {
+                continue;
             }
-        }
-    }
-
-    /// A layout kept because its panes could not be started before (`unrestored-*.json`):
-    /// added to the running layout (ids / labels taken meanwhile are renumbered). Returns how
-    /// many came back and what still could not be started.
-    pub fn restore_more(self: &Arc<Self>, mut saved: Saved) -> (usize, Option<Saved>) {
-        {
-            let s = self.session.lock().unwrap();
-            let mut used_ws: std::collections::HashSet<String> = s
-                .workspaces
+            // The folder the program is in now (a shell may have cd'ed), else where it started.
+            let cwd = p
+                .pid
+                .and_then(|pid| std::fs::read_link(format!("/proc/{pid}/cwd")).ok())
+                .map(|c| c.to_string_lossy().into_owned())
+                .filter(|c| !c.ends_with(" (deleted)"))
+                .unwrap_or_else(|| p.cwd.clone());
+            let (rows, cols) = p.size();
+            let bus_name = agents
                 .iter()
-                .map(|w| w.id.clone())
-                .chain(s.sleeping.iter().map(|x| x.workspace.id.clone()))
-                .collect();
-            let mut used_tabs: std::collections::HashSet<String> = s
-                .workspaces
-                .iter()
-                .chain(s.sleeping.iter().map(|x| &x.workspace))
-                .flat_map(|w| w.tabs.iter().map(|t| t.id.clone()))
-                .collect();
-            drop(s);
-            let num = |id: &str| id.get(1..).and_then(|n| n.parse::<u64>().ok()).unwrap_or(0);
-            let _ = self.edit(|s| {
-                // The live counter goes past every id the kept layout brings along.
-                s.next_id = s.next_id.max(saved.session.next_id);
-                for w in &saved.session.workspaces {
-                    s.next_id = s.next_id.max(num(&w.id));
-                    for t in &w.tabs {
-                        s.next_id = s.next_id.max(num(&t.id));
-                    }
-                }
-                for w in &mut saved.session.workspaces {
-                    if used_ws.contains(&w.id) {
-                        w.id = s.new_id("w");
-                    }
-                    used_ws.insert(w.id.clone());
-                    for t in &mut w.tabs {
-                        if used_tabs.contains(&t.id) {
-                            t.id = s.new_id("t");
-                        }
-                        used_tabs.insert(t.id.clone());
-                    }
-                    if s.label_taken(&w.label, None) {
-                        let base = w.label.clone();
-                        let mut n = 2;
-                        while s.label_taken(&format!("{base}-{n}"), None) {
-                            n += 1;
-                        }
-                        w.label = format!("{base}-{n}");
-                    }
-                }
-                Ok(())
+                .find(|a| a.pane.as_deref() == Some(format!("orch:{}", p.id).as_str()))
+                .map(|a| a.name.clone());
+            let screen = p.visible_text();
+            let agent = p.agent(&screen);
+            let asking = questions
+                .as_ref()
+                .is_none_or(|qs| qs.iter().any(|q| Some(&q.from) == bus_name.as_ref()));
+            let was_working = should_continue(
+                agent.as_deref(),
+                detect::detect(&screen, agent.as_deref()),
+                asking,
+            );
+            let process = agent.as_deref().and_then(|kind| {
+                crate::conversation::discover(
+                    Path::new("/proc"),
+                    p.pid?,
+                    &crate::conversation::host_home()?,
+                    kind,
+                )
             });
+            let session_id = process
+                .as_ref()
+                .and_then(|p| p.session_id.clone())
+                .or_else(|| agent.as_deref().and_then(|k| p.session_id(k)));
+            panes.insert(
+                p.id.clone(),
+                SavedPane {
+                    argv: p.argv.clone(),
+                    cwd,
+                    rows,
+                    cols,
+                    name: p.name.clone(),
+                    agent,
+                    bus_name,
+                    was_working,
+                    session_id,
+                    agent_argv: process.map(|p| p.argv),
+                    sole_codex_in_cwd: false,
+                },
+            );
         }
-        let original = saved.session.workspaces.clone();
-        let spawned = self.spawn_saved(std::mem::take(&mut saved.session.workspaces), &saved.panes);
-        let count = spawned.ids.len();
-        self.schedule_saved_continues(&spawned, &saved.panes);
-        let next = self.session().next_id;
-        let unrestored = unrestored_of(&original, &spawned.errors, &saved.panes, next);
-        let _ = self.edit(|s| {
-            s.workspaces.extend(spawned.workspaces.iter().cloned());
-            Ok(())
-        });
-        let _ = self.ui_events.send(crate::ui::UiEvent::Panes);
-        (count, unrestored)
+        mark_sole_codex_logged(&mut panes, log);
+        Saved { session, panes }
     }
 
-    /// Starts every pane of `workspaces` again from `panes` (keyed by the old pane ids) and
-    /// maps the layout onto the new panes. Running tasks follow their pane.
-    pub(crate) fn spawn_saved(
-        &self,
-        workspaces: Vec<Workspace>,
-        panes: &HashMap<String, SavedPane>,
-    ) -> Spawned {
-        let mut ids: HashMap<String, Arc<Pane>> = HashMap::new();
+    pub fn save_layout(&self, path: &Path) -> std::io::Result<()> {
+        write_atomic(path, &layout_bytes(&self.snapshot_layout())?)
+    }
+
+    /// Recreates a saved layout with new panes. Panes whose program can't start are left out
+    /// (their tab / workspace collapses if nothing is left). Returns how many came back.
+    pub fn restore_layout(self: &Arc<Self>, mut saved: Saved, source: Source) -> usize {
+        mark_sole_codex(&mut saved.panes);
+        let mut ids: HashMap<String, String> = HashMap::new();
         let mut resumed = 0;
+        let mut pending = Vec::new();
         let mut failed: Vec<String> = Vec::new();
-        let mut errors: Vec<String> = Vec::new();
-        for ws in &workspaces {
+        for ws in &saved.session.workspaces {
             for tab in &ws.tabs {
                 for old in tab.root.panes() {
-                    let Some(sp) = panes.get(&old) else {
+                    let Some(sp) = saved.panes.get(&old) else {
                         failed.push(old);
                         continue;
                     };
@@ -560,41 +407,43 @@ impl Daemon {
                         rows: Some(sp.rows.max(2)),
                         cols: Some(sp.cols.max(2)),
                     };
-                    // The same lineage as the saved pane (start-up reconciles by it).
-                    let origin = sp.origin.clone().unwrap_or_else(|| old.clone());
                     // A folder that is gone: start in the home folder instead.
                     let pane = self
-                        .new_pane_as(req(Some(sp.cwd.clone())), Some(&origin), None)
-                        .or_else(|_| self.new_pane_as(req(None), Some(&origin), None));
+                        .new_pane(req(Some(sp.cwd.clone())))
+                        .or_else(|_| self.new_pane(req(None)));
                     match pane {
                         Ok(p) => {
                             if matches!(sp.agent.as_deref(), Some("claude" | "codex")) {
                                 resumed += 1;
+                                if sp.was_working {
+                                    let name = sp
+                                        .bus_name
+                                        .clone()
+                                        .or_else(|| sp.name.clone())
+                                        .unwrap_or_else(|| {
+                                            format!("{} in {}", sp.agent.as_deref().unwrap(), p.id)
+                                        });
+                                    pending.push((Arc::clone(&p), name));
+                                }
                             }
                             if let Err(e) = self.bus.task_rebind(&old, &p.id) {
                                 eprintln!("orchd: task rebind: {e:#}");
                             }
-                            ids.insert(old, p);
+                            ids.insert(old, p.id.clone());
                         }
                         Err(e) => {
                             eprintln!("orchd: restore {old}: {}", e.message);
-                            errors.push(old.clone());
                             failed.push(old);
                         }
                     }
                 }
             }
         }
-        let new_ids: HashMap<String, String> =
-            ids.iter().map(|(o, p)| (o.clone(), p.id.clone())).collect();
-        let mut session = Session {
-            workspaces,
-            ..Default::default()
-        };
+        let mut session = saved.session;
         for ws in &mut session.workspaces {
             for tab in &mut ws.tabs {
-                tab.root = map_node(&tab.root, &new_ids);
-                tab.focus = new_ids.get(&tab.focus).cloned().unwrap_or_default();
+                tab.root = map_node(&tab.root, &ids);
+                tab.focus = ids.get(&tab.focus).cloned().unwrap_or_default();
             }
         }
         // Gaps of panes that didn't come back: removed like closed panes.
@@ -606,106 +455,14 @@ impl Daemon {
                 }
             }
         }
-        Spawned {
-            workspaces: session.workspaces,
-            ids,
-            failed,
-            errors,
-            resumed,
-        }
-    }
-
-    /// The layout and its panes as they are now.
-    pub fn snapshot_layout(&self) -> Saved {
-        self.snapshot(true)
-    }
-
-    /// `log`: explain panes without a verified Codex id (not for the autosave, every minute).
-    pub(crate) fn snapshot(&self, log: bool) -> Saved {
-        // Not while a sleeper change is being written (see `commit`).
-        let _gate = self.publish_gate.read().unwrap();
-        let mut session = self.session.lock().unwrap().clone();
-        // Sleeping workspaces have their own record (sleepstore.rs); the layout files, which an
-        // older orchd also reads and rewrites, never carry them.
-        session.sleeping.clear();
-        let deferred = self.deferred.lock().unwrap().clone();
-        let mut panes = HashMap::new();
-        let agents = self.bus.agents().unwrap_or_default();
-        // If the bus cannot be read, fail closed rather than continuing a pending human ask.
-        let questions = self.bus.questions(false).ok();
-        for p in self.all_panes() {
-            if p.exit_code().is_some() {
-                continue;
-            }
-            let mut sp = saved_pane(&p, &agents, questions.as_deref());
-            sp.continue_at = deferred.get(&p.id).copied();
-            panes.insert(p.id.clone(), sp);
-        }
-        mark_sole_codex_logged(&mut panes, log);
-        Saved { session, panes }
-    }
-
-    pub fn save_layout(&self, path: &Path) -> std::io::Result<()> {
-        if crate::fault::on("layout_save") {
-            return Err(std::io::Error::other("injected layout save failure"));
-        }
-        write_atomic(path, &layout_bytes(&self.snapshot_layout())?)
-    }
-
-    /// Recreates a saved layout with new panes. Panes whose program can't start are left out
-    /// (their tab / workspace collapses if nothing is left). Returns how many came back, and
-    /// the panes that could not be started as a layout of their own (their workspaces pruned
-    /// to them): the caller keeps that before it lets go of the file it restored from.
-    pub fn restore_layout(
-        self: &Arc<Self>,
-        mut saved: Saved,
-        source: Source,
-    ) -> (usize, Option<Saved>) {
-        mark_sole_codex(&mut saved.panes);
-        let mut session = saved.session;
-        // Sleepers come from their own record (reconciled before this), never from here.
-        session.sleeping.clear();
-        let had_panes = !session.workspaces.is_empty();
-        let original = session.workspaces.clone();
-        let spawned = self.spawn_saved(std::mem::take(&mut session.workspaces), &saved.panes);
-        let unrestored = unrestored_of(&original, &spawned.errors, &saved.panes, session.next_id);
-        let resumed = spawned.resumed;
-        let mut pending = Vec::new();
-        for (old, p) in &spawned.ids {
-            let sp = &saved.panes[old];
-            if matches!(sp.agent.as_deref(), Some("claude" | "codex")) && sp.was_working {
-                let name = sp
-                    .bus_name
-                    .clone()
-                    .or_else(|| sp.name.clone())
-                    .unwrap_or_else(|| format!("{} in {}", sp.agent.as_deref().unwrap(), p.id));
-                pending.push((Arc::clone(p), name));
-            }
-        }
-        let count = spawned.ids.len();
-        if !spawned.failed.is_empty() {
-            eprintln!(
-                "orchd: restore: {} pane(s) did not come back: {}",
-                spawned.failed.len(),
-                spawned.failed.join(", ")
-            );
-        }
-        self.schedule_saved_continues(&spawned, &saved.panes);
-        session.workspaces = spawned.workspaces;
         session.raised = None;
         {
             let mut s = self.session.lock().unwrap();
             session.version = s.version + 1;
-            // The sleepers already loaded stay.
-            session.sleeping = std::mem::take(&mut s.sleeping);
             *s = session;
         }
         let _ = self.ui_events.send(crate::ui::UiEvent::Session);
         let _ = self.ui_events.send(crate::ui::UiEvent::Panes);
-        // Only sleeping workspaces were saved (a plain stop-daemon keeps them): nothing to report.
-        if !had_panes {
-            return (count, unrestored);
-        }
         let daemon = Arc::clone(self);
         tokio::spawn(async move {
             let mut jobs = tokio::task::JoinSet::new();
@@ -739,7 +496,7 @@ impl Daemon {
                 eprintln!("orchd: restart summary: {e}");
             }
         });
-        (count, unrestored)
+        ids.len()
     }
 }
 
@@ -788,8 +545,6 @@ mod tests {
             session_id: None,
             agent_argv: None,
             sole_codex_in_cwd: false,
-            continue_at: None,
-            origin: None,
         }
     }
 

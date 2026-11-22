@@ -74,20 +74,6 @@ pub enum Request {
         #[serde(default)]
         on: Option<bool>,
     },
-    /// Auto-sleep after idle time: set it (`ms`: 0 = off) and/or read it. Replies
-    /// `{ms, keep_awake: [workspace ids]}`.
-    #[serde(rename = "auto_sleep")]
-    AutoSleep {
-        #[serde(default)]
-        ms: Option<u64>,
-    },
-    /// Exempt a workspace from auto-sleep (`on`) and/or read it. Replies `{workspace, keep_awake}`.
-    #[serde(rename = "ws.keep_awake")]
-    KeepAwake {
-        workspace: String,
-        #[serde(default)]
-        on: Option<bool>,
-    },
     #[serde(rename = "daemon.stop")]
     StopDaemon {
         #[serde(default)]
@@ -268,12 +254,9 @@ pub enum UiOp {
     },
     /// Bring a sleeping workspace back: the layout is recreated, agents resume.
     /// Replies `{session, workspace, panes, failed}`.
+    /// All or nothing: if a pane can't be started, none is and the sleeper stays as it was.
     WakeWorkspace {
         workspace: String,
-        /// Wake with the panes that start; the ones that don't stay asleep in a workspace of
-        /// their own ("<label>-rest"). Without it a wake is all or nothing.
-        #[serde(default)]
-        partial: bool,
     },
 }
 

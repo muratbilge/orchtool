@@ -57,21 +57,19 @@ pub struct Daemon {
     pub restore_path: std::sync::OnceLock<std::path::PathBuf>,
     /// The layout kept on disk for an unplanned stop (`autosave.json`, set by main).
     pub autosave: crate::autosave::Autosave,
-    /// Auto-sleep's idle tracking (`autosleep.rs`).
-    pub(crate) auto_sleep: crate::autosleep::State,
     /// The durable record of sleeping workspaces (`sleepstore.rs`).
     pub sleep_store: crate::sleepstore::Store,
     /// Workspaces going to sleep or waking right now (by id): no layout change, input, task or
     /// nudge reaches them, and no second transition starts. A leaf lock.
     pub(crate) transitions: Mutex<HashMap<String, crate::sleep::Transit>>,
-    /// Held (write) while a sleeper change is written and published; snapshots of the
-    /// layout take it (read), so no saved layout shows a change that is not yet durable.
-    pub(crate) publish_gate: std::sync::RwLock<()>,
     /// Requests that are writing into a pane right now (pane → count): a sleep waits for them
     /// to finish (taken after `transitions`).
     pub(crate) inflight: Mutex<HashMap<String, usize>>,
-    /// Usage-limit continuations still due after a wake: pane → reset (unix seconds).
-    pub(crate) deferred: Mutex<HashMap<String, i64>>,
+    /// Sleepers read at start-up until they are installed (their panes count as asleep).
+    pub(crate) loading_sleepers: Mutex<Vec<orch_proto::layout::Sleeping>>,
+    /// Programs of a workspace that could not be ended (sleep, or a failed wake), by workspace
+    /// id: it can't wake while one runs. In memory: a restart ends them anyway.
+    pub(crate) strays: Mutex<HashMap<String, Vec<String>>>,
 }
 
 #[derive(Debug)]
@@ -107,12 +105,11 @@ impl Daemon {
             shutdown: Notify::new(),
             restore_path: Default::default(),
             autosave: Default::default(),
-            auto_sleep: Default::default(),
             sleep_store: Default::default(),
             transitions: Default::default(),
-            publish_gate: Default::default(),
             inflight: Default::default(),
-            deferred: Default::default(),
+            loading_sleepers: Default::default(),
+            strays: Default::default(),
         })
     }
 
@@ -131,15 +128,14 @@ impl Daemon {
     }
 
     pub(crate) fn new_pane(&self, req: NewPane) -> Result<Arc<Pane>, ApiError> {
-        self.new_pane_as(req, None, None)
+        self.new_pane_in(req, None)
     }
 
-    /// `new_pane` for a saved pane started again: it keeps its lineage (`origin`), and with
-    /// `reserve_for` it joins that workspace's reservation before anything can find it.
-    pub(crate) fn new_pane_as(
+    /// `new_pane` that, with `reserve_for`, joins that workspace's reservation (a wake) before
+    /// the pane can be found by anything else.
+    pub(crate) fn new_pane_in(
         &self,
         req: NewPane,
-        origin: Option<&str>,
         reserve_for: Option<&str>,
     ) -> Result<Arc<Pane>, ApiError> {
         if let Some(name) = &req.name {
@@ -164,23 +160,15 @@ impl Daemon {
         }
         // Pane ids never repeat, not even across orchd restarts: agent identities and
         // nudges are keyed by pane, so a reused id would hand an old identity to a new program.
-        // No durable counter, no pane: a fallback sequence would start at the same number on
-        // the next start and hand out ids still held by sleepers and tasks.
-        let n = if crate::fault::on("pane_counter") {
-            Err(anyhow::anyhow!("injected counter failure"))
-        } else {
-            self.bus.next_counter("next_pane")
-        }
-        .map_err(|e| err("spawn_failed", format!("no unique pane id: {e:#}")))?;
-        self.next_pane.store(n, Ordering::SeqCst);
+        let n = self
+            .bus
+            .next_counter("next_pane")
+            .unwrap_or_else(|_| self.next_pane.fetch_add(1, Ordering::SeqCst) + 1_000_000);
         if let Some(ws) = reserve_for {
             self.reserve_panes(ws, &[format!("p{n}")]);
         }
         let pane = Pane::spawn(format!("p{n}"), req, self.scrollback)
             .map_err(|e| err("spawn_failed", format!("{e:#}")))?;
-        if let Some(o) = origin {
-            pane.set_origin(o);
-        }
         self.panes.lock().unwrap().insert(n, Arc::clone(&pane));
         Ok(pane)
     }
@@ -236,7 +224,7 @@ impl Daemon {
     async fn wake_into(self: &Arc<Self>, v: &mut Value, ws: &str) {
         let d = Arc::clone(self);
         let key = ws.to_string();
-        match tokio::spawn(async move { d.wake_workspace(&key, false).await }).await {
+        match tokio::spawn(async move { d.wake_workspace(&key).await }).await {
             Ok(Ok(r)) => {
                 let id = r["workspace"].as_str().unwrap_or_default().to_string();
                 v["woke"] = json!(self.session().workspace(&id).map(|w| w.label.clone()));
@@ -519,12 +507,8 @@ impl Daemon {
                         return Err(err("save_failed", format!("saving the layout failed: {e}")));
                     }
                 } else {
-                    // "End everything": the next orchd starts with no panes, and panes still
-                    // waiting to be started again (unrestored.json) are dropped too. Sleeping
-                    // workspaces live in their own record (sleepstore.rs), which this leaves alone.
-                    if let Some(dir) = self.autosave.path().and_then(|p| p.parent()) {
-                        crate::autosave::forget_retry(dir);
-                    }
+                    // "End everything": the next orchd starts empty. Sleeping workspaces live in
+                    // their own record (sleepstore.rs), which this leaves alone.
                     self.autosave.forget();
                 }
                 self.shutdown.notify_one();
@@ -597,34 +581,6 @@ impl Daemon {
                 }
                 Ok(v)
             }
-            Request::AutoSleep { ms } => {
-                if let Some(ms) = ms {
-                    self.set_auto_sleep(ms).map_err(bus_err)?;
-                }
-                Ok(json!({
-                    "ms": self.auto_sleep_ms(),
-                    "keep_awake": self.bus.kv_keys(crate::autosleep::KEEP_AWAKE).map_err(bus_err)?,
-                }))
-            }
-            Request::KeepAwake { workspace, on } => {
-                let s = self.session();
-                let id = s
-                    .workspace(&workspace)
-                    .or_else(|| s.sleeping(&workspace).map(|x| &x.workspace))
-                    .map(|w| w.id.clone())
-                    .ok_or_else(|| err("no_workspace", format!("no workspace {workspace:?}")))?;
-                // An exemption during an automatic sleep stops it (or, once it commits, is
-                // refused: the caller hears that it did not take effect).
-                if on == Some(true) {
-                    self.admit_ws(&id)?;
-                }
-                let key = format!("{}{id}", crate::autosleep::KEEP_AWAKE);
-                if let Some(on) = on {
-                    self.bus.kv_set(&key, on.then_some("1")).map_err(bus_err)?;
-                }
-                let keep = self.bus.kv_get(&key).map_err(bus_err)?.is_some();
-                Ok(json!({ "workspace": id, "keep_awake": keep }))
-            }
             Request::Inbox {
                 name,
                 wait_ms,
@@ -654,17 +610,6 @@ impl Daemon {
                 text,
                 options,
             } => {
-                // An agent asking during an automatic sleep of its workspace stops it; once that
-                // sleep commits, the question is refused (the agent is about to be put away).
-                if let Some(id) = self
-                    .bus
-                    .agent(&orch_proto::api::normalize_name(&from))
-                    .map_err(bus_err)?
-                    .and_then(|a| a.pane)
-                    .and_then(|p| p.strip_prefix("orch:").map(str::to_string))
-                {
-                    self.admit(&id)?;
-                }
                 let q = self.bus.ask(&from, &text, &options).map_err(bus_err)?;
                 let _ = self
                     .bus

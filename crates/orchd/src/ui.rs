@@ -103,6 +103,13 @@ impl Daemon {
             let w = s
                 .workspace_mut(ws)
                 .ok_or_else(|| err("no_workspace", format!("no workspace {ws:?}")))?;
+            // Checked where the pane is placed: a workspace going to sleep takes none.
+            if self.ws_in_transition(&w.id) {
+                return Err(err(
+                    "ws_transition",
+                    "that workspace is going to sleep or waking; try again",
+                ));
+            }
             w.tabs.push(Tab {
                 id: tab,
                 label: (w.tabs.len() + 1).to_string(),
@@ -125,7 +132,10 @@ impl Daemon {
             .find(|w| w.cwd == info.cwd && !self.ws_in_transition(&w.id))
             .map(|w| w.id.clone());
         match ws {
-            Some(ws) => self.add_tab(&ws, info),
+            // It started to sleep in between: a workspace of its own instead.
+            Some(ws) => self
+                .add_tab(&ws, info)
+                .or_else(|_| self.add_workspace(None, info).map(|_| ())),
             None => self.add_workspace(None, info).map(|_| ()),
         }
     }
@@ -155,8 +165,10 @@ impl Daemon {
         Ok(())
     }
 
-    /// The workspace a layout change would touch, if it is going to sleep or waking.
-    fn op_blocked(&self, op: &UiOp) -> Result<(), ApiError> {
+    /// A layout change of a workspace is counted from here until it is placed (refused while it
+    /// goes to sleep or wakes): a sleep waits for it and never captures a pane list about to
+    /// change.
+    fn op_guard(self: &Arc<Self>, op: &UiOp) -> Result<Option<crate::sleep::OpGuard>, ApiError> {
         let s = self.session();
         let ws = |key: &str| {
             s.workspace(key)
@@ -176,14 +188,11 @@ impl Daemon {
             | UiOp::ToggleZoom { pane } => of_pane(pane),
             _ => None,
         };
-        match target {
-            Some(id) => self.admit_ws(&id),
-            None => Ok(()),
-        }
+        target.map(|id| self.admit_ws_op(&id)).transpose()
     }
 
     pub async fn ui_op(self: &Arc<Self>, op: UiOp) -> Result<Value, ApiError> {
-        self.op_blocked(&op)?;
+        let _op = self.op_guard(&op)?;
         let mut created: Option<PaneInfo> = None;
         match op {
             UiOp::NewWorkspace { label, spawn } => {
@@ -214,6 +223,7 @@ impl Daemon {
                     return Err(err("not_placed", format!("{id} is not in a workspace")));
                 }
                 let info = self.spawn(spawn, Some(pane_cwd(&at.info())))?;
+                crate::fault::pause_at("split_pause_ms").await;
                 let new_id = info.id.clone();
                 let placed = self.edit(|s| {
                     let (wi, ti) = s
@@ -274,15 +284,15 @@ impl Daemon {
                 // In its own task: when the caller's own pane is in the workspace, its
                 // connection drops half-way and the sleep must still finish.
                 let d = Arc::clone(self);
-                return tokio::spawn(async move {
-                    d.sleep_workspace(&workspace, force, dry_run, None).await
-                })
+                return tokio::spawn(
+                    async move { d.sleep_workspace(&workspace, force, dry_run).await },
+                )
                 .await
                 .map_err(|e| err("bus", e.to_string()))?;
             }
-            UiOp::WakeWorkspace { workspace, partial } => {
+            UiOp::WakeWorkspace { workspace } => {
                 let d = Arc::clone(self);
-                return tokio::spawn(async move { d.wake_workspace(&workspace, partial).await })
+                return tokio::spawn(async move { d.wake_workspace(&workspace).await })
                     .await
                     .map_err(|e| err("bus", e.to_string()))?;
             }

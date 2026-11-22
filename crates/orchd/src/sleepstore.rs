@@ -15,7 +15,6 @@
 use orch_proto::layout::Sleeping;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 pub const SLOTS: [&str; 2] = ["sleeping.a.json", "sleeping.b.json"];
@@ -46,8 +45,10 @@ pub struct State {
     blocked: Option<String>,
 }
 
-/// A failed write. `published`: the new slot was renamed into place (it may be what the next
-/// start reads), so the caller must supersede it with the state it keeps.
+/// A failed write. `published`: the new slot was renamed into place but its folder sync
+/// failed: it may or may not survive a power loss. The caller treats it as failed (ends
+/// nothing); a crash then makes the next start see a sleeper whose workspace is still in the
+/// awake layout, and the awake copy wins.
 #[derive(Debug)]
 pub struct WriteError {
     pub published: bool,
@@ -145,22 +146,36 @@ impl Store {
         }
     }
 
-    /// A blocked store looks at its slots again; clear once no slot is bad any more.
+    /// A blocked store looks at its slots again. It unblocks only when no slot is bad any more
+    /// **and** the newest record on disk is the one this orchd loaded (or there is none): a
+    /// repaired slot that holds something else must be loaded by a restart, never overwritten
+    /// with what is in memory.
     fn recheck(&self, st: &mut State) {
         let (Some(dir), Some(_)) = (self.dir.get(), &st.blocked) else {
             return;
         };
         let (best, problems, _) = Self::scan(dir);
-        if problems.is_empty() {
-            st.blocked = None;
-            if let Some((i, r)) = best {
-                if r.generation >= st.generation {
-                    st.generation = r.generation;
-                    st.newest = i;
-                }
-            }
-        } else {
+        if !problems.is_empty() {
             st.blocked = Some(problems.join("; "));
+            return;
+        }
+        match best {
+            Some((i, r)) if r.generation == st.generation => {
+                st.newest = i;
+                st.blocked = None;
+            }
+            None if st.generation == 0 => st.blocked = None,
+            Some((_, r)) => {
+                st.blocked = Some(format!(
+                    "the record on disk (generation {}) is not the one this orchd loaded (generation {}); restart orchd to load it",
+                    r.generation, st.generation
+                ))
+            }
+            None => {
+                st.blocked = Some(
+                    "the record this orchd loaded is gone from disk; restart orchd".into(),
+                )
+            }
         }
     }
 
@@ -238,16 +253,14 @@ impl Store {
         st.generation = record.generation;
         st.newest = slot;
         crate::fault::crash_at("store_crash_after_rename");
-        if crate::fault::on("store_after_rename_once")
-            && !AFTER_RENAME_FIRED.swap(true, Ordering::SeqCst)
-        {
-            return fail(true, std::io::Error::other("injected failure after rename"));
-        }
-        if let Err(e) = fsync_dir(dir) {
+        let synced = if crate::fault::on("store_dir_sync") {
+            Err(std::io::Error::other("injected folder sync failure"))
+        } else {
+            fsync_dir(dir)
+        };
+        if let Err(e) = synced {
             return fail(true, e);
         }
         Ok(())
     }
 }
-
-static AFTER_RENAME_FIRED: AtomicBool = AtomicBool::new(false);
