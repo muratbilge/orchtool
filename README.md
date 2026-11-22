@@ -37,8 +37,14 @@ Built in Rust (stable) by Claude Code and Codex with Murat Bilge steering, for o
   the next start. A wake is all or nothing (`--partial` keeps panes that can't start asleep as `<label>-rest`);
   agents resume only a verified session id, else at their resume picker (Claude `--resume`, Codex `resume`).
   While asleep, an agent's bus name is reserved for it. A slot that is damaged or in an unknown format is
-  left alone and blocks sleep / wake (`save_failed`) until it is moved away. Panes that can't be started when a
-  layout is restored are kept in `unrestored-*.json` and tried again at every start. orchd refuses (exit 15) while an agent in it
+  left alone and blocks sleep / wake (`save_failed`) until it is moved away. (It is looked at again before every
+  write, so moving the bad file away is enough; no restart.) Panes that can't be started when a layout is
+  restored are kept in `unrestored.json` and tried again at every start until they come back; a plain
+  `orch stop-daemon` drops them (that ends the session, as it does for the running panes). Every pane keeps one
+  lineage across restarts, sleeps, wakes and retries, and each start decides by it which file owns a pane
+  (a sleeper, then the awake layout, then the retry file), so a crash between two writes can neither start a
+  pane twice nor lose one. A failed `restore.json` / autosave is kept as `*.failed` (or `*.failed-<ms>` when an
+  earlier one is still there); a malformed `restore.json` leaves the autosave to be used. orchd refuses (exit 15) while an agent in it
   works, waits on a dialog or a question, runs a task, or a program runs that can't be resumed; `--force`
   sleeps anyway (busy agents get a note on wake), `--dry-run` shows the plan. Mail, queued tasks and open
   questions for a sleeping agent wait for it; nothing wakes a workspace by itself, only on request:

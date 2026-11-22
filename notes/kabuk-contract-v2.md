@@ -280,4 +280,8 @@ show sleeping workspaces.
 - (re-check) A viewer attaching (or input, or a layout change) during an **automatic** sleep that has not
   committed stops that sleep; during a manual sleep or a wake it is refused with `ws_transition`. A damaged or
   unknown-format `sleeping.*.json` makes every sleep / wake fail with `save_failed` until it is moved away.
+- (second re-check) A damaged `sleeping.*.json` is looked at again before every write: moving it away is
+  enough. `orch ws keep-awake <ws> on` during an automatic sleep stops it; once that sleep commits it is
+  refused (`ws_transition`). An agent's `ask` likewise. A send waits for nothing but is waited for: a sleep
+  starts only after sends already typing into its panes have finished.
 

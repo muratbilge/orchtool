@@ -1,5 +1,30 @@
 # Status
 
+## 2026-11-22 — Sleep: second re-check (1, 3–8, 14, store, commit ids) — Claude (Opus)
+
+The class fix Codex asked for: one authority per pane, reconciled by **lineage** (`Pane::origin`, kept in every
+saved record as `origin`: the first pane id of a chain of restarts, sleeps, wakes and retries). Start-up
+(`autosave::restore_at_start`) reads the sleeper record, the awake layout file and the single retry file
+`unrestored.json`, and `reconcile_sleepers` gives each lineage to the highest owner (sleeper unless its wake
+committed, then the awake layout, then the retry file) before anything starts; it then writes the sleeper
+record, the autosave and the retry file in that order and only then drops the source. Replaying after a
+crash between any two of these finds the overlap and resolves it the same way.
+- **1:** commits run once: `f` returns a `Change` computed from the live layout with ids from the live
+  counter, that change is written and exactly it is published. A failed folder sync after the rename counts
+  as written: no compensating write.
+- **3:** a malformed `restore.json` no longer removes the autosave; failed sources are kept under unique names.
+- **4:** survivors are guarded by lineage (a live pane of the sleeper's lineage blocks its wake), which also
+  covers a partial wake's remainder and does not depend on a record write.
+- **5:** an awake copy of a workspace whose wake did not commit is dropped by lineage.
+- **6:** sends and kills count as in flight until their last byte; a sleep waits for them; woken panes join the
+  reservation when they are created. **7:** keep-awake and an agent's ask go through the reservation.
+- **8:** both restore paths schedule a saved continue. **14:** the retry file is single, rewritten after the
+  autosave, deduplicated by lineage, raises the id counter, and is dropped by a plain stop.
+- **Store:** a blocked store re-checks its slots before every write; a wake checks writability before starting
+  anything.
+Tests `c1_…`–`c14_…`, `cstore_…`, `cid_…` in `crates/orchd/tests/sleep.rs`.
+
+
 ## 2026-11-22 — Sleep: Codex re-check fixes (1, 2, 3–8, 10, 11, 13, 14, store) — Claude (Opus)
 
 - **14 (ordinary restart):** a restored pane whose start fails (e.g. no durable pane id) no longer consumes the
