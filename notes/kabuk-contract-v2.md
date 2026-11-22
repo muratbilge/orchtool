@@ -264,3 +264,17 @@ show sleeping workspaces.
    - Note for Kabuk: a workspace Kabuk raised (`orch focus`) counts as viewed and never auto-sleeps while it
      stays the raised one.
 
+### Review fixes (Codex review 2026-11-22)
+
+- New error outcomes (exit 1, message on stderr, nothing done): `ws_transition` (the workspace is going to
+  sleep or waking: layout changes, `send`, `kill` on its panes wait; try again), `save_failed` (the record could
+  not be written: nothing was put to sleep / it stays asleep), `wake_failed` (a pane could not start: it stays
+  asleep, every record kept; `orch ws wake --partial` wakes the rest), `ws_stuck` (a program survived SIGKILL
+  when it went to sleep; it is shown in workspace `<label>-stuck`; wake once it is gone), `name_conflict` /
+  `name_reserved` (a sleeping agent's bus name), `ws_changed` (its panes changed while it was checked; retry).
+- `orch ws wake <ws> --partial` prints `awake: …` and on stderr where the failed panes stay asleep
+  (`<label>-rest`, a new sleeping workspace in `sleeping`).
+- Ids are resolved before labels across awake and sleeping workspaces (a label that equals another
+  workspace's id never shadows it).
+- A woken Claude without a verified session id comes back at its resume picker (`claude --resume`), like Codex.
+

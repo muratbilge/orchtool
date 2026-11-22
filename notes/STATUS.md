@@ -1,5 +1,35 @@
 # Status
 
+## 2026-11-22 — Sleep: Codex review fixes (13 findings) — Claude (Opus)
+
+Codex's static review ("Safe to install: no", findings 1–13) checked against the code: all 13 hold; all fixed.
+- **Persistence (1–3):** sleepers have their own record, `sleeping.a.json` / `sleeping.b.json` next to the
+  socket (`sleepstore.rs`): alternating slots with a generation, tmp+fsync+rename+folder fsync, newest valid
+  slot wins, the other is kept; never deleted. Each write is of the current state under the store lock (no
+  stale overtaking). The layout files never carry sleepers (an older orchd leaves the record alone). Sleep:
+  reserve → check → move into `sleeping` → **confirmed write** → only then end the programs (failed write =
+  rolled back, nothing ended). Start-up loads the record first (the panes count as asleep at once), drops
+  every asleep workspace from a stale awake layout, finishes or undoes an interrupted wake. Plain stop waits
+  for transitions and never touches the record. Autosave writes are version-checked; `write_atomic` syncs the folder.
+- **Wake (4, 5, 9):** all or nothing (`--partial` keeps failed panes asleep as `<label>-rest`); an agent must
+  still be up after a grace (in a shell wrapper: as the shell's child); a missing folder fails the pane (no
+  home fallback). Order: start → write old→new map → move tasks and bus names → write awake layout →
+  mark committed → drop the sleeper; a crash before "committed" moves owners back at the next start. Agents
+  resume only a verified session id, else their picker (Claude `--resume`, Codex `resume`); a saved command
+  line is never replayed.
+- **Transitions (6, 7, 13):** per-workspace reservation (layout ops, send, kill, task dispatch, nudges refused
+  or skipped; the global task gate is only touched briefly); the commit checks the pane set is unchanged;
+  panes end in parallel; SIGKILL survivors stay visible in `<label>-stuck` and block the wake. Auto-sleep
+  re-samples at the commit (input, screen, clients, focus, exemption, setting, bus status) and aborts on any
+  change or failed read; a bus status "working" also blocks a manual sleep.
+- **8:** a due usage-limit continue keeps a workspace awake for auto-sleep; the continue rechecks the live
+  auto-continue setting before typing and goes into the layout snapshot (`continue_at`) to survive a restart.
+- **10:** a sleeping agent's explicit bus name is reserved (`name_reserved`); wake refuses on a live holder.
+- **11:** ids resolve before labels across awake and sleeping workspaces.
+- **12:** no pane without a durable id from the counter (no in-memory fallback).
+Failure injection: `ORCHD_FAULT` (`fault.rs`). Tests `f1_…`–`f13_…` in `crates/orchd/tests/sleep.rs`.
+
+
 ## 2026-11-22 — Sleep follow-ups: wake on request, Codex picker, auto-sleep — Claude (Opus)
 
 Murat's answers: "1 yes 2. yes 3. with request, 4. yes". (1) plain `stop-daemon` keeps sleeping workspaces

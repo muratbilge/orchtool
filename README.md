@@ -27,7 +27,16 @@ Built in Rust (stable) by Claude Code and Codex with Murat Bilge steering, for o
   whose pane is gone expire by themselves. A workspace you don't need now can **sleep** (`orch ws sleep <label>`, TUI
   `S` or the `w` list): its layout and how to resume each agent are kept, its programs end and their memory is
   free; `orch ws wake <label>` (or Enter on it in the `w` list) brings it back with the agents resumed. It stays
-  asleep across restarts and crashes, also a plain `stop-daemon`. orchd refuses (exit 15) while an agent in it
+  asleep across restarts and crashes, also a plain `stop-daemon`: sleeping workspaces have their own record
+  next to the socket (`sleeping.a.json` / `sleeping.b.json`, two alternating generations; the newest valid one
+  is used, the other is the predecessor), written and synced **before** any of the workspace's programs end. The
+  layout files `restore.json` / `autosave.json` never contain them, so an older orchd (which reads and rewrites
+  those) leaves the record alone; after a downgrade the sleepers are simply not shown, and they are back after
+  the next upgrade. A wake writes its old→new pane map into the record before moving tasks and bus names, and
+  drops the sleeper only after the awake layout is saved; an orchd that died half-way finishes or undoes it at
+  the next start. A wake is all or nothing (`--partial` keeps panes that can't start asleep as `<label>-rest`);
+  agents resume only a verified session id, else at their resume picker (Claude `--resume`, Codex `resume`).
+  While asleep, an agent's bus name is reserved for it. orchd refuses (exit 15) while an agent in it
   works, waits on a dialog or a question, runs a task, or a program runs that can't be resumed; `--force`
   sleeps anyway (busy agents get a note on wake), `--dry-run` shows the plan. Mail, queued tasks and open
   questions for a sleeping agent wait for it; nothing wakes a workspace by itself, only on request:
