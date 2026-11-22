@@ -2208,7 +2208,7 @@ async fn e5_a_second_crash_before_the_first_new_autosave() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn e6_a_split_by_pane_name_is_placed_before_a_sleep() {
     let mut d = daemon("e6").await;
-    restart_with(&mut d, "split_pause_ms=800,store_slow_ms=600").await;
+    restart_with(&mut d, "split_pause_ms=800,store_slow_ms=1500").await;
     let mut named = spawn(&["bash".into(), "--norc".into()]);
     named.name = Some("nm".into());
     op(
