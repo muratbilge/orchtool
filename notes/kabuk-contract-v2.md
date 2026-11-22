@@ -205,17 +205,18 @@ that cross-repository step is still required, not implied by orchtool's unit tes
 ## Sleeping workspaces (2026-11-22, additive)
 
 A workspace can sleep: its programs end (memory freed), its layout and how to resume each agent are kept in
-orchd, and it can be woken later with its agents resumed. Nothing in `v` changes; old Kabuk builds simply do not
-show sleeping workspaces.
+orchd's own record, and it can be woken later with its agents resumed. Nothing in `v` changes; old Kabuk builds
+simply do not show sleeping workspaces. (Murat, 2026-11-22: "1 yes 2. yes 3. with request, 4. yes"; the
+automatic sleep and partial wake that followed were removed again the same day: manual sleep / wake only.)
 
 - **Stream:** new top-level key `sleeping`: array, in the order they were put to sleep. Each entry:
   `{id, label, cwd, position, slept_ms, panes, tabs:[{id, label}], agents:[{name, kind, limited, interrupted}]}`.
-  `position` = its index among `workspaces` when it fell asleep (it wakes up there again, so the bar can show it
-  in place); `slept_ms` unix ms; `panes` = how many panes come back; `agents[].name` is the bus name (null for
-  an agent that never registered), `limited` = it was paused on its usage limit (it gets "continue" after the
-  reset once awake), `interrupted` = put to sleep with `--force` while busy. A sleeping workspace is **not** in
-  `workspaces`, and its agents are **not** in `agents` (their panes are gone); `workspaces[].number` and
-  `agents[].workspace_number` count awake workspaces only. Labels are unique across both lists.
+  `position` = its index among `workspaces` when it fell asleep (it wakes up there again); `slept_ms` unix ms;
+  `panes` = how many panes come back; `agents[].name` is the bus name (null for an agent that never
+  registered), `limited` = paused on its usage limit (it gets "continue" after the reset once awake),
+  `interrupted` = put to sleep with `--force` while busy. A sleeping workspace is **not** in `workspaces`, its
+  agents are **not** in `agents`; one being woken is already back in `workspaces` and no longer listed here.
+  `workspaces[].number` / `agents[].workspace_number` count awake workspaces only. Labels are unique across both.
 - **Actions:**
 
   | action | command | prints / exit |
@@ -223,65 +224,26 @@ show sleeping workspaces.
   | put to sleep | `"$O" ws sleep <id\|label>` | `asleep: <label> …`; **15** = busy, nothing done (stderr lists why, one reason per line after the first) |
   | sleep anyway | `"$O" ws sleep <id\|label> --force` | busy agents are interrupted (they get a note on wake), running programs end and come back as fresh shells |
   | what would happen | `"$O" ws sleep <id\|label> --dry-run` | the plan: `! <reason>` lines (blockers), `- <how it comes back>` lines; exit 0 |
-  | wake | `"$O" ws wake <id\|label>` | `awake: <label> (<new pane ids>)`; `already awake: …` for an awake one; 14 = no such workspace |
+  | wake | `"$O" ws wake <id\|label>` | `awake: <label> (<new pane ids>)`; `already awake: …`; 14 = no such workspace; 1 with `wake_failed` = a pane could not start, nothing changed |
   | forget a sleeping one | `"$O" ws close <id\|label>` | nothing to kill; its running tasks fail |
+  | message, waking its agent | `"$O" msg --wake -- <agent> <text>` | `sent #<id>`, `woke <label>`; refused for `all` (exit 1, nothing sent) |
+  | task, waking its workspace | `"$O" task add <label> --wake <text>` | the task id; a failed wake leaves it queued (exit 0, warning on stderr) |
 
-  Sleeping an already sleeping workspace prints `already asleep: <label>` (exit 0). `ws focus` on a sleeping
-  workspace is 14 (wake it first).
-- **Exit code 15** (new outcome, additive): `ws sleep` refused because the workspace is busy: an agent works,
-  waits on a dialog (permission prompt / menu) or for Murat's answer to a question, runs an orch task, or a
-  program runs that cannot be resumed (a job in a shell, an editor, any non-shell program). Certainly not done.
-- **While asleep:** messages to its agents stay unread (the agent is told to read them when it wakes), tasks
-  for its label can still be added and stay queued (dispatched once an agent is back), running tasks stay
-  running (they follow the pane), open questions stay open and can be answered. Nothing wakes a workspace by
-  itself; Kabuk should offer Wake on a sleeping entry.
+  The MCP tool `send_message` has an optional boolean `wake` (default false), same rules. Sleeping an already
+  sleeping workspace prints `already asleep: <label>` (exit 0). `ws focus` on a sleeping workspace is 14.
+- **Exit code 15** (new outcome, additive): `ws sleep` refused because the workspace is busy (an agent works,
+  waits on a dialog or a question, runs an orch task, or a program runs that cannot be resumed). Not done.
+- **Other new errors** (exit 1, nothing done): `ws_transition` (it is going to sleep or waking: layout changes,
+  `send`, `kill`, `attach` on its panes are refused meanwhile; ones already under way finish first),
+  `save_failed` (the record could not be written durably: nothing was put to sleep / it stays asleep; also while
+  a record slot is damaged or holds a record this orchd did not load: restart orchd), `wake_failed`, `ws_stuck`
+  (a program of it that could not be ended still runs outside any workspace: `orch kill` it first),
+  `name_conflict` / `name_reserved` (a sleeping agent's bus name), `ws_changed` (its panes changed while it was
+  checked; retry).
+- **While asleep:** messages stay unread (the agent is told to read them on wake), tasks for its label can be
+  added and stay queued, running tasks stay running (they follow the pane on wake), open questions stay open.
+  Nothing wakes a workspace by itself.
 - **Timeline:** orchd posts `msg` rows to murat in thread `sleep` ("<label> is asleep: …", "<label> is awake:
   …"), and in thread `limits` for a limited agent continued after a wake.
-- **Fixture:** `crates/orch/tests/fixtures/watch-v1.json` was regenerated with one sleeping workspace; copy it
-  into Kabuk (`app/src/test/resources/orch-watch.json`) the same day.
-
-### Follow-ups (Murat, 2026-11-22: "1 yes 2. yes 3. with request, 4. yes")
-
-1. A plain `stop-daemon` keeps sleeping workspaces (as above).
-2. A Codex without a verified session id comes back at its resume picker after a wake, never `resume --last`
-   (a restart keeps its own rule). The plan notes say so.
-3. Waking only on request:
-   - `"$O" msg --wake -- <agent> <text>`: the message is stored, then the agent's sleeping workspace wakes and
-     the agent is told to read its inbox. Prints `sent #<id>` and `woke <label>`. `--wake` with `all` is
-     refused (exit 1, nothing sent): a broadcast never wakes every workspace. To a pane-less or awake agent it
-     changes nothing.
-   - `"$O" task add <label> --wake <text>`: the task is queued, then its sleeping workspace wakes; the task
-     dispatches as usual. A failed wake leaves the task queued (exit 0, warning on stderr).
-   - The MCP tool `send_message` has an optional boolean `wake` (default false), same rules.
-   - Without `--wake` nothing changes: mail and tasks wait for the workspace.
-4. Auto-sleep (off by default): `"$O" auto-sleep` prints `auto-sleep: off` or `auto-sleep: after 30m idle`
-   (+ `kept awake: <labels>`); `"$O" auto-sleep <30m|2h|1h30m|90s|off>` sets it;
-   `"$O" ws keep-awake <id|label> on|off` exempts a workspace (prints `<label>: keep-awake on|off`). The idle
-   definition is in README. An automatic sleep is a normal sleep (never forced) and posts
-   "<label> is asleep (auto-sleep: idle for 30m): …" to murat, thread `sleep`.
-   - **Stream (additive):** top-level `auto_sleep_ms` (int, null = off); `workspaces[].keep_awake` and
-     `sleeping[].keep_awake` (bool). Against an older orchd `auto_sleep_ms` is null and `keep_awake` false.
-   - Note for Kabuk: a workspace Kabuk raised (`orch focus`) counts as viewed and never auto-sleeps while it
-     stays the raised one.
-
-### Review fixes (Codex review 2026-11-22)
-
-- New error outcomes (exit 1, message on stderr, nothing done): `ws_transition` (the workspace is going to
-  sleep or waking: layout changes, `send`, `kill` on its panes wait; try again), `save_failed` (the record could
-  not be written: nothing was put to sleep / it stays asleep), `wake_failed` (a pane could not start: it stays
-  asleep, every record kept; `orch ws wake --partial` wakes the rest), `ws_stuck` (a program survived SIGKILL
-  when it went to sleep; it is shown in workspace `<label>-stuck`; wake once it is gone), `name_conflict` /
-  `name_reserved` (a sleeping agent's bus name), `ws_changed` (its panes changed while it was checked; retry).
-- `orch ws wake <ws> --partial` prints `awake: …` and on stderr where the failed panes stay asleep
-  (`<label>-rest`, a new sleeping workspace in `sleeping`).
-- Ids are resolved before labels across awake and sleeping workspaces (a label that equals another
-  workspace's id never shadows it).
-- A woken Claude without a verified session id comes back at its resume picker (`claude --resume`), like Codex.
-- (re-check) A viewer attaching (or input, or a layout change) during an **automatic** sleep that has not
-  committed stops that sleep; during a manual sleep or a wake it is refused with `ws_transition`. A damaged or
-  unknown-format `sleeping.*.json` makes every sleep / wake fail with `save_failed` until it is moved away.
-- (second re-check) A damaged `sleeping.*.json` is looked at again before every write: moving it away is
-  enough. `orch ws keep-awake <ws> on` during an automatic sleep stops it; once that sleep commits it is
-  refused (`ws_transition`). An agent's `ask` likewise. A send waits for nothing but is waited for: a sleep
-  starts only after sends already typing into its panes have finished.
-
+- **Fixture:** `crates/orch/tests/fixtures/watch-v1.json` has one sleeping workspace; copy it into Kabuk
+  (`app/src/test/resources/orch-watch.json`) the same day.

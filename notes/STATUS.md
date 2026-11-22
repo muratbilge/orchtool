@@ -1,5 +1,23 @@
 # Status
 
+## 2026-11-22 — Sleep cut down to manual sleep / wake — Claude (Opus)
+
+Murat's decision after Codex's third re-check: smaller feature instead of a fourth fix round. **Supersedes the
+sleep entries below** (auto-sleep, keep-awake, partial wake, `-stuck` / `-rest` workspaces, pane lineage,
+`unrestored*.json` retry, `restore.json.restoring`, durable-only pane counter: all removed).
+- The restart path is main's: `autosave.rs`, `restore.rs` (except `SavedPane` moved to orch-proto) and the pane
+  id allocation are unchanged; `main.rs` only loads the sleeper record before the restore and installs it after.
+- Kept: `orch ws sleep|wake [--force|--dry-run]`, `msg --wake`, `task add --wake`, the two-slot record, plain
+  stop keeps sleepers, verified-id / picker resume, name reservation, id-before-label lookup, stop/reservation
+  admission, single-pass commits, the in-flight send/kill guard (now also layout changes, through placement).
+- Start-up rule (one): a sleeper whose panes are in the layout file the restore used came back awake (crash
+  before the autosave caught up with a sleep, or after a wake's autosave) and is dropped; duplicate sleepers of one
+  workspace id keep the first; an interrupted wake moves its owners back. A wake drops its sleeper only once the
+  autosave on disk holds the new panes. A failed folder sync is a failed sleep. A blocked record store unblocks
+  only when the record on disk is the one it loaded (else: restart).
+Tests: `crates/orchd/tests/sleep.rs` (manual sleep/wake, faults, d5/d6/d_store for the remaining findings).
+
+
 ## 2026-11-22 — Sleep: second re-check (1, 3–8, 14, store, commit ids) — Claude (Opus)
 
 The class fix Codex asked for: one authority per pane, reconciled by **lineage** (`Pane::origin`, kept in every

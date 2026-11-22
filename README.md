@@ -26,41 +26,24 @@ Built in Rust (stable) by Claude Code and Codex with Murat Bilge steering, for o
   that does not finish is not tried again: the file is kept as `autosave.json.failed`. Questions from agents
   whose pane is gone expire by themselves. A workspace you don't need now can **sleep** (`orch ws sleep <label>`, TUI
   `S` or the `w` list): its layout and how to resume each agent are kept, its programs end and their memory is
-  free; `orch ws wake <label>` (or Enter on it in the `w` list) brings it back with the agents resumed. It stays
-  asleep across restarts and crashes, also a plain `stop-daemon`: sleeping workspaces have their own record
-  next to the socket (`sleeping.a.json` / `sleeping.b.json`, two alternating generations; the newest valid one
-  is used, the other is the predecessor), written and synced **before** any of the workspace's programs end. The
-  layout files `restore.json` / `autosave.json` never contain them, so an older orchd (which reads and rewrites
-  those) leaves the record alone; after a downgrade the sleepers are simply not shown, and they are back after
-  the next upgrade. A wake writes its old→new pane map into the record before moving tasks and bus names, and
-  drops the sleeper only after the awake layout is saved; an orchd that died half-way finishes or undoes it at
-  the next start. A wake is all or nothing (`--partial` keeps panes that can't start asleep as `<label>-rest`);
-  agents resume only a verified session id, else at their resume picker (Claude `--resume`, Codex `resume`).
-  While asleep, an agent's bus name is reserved for it. A slot that is damaged or in an unknown format is
-  left alone and blocks sleep / wake (`save_failed`) until it is moved away. (It is looked at again before every
-  write, so moving the bad file away is enough; no restart.) Panes that can't be started when a layout is
-  restored are kept in `unrestored.json` and tried again at every start until they come back; a plain
-  `orch stop-daemon` drops them (that ends the session, as it does for the running panes). Every pane keeps one
-  lineage across restarts, sleeps, wakes and retries, and each start decides by it which file owns a pane
-  (a sleeper, then the awake layout, then the retry file), so a crash between two writes can neither start a
-  pane twice nor lose one. A failed `restore.json` / autosave is kept as `*.failed` (or `*.failed-<ms>` when an
-  earlier one is still there); a malformed `restore.json` leaves the autosave to be used. orchd refuses (exit 15) while an agent in it
-  works, waits on a dialog or a question, runs a task, or a program runs that can't be resumed; `--force`
-  sleeps anyway (busy agents get a note on wake), `--dry-run` shows the plan. Mail, queued tasks and open
-  questions for a sleeping agent wait for it; nothing wakes a workspace by itself, only on request:
-  `orch msg --wake <agent> …` (the MCP `send_message` has `wake`) and `orch task add <ws> --wake …` wake the
-  addressed agent's / the target's workspace (refused for `all`: a broadcast never wakes everything). A Codex
-  without a verified session id comes back at its resume picker after a wake (never `resume --last`).
-  **Auto-sleep** (off by default): `orch auto-sleep 30m` (or `2h`, `1h30m`, `90s`; `off`; without an argument it
-  shows the setting; kept in the database) puts a workspace to sleep once it has been idle that long, never
-  forced: a workspace a plain `orch ws sleep` would refuse is left awake and gets a new period.
-  `orch ws keep-awake <ws> on|off` exempts one. *Idle* for the whole period means: no agent in it working
-  (screen or bus status), no change of any of its panes' screens (the normalised `read --hash`, so spinners
-  don't count), no input written into any of its panes, no client attached to any of its panes (a TUI showing
-  it, `orch attach`), and it is not the workspace last raised (`orch focus`, Kabuk, a TUI's switch). Any of
-  these starts a new period, and so does creating or waking a workspace, changing the setting, and starting
-  orchd (after a restart every workspace gets a full period). Each automatic sleep is posted to the timeline
-  (thread `sleep`, "… is asleep (auto-sleep: idle for 30m) …"). Starts on demand from `orch`, or as a user service (`contrib/orchd.service`).
+  free; `orch ws wake <label>` (or Enter on it in the `w` list) brings it back with the agents resumed. orchd
+  refuses (exit 15) while an agent in it works, waits on a dialog or a question, runs a task, or a program runs
+  that can't be resumed; `--force` sleeps anyway (busy agents get a note on wake), `--dry-run` shows the plan.
+  Sleeping workspaces have their own record next to the socket (`sleeping.a.json` / `sleeping.b.json`, two
+  alternating generations, the newest valid one used), written and synced before any of the workspace's programs
+  end (a failed write, folder sync included, ends nothing). Restarts, crashes and a plain `stop-daemon` keep it;
+  the restart path itself (`restore.json`, the autosave) is unchanged. If orchd dies before the autosave has
+  caught up with a sleep (about 2 s), the workspace comes back awake and its sleeper record is dropped; a wake
+  drops the sleeper only once the autosave holds the woken panes. A wake is all or nothing: if a pane can't be
+  started, none is and the sleeper stays as it was; a started pane that then can't be ended keeps running
+  outside any workspace (`orch ls`, `orch kill`) and the workspace can't wake until it is gone. Agents resume
+  only a verified session id, else at their resume picker (Claude `--resume`, Codex `resume`, never `--last`).
+  While asleep, an agent's bus name is reserved for it; mail, queued tasks and open questions wait for it.
+  Nothing wakes a workspace by itself, only on request: `orch msg --wake <agent> …` (the MCP `send_message` has
+  `wake`) and `orch task add <ws> --wake …` (refused for `all`: a broadcast never wakes everything). A record
+  slot that is damaged or in an unknown format is left alone and blocks sleep / wake (`save_failed`); moving it
+  away is enough while it was not the newest record, otherwise (or after a repaired slot) restart orchd to load
+  it. Starts on demand from `orch`, or as a user service (`contrib/orchd.service`).
 - **`orch`**, the CLI and the TUI (`ratatui`; mouse and touch: tap a pane or a tab, `+` for a new tab, `☰` for
   the workspace list). Panes: `new`, `ls`, `attach`, `send`, `read` (`--unwrapped` joins soft-wrapped
   rows), `kill`, `focus`, `auto-continue`; layout: `ws` and `tab`
