@@ -1,5 +1,34 @@
 # Status
 
+## 2026-11-22 — Sleep: Codex re-check fixes (1, 2, 3–8, 10, 11, 13, 14, store) — Claude (Opus)
+
+- **14 (ordinary restart):** a restored pane whose start fails (e.g. no durable pane id) no longer consumes the
+  layout: the failed panes go to `unrestored-*.json` (never written by the autosave or an older orchd) and are
+  tried again at every start. `restore.json` is renamed to `restore.json.restoring` (loop guard) instead of
+  unlinked, and the source (`restore.json.restoring` / `autosave.json.restoring`) goes only after the
+  sleepers taken from it are in their record, the leftovers are kept and the restored layout is in the
+  autosave; otherwise it is kept as `*.failed`.
+- **1:** sleeper changes go through `Daemon::commit`: computed on a copy, written, and only then applied to the
+  live layout; snapshots wait on a publish gate while a write is in flight; a write that failed after its
+  rename is superseded by the unchanged state.
+- **2:** a failed planned-restart save resets `stopping_soon`; reservations are admitted under the lock the stop
+  checks under.
+- **3:** a stale awake copy of a sleeper is recognised by its panes, not its id (an older orchd's reused id
+  keeps its workspace; the sleeper is renumbered); legacy sleepers keep their source until written.
+- **4:** wake-rollback survivors are kept visible and block the next wake; a shell wrapper only counts as
+  started when the agent program itself is its child.
+- **5:** a failed undo keeps the wake map in the record (the next start retries); the question sweep starts
+  after the sleepers are reconciled.
+- **6/7:** reservations hold their pane ids until the transition ends (send, kill, attach refused even after the
+  workspace left the layout); a person arriving (attach, input, layout change) stops an automatic sleep that has
+  not started to commit; questions are checked at the auto-sleep commit.
+- **8:** due usage-limit continues of woken panes are in the awake layout before the wake commits.
+- **10:** during a wake only the replacement of the agent's own pane may take its name. **11:** `task add --wake`
+  wakes the sleeper the task's label resolves to. **13:** record writes run on blocking threads.
+- **Store:** a slot that exists but is damaged or unsupported is left alone and blocks writes.
+Tests `r1_…`–`r14_…`, `rstore_…` in `crates/orchd/tests/sleep.rs`.
+
+
 ## 2026-11-22 — Sleep: Codex review fixes (13 findings) — Claude (Opus)
 
 Codex's static review ("Safe to install: no", findings 1–13) checked against the code: all 13 hold; all fixed.

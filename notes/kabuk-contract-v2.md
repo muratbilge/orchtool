@@ -277,4 +277,7 @@ show sleeping workspaces.
 - Ids are resolved before labels across awake and sleeping workspaces (a label that equals another
   workspace's id never shadows it).
 - A woken Claude without a verified session id comes back at its resume picker (`claude --resume`), like Codex.
+- (re-check) A viewer attaching (or input, or a layout change) during an **automatic** sleep that has not
+  committed stops that sleep; during a manual sleep or a wake it is refused with `ws_transition`. A damaged or
+  unknown-format `sleeping.*.json` makes every sleep / wake fail with `save_failed` until it is moved away.
 

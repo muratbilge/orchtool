@@ -36,7 +36,9 @@ Built in Rust (stable) by Claude Code and Codex with Murat Bilge steering, for o
   drops the sleeper only after the awake layout is saved; an orchd that died half-way finishes or undoes it at
   the next start. A wake is all or nothing (`--partial` keeps panes that can't start asleep as `<label>-rest`);
   agents resume only a verified session id, else at their resume picker (Claude `--resume`, Codex `resume`).
-  While asleep, an agent's bus name is reserved for it. orchd refuses (exit 15) while an agent in it
+  While asleep, an agent's bus name is reserved for it. A slot that is damaged or in an unknown format is
+  left alone and blocks sleep / wake (`save_failed`) until it is moved away. Panes that can't be started when a
+  layout is restored are kept in `unrestored-*.json` and tried again at every start. orchd refuses (exit 15) while an agent in it
   works, waits on a dialog or a question, runs a task, or a program runs that can't be resumed; `--force`
   sleeps anyway (busy agents get a note on wake), `--dry-run` shows the plan. Mail, queued tasks and open
   questions for a sleeping agent wait for it; nothing wakes a workspace by itself, only on request:
