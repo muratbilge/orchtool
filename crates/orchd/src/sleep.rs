@@ -536,31 +536,28 @@ impl Daemon {
         .await
     }
 
-    /// Start-up, before the restore: the sleeper record, and the panes per workspace of the
-    /// layout file the restore will use (`restore.json`, else the autosave unless a failed
-    /// restore left its marker: the same choice `autosave::restore_at_start` makes). The
-    /// sleepers count as asleep from now on.
-    pub fn load_sleepers(&self, dir: &Path) -> Sleepers {
+    /// Start-up, before the restore: the sleeper record. The sleepers count as asleep from now
+    /// on, and the restore leaves their panes out (`skip_asleep`).
+    pub fn load_sleepers(&self) -> Sleepers {
         let mut sl = Sleepers::default();
         if let crate::sleepstore::Loaded::Found { record, .. } = self.sleep_store.load() {
             sl.list = record.sleeping;
             sl.next_id = record.next_id;
         }
-        let restart = dir.join("restore.json");
-        let auto = dir.join(crate::autosave::FILE);
-        let file = if restart.exists() {
-            Some(restart)
-        } else if !dir.join(crate::autosave::RESTORING).exists() && auto.exists() {
-            Some(auto)
-        } else {
-            None
-        };
-        // The sleeper record is the truth for its panes: any of them (its old pane ids, or the
-        // new ids of an interrupted wake) still in that layout file is a stale awake copy and is
-        // taken out of it before the restore reads it, so it is never started. Only done when a
-        // sleeper overlaps the file.
-        let mine: HashSet<String> = sl
-            .list
+        *self.loading_sleepers.lock().unwrap() = sl.list.clone();
+        sl
+    }
+
+    /// Called by the restore on the layout it parsed, whichever file that was, before it starts
+    /// anything: the panes of the sleepers loaded at start-up (their old ids, and the new ids
+    /// of an interrupted wake) are taken out, so a stale awake copy of a sleeper is never
+    /// started; the sleeper record is the truth for them. Other panes and workspaces stay. With
+    /// no sleepers this returns at once and the layout is untouched.
+    pub fn skip_asleep(&self, saved: &mut crate::restore::Saved) {
+        let mine: HashSet<String> = self
+            .loading_sleepers
+            .lock()
+            .unwrap()
             .iter()
             .flat_map(|x| {
                 x.panes
@@ -569,66 +566,27 @@ impl Daemon {
                     .chain(x.wake.iter().flat_map(|w| w.map.values().cloned()))
             })
             .collect();
-        if let Some(file) = file.filter(|_| !mine.is_empty()) {
-            if let Some(mut saved) = std::fs::read(&file)
-                .ok()
-                .and_then(|d| serde_json::from_slice::<crate::restore::Saved>(&d).ok())
-            {
-                let stale = saved
-                    .session
-                    .workspaces
-                    .iter()
-                    .flat_map(|w| w.tabs.iter().flat_map(|t| t.root.panes()))
-                    .any(|p| mine.contains(&p));
-                if stale {
-                    saved.panes.retain(|id, _| !mine.contains(id));
-                    let keep: HashMap<String, String> = saved
-                        .session
-                        .workspaces
-                        .iter()
-                        .flat_map(|w| w.tabs.iter().flat_map(|t| t.root.panes()))
-                        .filter(|p| !mine.contains(p))
-                        .map(|p| (p.clone(), p))
-                        .collect();
-                    saved.session.workspaces = saved
-                        .session
-                        .workspaces
-                        .iter()
-                        .filter_map(|w| mapped(w, &keep))
-                        .collect();
-                    let written = if crate::fault::on("strip_write") {
-                        Err(std::io::Error::other("injected"))
-                    } else {
-                        crate::restore::layout_bytes(&saved)
-                            .map_err(std::io::Error::from)
-                            .and_then(|d| crate::restore::write_atomic(&file, &d))
-                    };
-                    match written {
-                        Ok(()) => eprintln!(
-                            "orchd: {} held panes of a sleeping workspace; they stay asleep",
-                            file.display()
-                        ),
-                        Err(e) => {
-                            // Never start a sleeper's panes: the whole file is set aside
-                            // (kept, not restored) rather than restored with them.
-                            let aside = file.with_extension("json.sleeper-conflict");
-                            let _ = std::fs::rename(&file, &aside);
-                            eprintln!(
-                                "orchd: taking a sleeper's panes out of {} failed ({e}); it is kept as {} and not restored",
-                                file.display(),
-                                aside.display()
-                            );
-                        }
-                    }
-                }
-            }
+        if mine.is_empty() {
+            return;
         }
-        crate::fault::crash_at("after_sleep_strip");
-        *self.loading_sleepers.lock().unwrap() = sl.list.clone();
-        sl
+        saved.panes.retain(|id, _| !mine.contains(id));
+        let keep: HashMap<String, String> = saved
+            .session
+            .workspaces
+            .iter()
+            .flat_map(|w| w.tabs.iter().flat_map(|t| t.root.panes()))
+            .filter(|p| !mine.contains(p))
+            .map(|p| (p.clone(), p))
+            .collect();
+        saved.session.workspaces = saved
+            .session
+            .workspaces
+            .iter()
+            .filter_map(|w| mapped(w, &keep))
+            .collect();
     }
 
-    /// Start-up, after the restore (which, see `load_sleepers`, started none of a sleeper's
+    /// Start-up, after the restore (which, see `skip_asleep`, started none of a sleeper's
     /// panes). No sleeper is retired here. Two sleepers of one workspace id: the first one
     /// stays. An interrupted wake moves its tasks and names back to the old panes (its map stays
     /// if that fails, for the next start). Ids an older orchd handed out meanwhile are
@@ -1235,7 +1193,7 @@ impl Daemon {
         self.after_wake_all(&ok, &w.label);
         // 4. The sleeper goes once the autosave on disk holds the new panes (until then a crash
         //    leaves it asleep, see `install_sleepers`). The reservation lasts until then.
-        let confirmed = self.confirm_wake(&ws_id, &new_panes, reserved).await;
+        let confirmed = self.confirm_wake(&ws_id, &map, reserved).await;
         Ok(json!({
             "session": self.session(),
             "workspace": w.id,
@@ -1246,28 +1204,40 @@ impl Daemon {
     }
 
     /// Waits until the autosave file holds the woken workspace with its new panes placed, then
-    /// drops the sleeper. A new pane that has ended meanwhile is no longer waited for (it is in
-    /// no future autosave); with none left the sleeper is dropped at once. The reservation is
-    /// released when that happens or after `CONFIRM_FOR`, whichever comes first; the sleeper is
-    /// still dropped later if it takes longer. Returns whether it was dropped within that time.
+    /// drops the sleeper. It belongs to this one wake: the sleeper is removed only if it still
+    /// carries this wake's pane map (compared in the same commit), and it stops as soon as that
+    /// sleeper is gone or carries another map (closed, or slept and woken again). A new pane
+    /// that has ended is no longer waited for. The reservation is released when the sleeper is
+    /// dropped or by a timer at the deadline, whatever the polling is doing then; the sleeper is
+    /// still dropped later if it takes longer. Returns whether it was dropped in time.
     async fn confirm_wake(
         self: &Arc<Self>,
         ws_id: &str,
-        panes: &[String],
+        map: &HashMap<String, String>,
         reserved: Reservation,
     ) -> bool {
-        let d = Arc::clone(self);
-        let (id, want) = (ws_id.to_string(), panes.to_vec());
-        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+        let wait = std::env::var("ORCHD_WAKE_CONFIRM_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .map_or(CONFIRM_FOR, Duration::from_millis);
+        let reserved = Arc::new(std::sync::Mutex::new(Some(reserved)));
+        let timer = Arc::clone(&reserved);
         tokio::spawn(async move {
-            let mut reserved = Some(reserved);
-            let mut done_tx = Some(done_tx);
-            let wait = std::env::var("ORCHD_WAKE_CONFIRM_MS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .map_or(CONFIRM_FOR, Duration::from_millis);
-            let deadline = tokio::time::Instant::now() + wait;
+            tokio::time::sleep(wait).await;
+            timer.lock().unwrap().take();
+        });
+        let d = Arc::clone(self);
+        let (id, mine) = (ws_id.to_string(), map.clone());
+        let want: Vec<String> = map.values().cloned().collect();
+        let job = tokio::spawn(async move {
             loop {
+                // Still this wake's sleeper?
+                let ours = d.session().sleeping.iter().any(|x| {
+                    x.workspace.id == id && x.wake.as_ref().map(|w| &w.map) == Some(&mine)
+                });
+                if !ours {
+                    break;
+                }
                 let live: Vec<&String> = want
                     .iter()
                     .filter(|p| d.find(p).is_ok_and(|p| p.exit_code().is_none()))
@@ -1290,33 +1260,46 @@ impl Daemon {
                     });
                 if placed {
                     crate::fault::crash_at("wake_before_drop");
+                    let (id2, mine2) = (id.clone(), mine.clone());
                     let dropped = if crate::fault::on("drop_fail") {
                         Err(err("save_failed", "injected"))
                     } else {
-                        d.commit_sleeper(&id, |_| false).await
+                        d.commit_off(move |s| {
+                            let list: Vec<Sleeping> = s
+                                .sleeping
+                                .iter()
+                                .filter(|x| {
+                                    !(x.workspace.id == id2
+                                        && x.wake.as_ref().map(|w| &w.map) == Some(&mine2))
+                                })
+                                .cloned()
+                                .collect();
+                            if list.len() == s.sleeping.len() {
+                                return Err(err("no_workspace", "not this wake's sleeper"));
+                            }
+                            Ok((Change::sleepers(list), ()))
+                        })
+                        .await
                     };
                     match dropped {
-                        Ok(()) => break,
+                        Ok(()) => return true,
                         Err(e) if e.code == "no_workspace" => break,
                         Err(e) => {
                             eprintln!("orchd: dropping the sleeper of a wake: {}", e.message)
                         }
                     }
                 }
-                if tokio::time::Instant::now() >= deadline {
-                    // Never held longer than this: the workspace is usable again; a sleep of
-                    // it is refused while its sleeper record is still there.
-                    reserved.take();
-                    done_tx.take();
-                }
                 tokio::time::sleep(Duration::from_millis(250)).await;
             }
-            drop(reserved);
-            if let Some(tx) = done_tx {
-                let _ = tx.send(());
-            }
+            false
         });
-        done_rx.await.is_ok()
+        let done = Arc::clone(&reserved);
+        let confirmed = tokio::spawn(async move {
+            let ok = job.await.unwrap_or(false);
+            done.lock().unwrap().take();
+            ok
+        });
+        matches!(tokio::time::timeout(wait, confirmed).await, Ok(Ok(true)))
     }
 
     /// Ends the panes a failed wake started. One that can't be ended keeps running outside any

@@ -2348,3 +2348,101 @@ async fn e7_a_pane_ending_before_the_checkpoint_does_not_hold_the_wake() {
     assert!(out.status.success(), "{out:?}");
     d.child.wait().unwrap();
 }
+
+// ---------- fifth check ----------
+
+/// A layout file holding the awake workspaces of `autosave.json` plus the sleeper's workspace
+/// with all its panes (a stale awake copy), written to `name`.
+fn stale_layout_with_others(d: &D, name: &str) {
+    let rec = record(d);
+    let x = &rec["sleeping"][0];
+    let mut saved: Value =
+        serde_json::from_slice(&std::fs::read(d.dir.join("autosave.json")).unwrap()).unwrap();
+    saved["session"]["workspaces"]
+        .as_array_mut()
+        .unwrap()
+        .push(x["workspace"].clone());
+    for (k, v) in x["panes"].as_object().unwrap() {
+        saved["panes"][k] = v.clone();
+    }
+    std::fs::write(d.dir.join(name), serde_json::to_vec(&saved).unwrap()).unwrap();
+}
+
+/// A1: the planned file is unreadable, so the restore falls back to the autosave; both hold a
+/// stale copy of sleeper S. The filter sits where the parsed layout is used: S is not started,
+/// stays asleep with both panes; unrelated T comes back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn g5_every_fallback_leaves_a_sleepers_panes_out() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let mut d = daemon("g5a").await;
+    shell_ws(&d, "tee").await;
+    two_tabs_asleep(&mut d).await;
+    stale_layout_with_others(&d, "autosave.json");
+    std::fs::copy(d.dir.join("autosave.json"), d.dir.join("restore.json")).unwrap();
+    std::fs::set_permissions(
+        d.dir.join("restore.json"),
+        std::fs::Permissions::from_mode(0o000),
+    )
+    .unwrap();
+    restart_with(&mut d, "").await;
+    let s = session(&d).await;
+    assert!(
+        asleep_with(&s, "two", 2),
+        "S asleep with both panes, not started"
+    );
+    let t = s.workspace("tee").expect("T comes back");
+    let t_panes: Vec<String> = t.tabs.iter().flat_map(|t| t.root.panes()).collect();
+    assert_eq!(
+        running_panes(&d).await.len(),
+        t_panes.len(),
+        "only T's panes run"
+    );
+    let _ = std::fs::set_permissions(
+        d.dir.join("restore.json"),
+        std::fs::Permissions::from_mode(0o600),
+    );
+}
+
+/// A2: unrelated awake T survives next to a stale copy of S (no layout file is rewritten or
+/// set aside, also when such a rewrite would fail).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn g5_an_unrelated_workspace_survives_next_to_a_stale_sleeper() {
+    let mut d = daemon("g5b").await;
+    shell_ws(&d, "tee").await;
+    two_tabs_asleep(&mut d).await;
+    stale_layout_with_others(&d, "autosave.json");
+    restart_with(&mut d, "strip_write").await;
+    let s = session(&d).await;
+    assert!(s.workspace("tee").is_some(), "T comes back");
+    assert!(asleep_with(&s, "two", 2));
+    assert!(!d.dir.join("autosave.json.sleeper-conflict").exists());
+}
+
+/// C3: a confirmer from an earlier wake never removes a later sleeper of the same workspace:
+/// the autosave is unavailable past the timeout, the pending sleeper is closed, the workspace
+/// is put to sleep again, then autosaves work again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn g7_an_old_confirmer_leaves_a_later_sleeper_alone() {
+    let d = daemon("g7").await;
+    shell_ws(&d, "cw").await;
+    sleep_op(&d, "cw", false).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let auto = d.dir.join("autosave.json");
+    let _ = std::fs::remove_file(&auto);
+    std::fs::create_dir_all(auto.join("blocked")).unwrap();
+    // Not confirmed within the (3 s) timeout: the reservation is released.
+    let v = wake_op(&d, "cw").await.unwrap();
+    assert_eq!(v["confirmed"], false);
+    // Close takes the pending sleeper; the awake workspace stays; sleep it again.
+    let out = orch_cli(&d, &["ws", "close", "cw"]);
+    assert!(out.status.success(), "{out:?}");
+    assert!(session(&d).await.workspace("cw").is_some());
+    sleep_op(&d, "cw", false).await.unwrap();
+    // Autosaves work again; the old confirmer must not take the new sleeper.
+    std::fs::remove_dir_all(&auto).unwrap();
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(
+        session(&d).await.sleeping("cw").is_some(),
+        "the later sleeper is intact"
+    );
+}

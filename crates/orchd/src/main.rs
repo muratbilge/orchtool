@@ -71,7 +71,7 @@ async fn main() -> anyhow::Result<()> {
     // before anything runs, so their panes count as asleep from the start; reconciled with
     // what the restore brought back right after it.
     daemon.sleep_store.set_dir(dir.clone());
-    let sleepers = daemon.load_sleepers(&dir);
+    let sleepers = daemon.load_sleepers();
     start_nudger(Arc::clone(&daemon));
     orchd::ui::start_detector(Arc::clone(&daemon));
     orchd::limits::start(Arc::clone(&daemon));
