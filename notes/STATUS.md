@@ -1,5 +1,17 @@
 # Status
 
+## 2026-11-22 — Sleep: tenth check (wrapper variables, relative programs, note script, logs) — Claude (Opus)
+
+- `agent_start::rebuild` refuses (note) a shell pane whose command line sets a variable or can't be read, also
+  with a discovered agent argv; and a program word that is a relative path with a slash.
+- The note is `/bin/sh -c <fixed script> orch-note <shell> <lines...>`: the lines are arguments, never script
+  text; then `exec` of the pane's / login shell.
+- Logs, the sleep plan and `orch ws wake` carry pane, kind and a fixed reason only, never the command line.
+- Fact for the install decision: main's own restart (`restart_spec`, unchanged) already drops wrapper variables
+  and replays a relative program from the pane's root folder (asserted in
+  `agent_start::tests::wrapper_variables_and_relative_programs_are_refused`).
+Tests `l2…`, `l3…`, log/plan checks in `k1…`/`k2…`, unit tests in `agent_start.rs`.
+
 ## 2026-11-22 — Sleep: ninth check (fail-safe agent start) — Claude (Opus)
 
 - New `agent_start.rs`, used by manual wake (`wake_start`) and by the restart beside a sleeper

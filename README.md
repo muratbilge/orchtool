@@ -48,15 +48,21 @@ Built in Rust (stable) by Claude Code and Codex with Murat Bilge steering, for o
   the picker; an agent that ran in a shell comes back as `<shell> -lc '<agent command>; exec <shell>'` (the
   wrapper's other commands, e.g. a `cd`, are not kept).
   **Fail-safe start (wake, and a restart beside a sleeper):** an agent is started only from a command that parses
-  completely: its program word is `claude`/`codex` (any folder) and is kept as written, every option is recognised
-  and carried over (sandbox, approval, model ...), and a shell wrapper is one plain command (no `cd`, no variables
-  other than `ORCH_AGENT`), unless orch saw the agent's own command line. Otherwise the agent is **not started**:
-  the pane comes back as a plain shell in its folder (its own shell, or your login shell for a direct agent pane)
-  that prints `orch: <kind> was not restarted: its start command could not be reconstructed safely.`, the saved
-  command line (shell-quoted, to run or adapt yourself) and the verified conversation id if known. Nothing of the
-  saved text is run. The wake still succeeds; `orch ws wake`, the sleep plan and the daemon log name such panes.
-  Known limit: the program word is used as written (as main's restart does); a bare `codex`/`claude` is found on
-  the shell's PATH at that time, which is not checked against the program that ran before.
+  completely: its program word is `claude`/`codex`, written as a bare name or an absolute path (a relative path
+  like `./bin/codex` is refused: it would be looked up from the pane's folder, not necessarily where it ran) and
+  kept as written; every option is recognised and carried over (sandbox, approval, model ...). A shell pane's
+  command line must set nothing: a plain shell, or a `-c` script whose first command is the agent itself with no
+  variable other than orch's own `ORCH_AGENT` (no `cd`, `export`, `env X=`, `$...`), also when orch saw the
+  agent's own command line. Otherwise the agent is **not started**: the pane comes back as a plain shell in its
+  folder (its own shell, or your login shell for a direct agent pane). A fixed `/bin/sh` script first prints
+  `orch: <kind> was not restarted: its start command could not be reconstructed safely (<reason>).`, the saved
+  command line (shell-quoted, to run or adapt yourself) and the verified conversation id if known; the lines are
+  passed as arguments, so nothing of the saved text is run, whatever your shell. The saved command line appears
+  only in that pane: the daemon log, the sleep plan and `orch ws wake` name the pane, the agent kind and the
+  reason (a command line can carry credentials). The wake still succeeds.
+  Known limits: the program word is used as written (as main's restart does); a bare `codex`/`claude` is found
+  on the shell's PATH at that time, which is not checked against the program that ran before. Variables set
+  interactively in a shell pane (or by orch's spawn environment) are not seen; main's restart drops them too.
   While asleep, an agent's bus name is reserved for it; mail, queued tasks and open questions wait for it.
   Nothing wakes a workspace by itself, only on request: `orch msg --wake <agent> …` (the MCP `send_message` has
   `wake`) and `orch task add <ws> --wake …` (refused for `all`: a broadcast never wakes everything). A record
