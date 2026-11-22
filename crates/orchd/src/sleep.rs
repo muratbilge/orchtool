@@ -127,6 +127,8 @@ impl Daemon {
                 continue;
             };
             let mut sp = sp.clone();
+            // Never `resume --last` on wake (see wake_workspace): the plan says "picker".
+            sp.sole_codex_in_cwd = false;
             let screen = p.visible_text();
             let status = detect::detect(&screen, sp.agent.as_deref());
             let who = match (&sp.bus_name, &sp.name) {
@@ -222,6 +224,7 @@ impl Daemon {
         key: &str,
         force: bool,
         dry_run: bool,
+        auto: Option<Duration>,
     ) -> Result<Value, ApiError> {
         let _gate = self.task_gate.lock().await;
         let session = self.session();
@@ -308,8 +311,14 @@ impl Daemon {
                 Some(&format!("asleep · orch ws wake {}", plan.label)),
             );
         }
+        let why = auto.map_or(String::new(), |idle| {
+            format!(
+                " (auto-sleep: idle for {})",
+                crate::autosleep::duration_words(idle)
+            )
+        });
         let text = format!(
-            "{} is asleep: {} pane(s), {n_agents} agent(s){}; wake it with: orch ws wake {}",
+            "{} is asleep{why}: {} pane(s), {n_agents} agent(s){}; wake it with: orch ws wake {}",
             plan.label,
             all.len(),
             if interrupted.is_empty() {
@@ -349,23 +358,11 @@ impl Daemon {
             .iter()
             .map(|(k, v)| (k.clone(), v.saved.clone()))
             .collect();
-        // `codex resume --last` only while no awake Codex pane shares the folder now.
-        let awake_codex: HashSet<String> = self
-            .all_panes()
-            .iter()
-            .filter(|p| p.exit_code().is_none())
-            .filter(|p| p.agent(&p.visible_text()).as_deref() == Some("codex"))
-            .map(|p| {
-                p.pid
-                    .and_then(|pid| std::fs::read_link(format!("/proc/{pid}/cwd")).ok())
-                    .map(|c| c.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| p.cwd.clone())
-            })
-            .collect();
+        // Murat (2026-11-22): a Codex without a verified session id always comes back at its
+        // resume picker after a wake, never `resume --last` (another Codex may have run in that
+        // folder while this one slept). The restart path keeps its own rule.
         for sp in panes.values_mut() {
-            if sp.sole_codex_in_cwd && awake_codex.contains(&sp.cwd) {
-                sp.sole_codex_in_cwd = false;
-            }
+            sp.sole_codex_in_cwd = false;
         }
         let mut spawned = self.spawn_saved(vec![sl.workspace.clone()], &panes);
         if spawned.workspaces.is_empty() {
