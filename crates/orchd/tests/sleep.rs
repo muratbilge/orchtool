@@ -2745,3 +2745,36 @@ async fn i_d_without_sleepers_the_selectors_are_mains() {
     assert_eq!(second_start(&d, "cla").await, "--continue");
     assert_eq!(second_start(&d, "bin").await, "resume --last");
 }
+
+// ---------- eighth check ----------
+
+/// A wrapper whose selector only appears once the shell expands it (`choice=--last; codex
+/// resume "$choice"`), beside a sleeping Codex: not replayed, a fresh picker command.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn j_a_wrapper_with_a_hidden_selector_gets_the_picker() {
+    let mut d = daemon("ja").await;
+    codex_on_path(&d);
+    let script = vec![
+        "bash".to_string(),
+        "-lc".into(),
+        "choice=--last; codex resume \"$choice\"; exec bash".into(),
+    ];
+    agent_ws(&d, "wrap", &script, &folder(&d, "proj"), "codex").await;
+    wait_for("wrapper started", || {
+        read(&d, "bin", "args").lines().count() == 1
+    })
+    .await;
+    assert_eq!(
+        read(&d, "bin", "args").lines().next(),
+        Some("resume --last")
+    );
+    let b = fake_codex(&d, "cxb");
+    agent_ws(&d, "slp", &[b], Path::new("/tmp"), "codex").await;
+    wait_for("B started", || read(&d, "cxb", "args").lines().count() == 1).await;
+    sleep_op(&d, "slp", false).await.unwrap();
+    planned_restart(&mut d).await;
+    assert_eq!(second_start(&d, "bin").await, "resume");
+    // The pane is still a shell after the agent: the wrapper's shape is kept.
+    let s = session(&d).await;
+    assert!(s.workspace("wrap").is_some());
+}
