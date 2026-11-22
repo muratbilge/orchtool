@@ -548,14 +548,33 @@ impl Daemon {
         sl
     }
 
+    /// Whether the restore must not give this awake pane a latest-conversation selector
+    /// (Claude `--continue`, Codex `resume --last`, on any restart branch): a loaded sleeper
+    /// holds a pane of the same agent kind, in any folder, so "the latest" could be the
+    /// sleeper's conversation. False with no such sleeper (main's behaviour).
+    pub fn no_latest(&self, sp: &crate::restore::SavedPane) -> bool {
+        let Some(kind) = sp
+            .agent
+            .as_deref()
+            .filter(|k| matches!(*k, "claude" | "codex"))
+        else {
+            return false;
+        };
+        self.loading_sleepers
+            .lock()
+            .unwrap()
+            .iter()
+            .flat_map(|x| x.panes.values())
+            .any(|p| p.saved.agent.as_deref() == Some(kind))
+    }
+
     /// Called by the restore on the layout it parsed, whichever file that was, before it starts
     /// anything (after it marked the lone Codex panes): every pane of the sleepers loaded at
     /// start-up (all pane ids in their tab trees, also ones whose program had already ended,
     /// their restartable records, and the new ids of an interrupted wake) is taken out, so a
     /// stale awake copy of a sleeper is never started; the sleeper record is the truth for them.
-    /// An awake Codex without a known conversation in a folder where a sleeping Codex works
-    /// is not alone there: it gets the picker, not `resume --last` (which could pick the
-    /// sleeper's conversation). Other panes and workspaces stay. With no sleepers this returns
+    /// (Awake agents of a sleeping kind get no latest-conversation selector: `no_latest`.)
+    /// Other panes and workspaces stay. With no sleepers this returns
     /// at once and the layout is untouched.
     pub fn skip_asleep(&self, saved: &mut crate::restore::Saved) {
         let loading = self.loading_sleepers.lock().unwrap().clone();
@@ -572,20 +591,6 @@ impl Daemon {
             .collect();
         if mine.is_empty() {
             return;
-        }
-        let codex_dirs: HashSet<String> = loading
-            .iter()
-            .flat_map(|x| x.panes.values())
-            .filter(|p| p.saved.agent.as_deref() == Some("codex"))
-            .map(|p| p.saved.cwd.clone())
-            .collect();
-        for (id, sp) in saved.panes.iter_mut() {
-            if sp.sole_codex_in_cwd && codex_dirs.contains(&sp.cwd) {
-                eprintln!(
-                    "orchd: {id}: a sleeping Codex pane shares its folder: the picker, not resume --last"
-                );
-                sp.sole_codex_in_cwd = false;
-            }
         }
         saved.panes.retain(|id, _| !mine.contains(id));
         let keep: HashMap<String, String> = saved

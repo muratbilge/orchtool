@@ -2596,3 +2596,152 @@ async fn h2_a_stale_checkpoint_with_both_codex_gives_the_picker() {
     a_resumed_at_its_picker(&d).await;
     assert!(asleep_with(&session(&d).await, "slp", 1));
 }
+
+// ---------- seventh check ----------
+
+/// A workspace `label` with one pane running `argv` in `cwd`, registered as agent `kind`.
+async fn agent_ws(d: &D, label: &str, argv: &[String], cwd: &Path, kind: &str) -> String {
+    let mut sp = spawn(argv);
+    sp.cwd = Some(cwd.to_string_lossy().into_owned());
+    let v = op(
+        d,
+        UiOp::NewWorkspace {
+            label: Some(label.into()),
+            spawn: sp,
+        },
+    )
+    .await;
+    let pane = v["pane"]["id"].as_str().unwrap().to_string();
+    req(
+        d,
+        Request::RegisterAgent(RegisterAgent {
+            kind: kind.into(),
+            pane: Some(format!("orch:{pane}")),
+            name: Some(format!("{label}-{kind}")),
+            cwd: None,
+            instance: None,
+        }),
+    )
+    .await
+    .unwrap();
+    pane
+}
+
+/// A folder of its own under the test directory.
+fn folder(d: &D, name: &str) -> PathBuf {
+    let p = d.dir.join(name);
+    std::fs::create_dir_all(&p).unwrap();
+    p
+}
+
+/// A fake `codex` found by name in login shells (the private HOME's .bash_profile puts its
+/// folder first on PATH); it records into `<test dir>/bin/args`.
+fn codex_on_path(d: &D) {
+    let bin = folder(d, "bin");
+    std::fs::write(bin.join("codex"), FAKE).unwrap();
+    std::fs::set_permissions(bin.join("codex"), std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::write(
+        d.dir.join("home").join(".bash_profile"),
+        format!("PATH={}:$PATH\n", bin.display()),
+    )
+    .unwrap();
+}
+
+/// The wrapper the resume parser refuses (it starts with `cd`), replayed word for word on main.
+fn wrapper() -> Vec<String> {
+    vec![
+        "bash".into(),
+        "-lc".into(),
+        "cd . && codex resume --last; exec bash".into(),
+    ]
+}
+
+async fn planned_restart(d: &mut D) {
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let out = orch_cli(d, &["stop-daemon", "--restart"]);
+    assert!(out.status.success(), "{out:?}");
+    d.child.wait().unwrap();
+    d.child = spawn_orchd(&d.dir, &d.socket);
+    conn(d).await;
+}
+
+async fn second_start(d: &D, role: &str) -> String {
+    wait_for("restarted", || read(d, role, "args").lines().count() == 2).await;
+    read(d, role, "args").lines().nth(1).unwrap().to_string()
+}
+
+/// (a) Sleeping Codex B runs from a child shell, so its pane folder (/tmp) is not A's: awake
+/// Codex A, alone in its own folder, still gets the picker, not `resume --last`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn i_a_codex_beside_a_sleeping_codex_in_another_folder_gets_the_picker() {
+    let mut d = daemon("ia").await;
+    let a = fake_codex(&d, "cxa");
+    agent_ws(&d, "awk", &[a], &folder(&d, "proj"), "codex").await;
+    wait_for("A started", || read(&d, "cxa", "args").lines().count() == 1).await;
+    agent_ws(
+        &d,
+        "slp",
+        &["bash".into(), "--norc".into()],
+        Path::new("/tmp"),
+        "codex",
+    )
+    .await;
+    sleep_op(&d, "slp", true).await.unwrap();
+    planned_restart(&mut d).await;
+    assert_eq!(second_start(&d, "cxa").await, "resume");
+    assert!(asleep_with(&session(&d).await, "slp", 1));
+}
+
+/// (b) Awake Claude without an id beside a sleeping Claude in the same folder: no `--continue`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn i_b_a_claude_beside_a_sleeping_claude_does_not_continue() {
+    let mut d = daemon("ib").await;
+    for (label, role) in [("awk", "cla"), ("slp", "clb")] {
+        let program = fake(&d, role);
+        agent_ws(&d, label, &[program], Path::new("/tmp"), "claude").await;
+        wait_for("started", || read(&d, role, "args").lines().count() == 1).await;
+    }
+    sleep_op(&d, "slp", false).await.unwrap();
+    planned_restart(&mut d).await;
+    assert_eq!(second_start(&d, "cla").await, "--resume");
+    assert_eq!(read(&d, "clb", "args").lines().count(), 1, "B stays asleep");
+}
+
+/// (c) The `cd . && codex resume --last` wrapper beside a sleeping Codex: not replayed with
+/// `--last`, the picker instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn i_c_a_wrapper_with_last_beside_a_sleeping_codex_gets_the_picker() {
+    let mut d = daemon("ic").await;
+    codex_on_path(&d);
+    agent_ws(&d, "wrap", &wrapper(), &folder(&d, "proj"), "codex").await;
+    wait_for("wrapper started", || {
+        read(&d, "bin", "args").lines().count() == 1
+    })
+    .await;
+    let b = fake_codex(&d, "cxb");
+    agent_ws(&d, "slp", &[b], Path::new("/tmp"), "codex").await;
+    wait_for("B started", || read(&d, "cxb", "args").lines().count() == 1).await;
+    sleep_op(&d, "slp", false).await.unwrap();
+    planned_restart(&mut d).await;
+    assert_eq!(second_start(&d, "bin").await, "resume");
+}
+
+/// (d) No sleepers: the same three panes come back exactly as on main (`resume --last` for
+/// the lone Codex and the wrapper, `--continue` for Claude).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn i_d_without_sleepers_the_selectors_are_mains() {
+    let mut d = daemon("id").await;
+    codex_on_path(&d);
+    let a = fake_codex(&d, "cxa");
+    agent_ws(&d, "cx", &[a], &folder(&d, "one"), "codex").await;
+    let c = fake(&d, "cla");
+    agent_ws(&d, "cl", &[c], Path::new("/tmp"), "claude").await;
+    agent_ws(&d, "wrap", &wrapper(), &folder(&d, "two"), "codex").await;
+    for role in ["cxa", "cla", "bin"] {
+        wait_for("started", || read(&d, role, "args").lines().count() == 1).await;
+    }
+    planned_restart(&mut d).await;
+    assert_eq!(second_start(&d, "cxa").await, "resume --last");
+    assert_eq!(second_start(&d, "cla").await, "--continue");
+    assert_eq!(second_start(&d, "bin").await, "resume --last");
+}

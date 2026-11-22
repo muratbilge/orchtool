@@ -97,6 +97,21 @@ fn base(p: &str) -> &str {
 /// comes back resumed inside that shell (and the shell stays when it exits); an agent started
 /// directly is resumed directly. Either way it gets its old bus name.
 pub fn restart_spec(sp: &SavedPane) -> (Vec<String>, Vec<(String, String)>) {
+    restart_spec_for(sp, false)
+}
+
+/// [`restart_spec`]; with `no_latest` (a workspace with an agent of this kind sleeps, see
+/// `Daemon::no_latest`) no branch picks "the latest conversation": an id, else the picker.
+/// Every branch passes its agent command through [`no_latest_selector`]. With `no_latest`
+/// false the result is exactly [`restart_spec`]'s.
+pub fn restart_spec_for(sp: &SavedPane, no_latest: bool) -> (Vec<String>, Vec<(String, String)>) {
+    let picker = |argv: Vec<String>, kind: &str| {
+        if no_latest {
+            no_latest_selector(argv, kind)
+        } else {
+            argv
+        }
+    };
     let agent = sp
         .agent
         .as_deref()
@@ -123,11 +138,13 @@ pub fn restart_spec(sp: &SavedPane) -> (Vec<String>, Vec<(String, String)>) {
             // No id (neither known nor on its command line) but unambiguous: skip the picker.
             if kind == "codex"
                 && sp.sole_codex_in_cwd
+                && !no_latest
                 && argv.get(1).is_some_and(|a| a == "resume")
                 && argv.get(2).is_none_or(|a| a.starts_with('-'))
             {
                 argv.insert(2, "--last".into());
             }
+            let argv = picker(argv, kind);
             if shell_pane {
                 let shell = sp
                     .argv
@@ -154,11 +171,12 @@ pub fn restart_spec(sp: &SavedPane) -> (Vec<String>, Vec<(String, String)>) {
     match agent {
         // Already a resume of one particular conversation (`codex resume <id>`,
         // `claude --resume <id>`, as moved agents run): start exactly that again.
-        Some(_)
+        Some(kind)
             if shell_pane
                 && sp.argv.iter().skip(1).any(|a| {
                     a.contains(" resume ") || a.contains("--resume ") || a.contains(" -r ")
-                }) =>
+                })
+                && !(no_latest && has_latest_selector(&sp.argv, kind)) =>
         {
             let mut argv = sp.argv.clone();
             // Its bus name for the agent (the first command), as for the other restored agents.
@@ -176,7 +194,7 @@ pub fn restart_spec(sp: &SavedPane) -> (Vec<String>, Vec<(String, String)>) {
                 .cloned()
                 .or_else(|| std::env::var("SHELL").ok())
                 .unwrap_or_else(|| "/bin/bash".into());
-            let resume = restart_argv(&[kind.to_string()]).join(" ");
+            let resume = picker(restart_argv(&[kind.to_string()]), kind).join(" ");
             // Only the agent gets the name, not every program started later in the shell.
             let name = sp
                 .bus_name
@@ -191,9 +209,45 @@ pub fn restart_spec(sp: &SavedPane) -> (Vec<String>, Vec<(String, String)>) {
             if agent.is_some() {
                 name_env(&mut env);
             }
-            (restart_argv(&sp.argv), env)
+            let argv = restart_argv(&sp.argv);
+            match agent {
+                Some(kind) => (picker(argv, kind), env),
+                None => (argv, env),
+            }
         }
     }
+}
+
+/// The latest-conversation selectors of an agent command made into the picker: Claude
+/// `-c`/`--continue` becomes `--resume` (no id: its picker), Codex `--last` goes (`resume`
+/// without an id is its picker). The program (first word) is never touched.
+pub fn no_latest_selector(argv: Vec<String>, kind: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(argv.len());
+    for (i, a) in argv.into_iter().enumerate() {
+        if i == 0 {
+            out.push(a);
+        } else if kind == "claude" && matches!(a.as_str(), "-c" | "--continue") {
+            if !out.iter().skip(1).any(|o| o == "--resume") {
+                out.push("--resume".into());
+            }
+        } else if !(kind == "codex" && a == "--last") {
+            out.push(a);
+        }
+    }
+    out
+}
+
+/// Whether a saved shell command line (`sh -lc '<script>'`) holds a latest-conversation
+/// selector for `kind` anywhere: such a script is not replayed word for word.
+fn has_latest_selector(argv: &[String], kind: &str) -> bool {
+    argv.iter().skip(1).any(|arg| {
+        let words = shell_words::split(arg)
+            .unwrap_or_else(|_| arg.split_whitespace().map(str::to_string).collect());
+        words.iter().any(|w| {
+            let w = w.trim_end_matches(';');
+            kind == "codex" && w == "--last" || kind == "claude" && matches!(w, "-c" | "--continue")
+        })
+    })
 }
 
 /// Codex without a known conversation: `--last` only where it cannot mean another pane.
@@ -392,7 +446,7 @@ impl Daemon {
                         failed.push(old);
                         continue;
                     };
-                    let (argv, extra) = restart_spec(sp);
+                    let (argv, extra) = restart_spec_for(sp, self.no_latest(sp));
                     // orchd's own environment, plus the agent's bus name.
                     let env = (!extra.is_empty()).then(|| {
                         orch_proto::env::full_env()
@@ -698,5 +752,93 @@ mod tests {
         let (argv, env) = restart_spec(&saved(&["bash", "--norc"], None, None));
         assert_eq!(argv, v(&["bash", "--norc"]));
         assert!(env.is_empty());
+    }
+
+    /// While an agent of this kind sleeps, no restart branch picks "the latest conversation";
+    /// a known id still wins; without the flag every branch is unchanged.
+    #[test]
+    fn no_latest_selector_on_any_branch_while_one_of_the_kind_sleeps() {
+        let id = |mut p: SavedPane, s: &str| {
+            p.session_id = Some(s.into());
+            p
+        };
+        let mut sole = saved(&["codex", "-c", "k=v"], Some("codex"), None);
+        sole.sole_codex_in_cwd = true;
+        let cases: Vec<(SavedPane, Vec<String>, Vec<String>)> = vec![
+            // Rewrite, direct: Codex alone in its folder; Claude without an id.
+            (
+                sole,
+                v(&["codex", "resume", "--last", "-c", "k=v"]),
+                v(&["codex", "resume", "-c", "k=v"]),
+            ),
+            (
+                saved(&["claude", "--model", "x"], Some("claude"), None),
+                v(&["claude", "--continue", "--model", "x"]),
+                v(&["claude", "--resume", "--model", "x"]),
+            ),
+            // A known id: the same either way.
+            (
+                id(saved(&["claude"], Some("claude"), None), "abc"),
+                v(&["claude", "--resume", "abc"]),
+                v(&["claude", "--resume", "abc"]),
+            ),
+            // Rewrite inside a shell.
+            (
+                saved(&["bash", "-lc", "claude -c"], Some("claude"), None),
+                v(&["bash", "-lc", "claude --continue; exec bash"]),
+                v(&["bash", "-lc", "claude --resume; exec bash"]),
+            ),
+            // Word-for-word replay of a wrapper the parser refuses.
+            (
+                saved(
+                    &["bash", "-lc", "cd . && codex resume --last; exec bash"],
+                    Some("codex"),
+                    None,
+                ),
+                v(&["bash", "-lc", "cd . && codex resume --last; exec bash"]),
+                v(&["bash", "-lc", "codex resume; exec 'bash'"]),
+            ),
+            (
+                saved(
+                    &["bash", "-lc", "cd . && claude --continue -r x ; exec bash"],
+                    Some("claude"),
+                    None,
+                ),
+                v(&["bash", "-lc", "cd . && claude --continue -r x ; exec bash"]),
+                v(&["bash", "-lc", "claude --resume; exec 'bash'"]),
+            ),
+            // A replay that names its conversation stays word for word.
+            (
+                saved(
+                    &["bash", "-lc", "cd . && codex resume abc; exec bash"],
+                    Some("codex"),
+                    None,
+                ),
+                v(&["bash", "-lc", "cd . && codex resume abc; exec bash"]),
+                v(&["bash", "-lc", "cd . && codex resume abc; exec bash"]),
+            ),
+            // Shell fallback (no agent command found in the shell).
+            (
+                saved(&["bash", "-lc", "x=1 make && claude"], Some("claude"), None),
+                v(&["bash", "-lc", "claude --continue; exec 'bash'"]),
+                v(&["bash", "-lc", "claude --resume; exec 'bash'"]),
+            ),
+            // Last branch: a command the rewrite does not know.
+            (
+                saved(&["claude", "--unknown-flag"], Some("claude"), None),
+                v(&["claude", "--unknown-flag", "--continue"]),
+                v(&["claude", "--unknown-flag", "--resume"]),
+            ),
+            (
+                saved(&["codex", "--unknown", "--last"], Some("codex"), None),
+                v(&["codex", "resume", "--unknown", "--last"]),
+                v(&["codex", "resume", "--unknown"]),
+            ),
+        ];
+        for (pane, main, asleep) in cases {
+            assert_eq!(restart_spec(&pane).0, main, "main: {:?}", pane.argv);
+            assert_eq!(restart_spec_for(&pane, false), restart_spec(&pane));
+            assert_eq!(restart_spec_for(&pane, true).0, asleep, "{:?}", pane.argv);
+        }
     }
 }
