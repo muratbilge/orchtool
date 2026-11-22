@@ -2446,3 +2446,153 @@ async fn g7_an_old_confirmer_leaves_a_later_sleeper_alone() {
         "the later sleeper is intact"
     );
 }
+
+// ---------- sixth check ----------
+
+/// 1: pane A's program ended (its tab stays), B lives; the workspace is put to sleep and orchd
+/// dies before the autosave caught up (it still holds A and B awake). At the next start A's
+/// command does not run again and B stays asleep.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn h1_an_ended_pane_of_a_sleeper_is_not_run_again() {
+    let mut d = daemon("h1").await;
+    let dir = d.dir.join("ends");
+    std::fs::create_dir_all(&dir).unwrap();
+    let marker = dir.join("runs");
+    let trigger = dir.join("trigger");
+    let script = format!(
+        "echo run >> {}; while [ ! -f {} ]; do sleep 0.05; done",
+        marker.display(),
+        trigger.display()
+    );
+    let v = op(
+        &d,
+        UiOp::NewWorkspace {
+            label: Some("ex".into()),
+            spawn: spawn(&["sh".into(), "-c".into(), script]),
+        },
+    )
+    .await;
+    let ws = v["session"]["workspaces"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let a = v["pane"]["id"].as_str().unwrap().to_string();
+    op(
+        &d,
+        UiOp::NewTab {
+            workspace: ws,
+            spawn: spawn(&["bash".into(), "--norc".into()]),
+        },
+    )
+    .await;
+    wait_for("A ran", || {
+        std::fs::read_to_string(&marker)
+            .unwrap_or_default()
+            .lines()
+            .count()
+            == 1
+    })
+    .await;
+    // The healthy autosave of A and B, both alive.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let old = std::fs::read(d.dir.join("autosave.json")).unwrap();
+    // A ends; its tab stays.
+    std::fs::write(&trigger, b"x").unwrap();
+    for _ in 0..200 {
+        if !running_panes(&d).await.contains(&a) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(!running_panes(&d).await.contains(&a), "A ended");
+    sleep_op(&d, "ex", false).await.unwrap();
+    // orchd dies before the autosave caught up.
+    let _ = d.child.kill();
+    let _ = d.child.wait();
+    std::fs::write(d.dir.join("autosave.json"), old).unwrap();
+    restart_with(&mut d, "").await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        std::fs::read_to_string(&marker).unwrap().lines().count(),
+        1,
+        "A's command did not run again"
+    );
+    let s = session(&d).await;
+    assert!(asleep_with(&s, "ex", 1), "B stays asleep");
+    assert!(running_panes(&d).await.is_empty());
+}
+
+/// Two fake Codex panes in one folder (/tmp), in workspaces "awk" (A) and "slp" (B); B asleep.
+async fn two_codex_one_asleep(d: &D) {
+    for (label, role) in [("awk", "cxa"), ("slp", "cxb")] {
+        let program = fake_codex(d, role);
+        let v = op(
+            d,
+            UiOp::NewWorkspace {
+                label: Some(label.into()),
+                spawn: spawn(&[program]),
+            },
+        )
+        .await;
+        let pane = v["pane"]["id"].as_str().unwrap().to_string();
+        req(
+            d,
+            Request::RegisterAgent(RegisterAgent {
+                kind: "codex".into(),
+                pane: Some(format!("orch:{pane}")),
+                name: Some(format!("{label}-codex")),
+                cwd: None,
+                instance: None,
+            }),
+        )
+        .await
+        .unwrap();
+        wait_for("codex started", || {
+            read(d, role, "args").lines().count() == 1
+        })
+        .await;
+    }
+    sleep_op(d, "slp", false).await.unwrap();
+}
+
+async fn a_resumed_at_its_picker(d: &D) {
+    wait_for("A resumed", || read(d, "cxa", "args").lines().count() == 2).await;
+    assert_eq!(
+        read(d, "cxa", "args").lines().nth(1),
+        Some("resume"),
+        "a sleeping Codex shares the folder: the picker, not --last"
+    );
+    assert_eq!(read(d, "cxb", "args").lines().count(), 1, "B stays asleep");
+}
+
+/// 2: a planned restart: awake Codex A does not take sleeping B's conversation with --last.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn h2_an_awake_codex_beside_a_sleeping_one_gets_the_picker() {
+    let mut d = daemon("h2a").await;
+    two_codex_one_asleep(&d).await;
+    let out = orch_cli(&d, &["stop-daemon", "--restart"]);
+    assert!(out.status.success(), "{out:?}");
+    d.child.wait().unwrap();
+    d.child = spawn_orchd(&d.dir, &d.socket);
+    conn(&d).await;
+    a_resumed_at_its_picker(&d).await;
+    // Waking B: its picker too (no verified id), never --last.
+    wake_op(&d, "slp").await.unwrap();
+    wait_for("B resumed", || read(&d, "cxb", "args").lines().count() == 2).await;
+    assert_eq!(read(&d, "cxb", "args").lines().nth(1), Some("resume"));
+}
+
+/// 2: the same from a stale checkpoint holding both panes awake (a crash before the autosave
+/// caught up with the sleep).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn h2_a_stale_checkpoint_with_both_codex_gives_the_picker() {
+    let mut d = daemon("h2b").await;
+    two_codex_one_asleep(&d).await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let _ = d.child.kill();
+    let _ = d.child.wait();
+    stale_layout_with_others(&d, "autosave.json");
+    restart_with(&mut d, "").await;
+    a_resumed_at_its_picker(&d).await;
+    assert!(asleep_with(&session(&d).await, "slp", 1));
+}

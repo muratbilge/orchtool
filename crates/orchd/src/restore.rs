@@ -379,8 +379,8 @@ impl Daemon {
     /// Recreates a saved layout with new panes. Panes whose program can't start are left out
     /// (their tab / workspace collapses if nothing is left). Returns how many came back.
     pub fn restore_layout(self: &Arc<Self>, mut saved: Saved, source: Source) -> usize {
-        self.skip_asleep(&mut saved);
         mark_sole_codex(&mut saved.panes);
+        self.skip_asleep(&mut saved);
         let mut ids: HashMap<String, String> = HashMap::new();
         let mut resumed = 0;
         let mut pending = Vec::new();
