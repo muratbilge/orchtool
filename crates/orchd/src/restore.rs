@@ -196,112 +196,6 @@ pub fn restart_spec(sp: &SavedPane) -> (Vec<String>, Vec<(String, String)>) {
     }
 }
 
-/// [`restart_spec`] (main's, untouched) unless `no_latest` (a workspace with an agent of this
-/// kind sleeps, see `Daemon::no_latest`): then [`fresh_spec`].
-pub fn restart_spec_for(sp: &SavedPane, no_latest: bool) -> (Vec<String>, Vec<(String, String)>) {
-    if no_latest {
-        fresh_spec(sp)
-    } else {
-        restart_spec(sp)
-    }
-}
-
-/// While an agent of this kind sleeps, "the latest conversation" could be the sleeper's: a
-/// fresh agent command is built, never saved shell text replayed and never a command whose
-/// agent arguments are unknown. Target in this order: the verified session id; an explicit
-/// target the resume parser establishes from the discovered agent argv, or from the pane's
-/// command or its shell wrapper when that is one simple command (its known options kept);
-/// else the picker (`claude --resume`, `codex resume`). A shell pane gets
-/// `<shell> -lc '<agent command>; exec <shell>'`, so the pane stays when the agent exits; the
-/// wrapper's other commands are not kept. Not an agent pane: [`restart_spec`].
-pub fn fresh_spec(sp: &SavedPane) -> (Vec<String>, Vec<(String, String)>) {
-    let Some(kind) = sp
-        .agent
-        .as_deref()
-        .filter(|a| matches!(*a, "claude" | "codex"))
-    else {
-        return restart_spec(sp);
-    };
-    let shell_pane =
-        sp.argv.is_empty() || sp.argv.first().is_some_and(|a| SHELLS.contains(&base(a)));
-    let parsed = sp.agent_argv.clone().or_else(|| {
-        if shell_pane {
-            crate::resume_argv::shell_agent(&sp.argv, kind)
-        } else {
-            Some(sp.argv.clone())
-        }
-    });
-    let id = sp.session_id.as_deref();
-    let argv = parsed
-        .as_deref()
-        .and_then(|args| crate::resume_argv::rewrite(args, kind, id))
-        .map(|argv| no_latest_selector(argv, kind))
-        .unwrap_or_else(|| {
-            // The program, if the command names this agent; else the agent by name.
-            let exe = parsed
-                .as_ref()
-                .and_then(|a| a.first())
-                .filter(|e| base(e) == kind)
-                .cloned()
-                .unwrap_or_else(|| kind.to_string());
-            let mut argv = vec![exe];
-            argv.push(
-                if kind == "claude" {
-                    "--resume"
-                } else {
-                    "resume"
-                }
-                .into(),
-            );
-            argv.extend(id.map(str::to_string));
-            argv
-        });
-    if shell_pane {
-        let shell = sp
-            .argv
-            .first()
-            .cloned()
-            .or_else(|| std::env::var("SHELL").ok())
-            .unwrap_or_else(|| "/bin/bash".into());
-        let name = sp
-            .bus_name
-            .as_ref()
-            .map(|n| format!("ORCH_AGENT={} ", shell_words::quote(n)))
-            .unwrap_or_default();
-        let script = format!(
-            "{name}{}; exec {}",
-            shell_words::join(argv),
-            shell_words::quote(&shell)
-        );
-        return (vec![shell, "-lc".into(), script], Vec::new());
-    }
-    let env = sp
-        .bus_name
-        .iter()
-        .map(|n| ("ORCH_AGENT".to_string(), n.clone()))
-        .collect();
-    (argv, env)
-}
-
-/// The latest-conversation selectors of a parsed agent command made into the picker: Claude
-/// `-c`/`--continue` becomes `--resume` (no id: its picker), Codex `--last` goes (`resume`
-/// without an id is its picker). The program (first word) is never touched.
-pub fn no_latest_selector(argv: Vec<String>, kind: &str) -> Vec<String> {
-    let mut out: Vec<String> = Vec::with_capacity(argv.len());
-    for (i, a) in argv.into_iter().enumerate() {
-        if i == 0 {
-            out.push(a);
-        } else if kind == "claude" && matches!(a.as_str(), "-c" | "--continue") {
-            if !out.iter().skip(1).any(|o| o == "--resume") {
-                out.push("--resume".into());
-            }
-        } else if !(kind == "codex" && a == "--last") {
-            out.push(a);
-        }
-    }
-    out
-}
-
 /// Codex without a known conversation: `--last` only where it cannot mean another pane.
 /// Run when saving and again when restoring, so a snapshot written by an older orchd (which
 /// has no flag) is treated the same.
@@ -498,7 +392,7 @@ impl Daemon {
                         failed.push(old);
                         continue;
                     };
-                    let (argv, extra) = restart_spec_for(sp, self.no_latest(sp));
+                    let (argv, extra, started) = self.restart_for(&old, sp);
                     // orchd's own environment, plus the agent's bus name.
                     let env = (!extra.is_empty()).then(|| {
                         orch_proto::env::full_env()
@@ -520,7 +414,7 @@ impl Daemon {
                         .or_else(|_| self.new_pane(req(None)));
                     match pane {
                         Ok(p) => {
-                            if matches!(sp.agent.as_deref(), Some("claude" | "codex")) {
+                            if started && matches!(sp.agent.as_deref(), Some("claude" | "codex")) {
                                 resumed += 1;
                                 if sp.was_working {
                                     let name = sp
@@ -804,156 +698,5 @@ mod tests {
         let (argv, env) = restart_spec(&saved(&["bash", "--norc"], None, None));
         assert_eq!(argv, v(&["bash", "--norc"]));
         assert!(env.is_empty());
-    }
-
-    /// While an agent of this kind sleeps, no restart branch picks "the latest conversation":
-    /// a fresh command with the verified id, a parsed explicit target, else the picker. The
-    /// `main` column is main's own output (literals, checked against main's function body
-    /// kept as `restart_spec`), and `restart_spec_for(.., false)` must give exactly it.
-    #[test]
-    fn no_latest_builds_a_fresh_command_on_every_branch() {
-        let id = |mut p: SavedPane, s: &str| {
-            p.session_id = Some(s.into());
-            p
-        };
-        let named = |mut p: SavedPane| {
-            p.bus_name = Some("x-agent".into());
-            p
-        };
-        let mut sole = saved(&["codex", "-c", "k=v"], Some("codex"), None);
-        sole.sole_codex_in_cwd = true;
-        let cases: Vec<(SavedPane, Vec<String>, Vec<String>)> = vec![
-            // Parsed agent command, direct: Codex alone in its folder; Claude without an id.
-            (
-                sole,
-                v(&["codex", "resume", "--last", "-c", "k=v"]),
-                v(&["codex", "resume", "-c", "k=v"]),
-            ),
-            (
-                saved(&["claude", "--model", "x"], Some("claude"), None),
-                v(&["claude", "--continue", "--model", "x"]),
-                v(&["claude", "--resume", "--model", "x"]),
-            ),
-            // A verified id: the same either way.
-            (
-                id(saved(&["claude"], Some("claude"), None), "abc"),
-                v(&["claude", "--resume", "abc"]),
-                v(&["claude", "--resume", "abc"]),
-            ),
-            // An explicit target on a parsed command line stays.
-            (
-                saved(&["codex", "resume", "abc"], Some("codex"), None),
-                v(&["codex", "resume", "abc"]),
-                v(&["codex", "resume", "abc"]),
-            ),
-            // Parsed agent command inside a shell.
-            (
-                saved(&["bash", "-lc", "claude -c"], Some("claude"), None),
-                v(&["bash", "-lc", "claude --continue; exec bash"]),
-                v(&["bash", "-lc", "claude --resume; exec bash"]),
-            ),
-            // Wrappers the parser refuses: never replayed, the picker.
-            (
-                saved(
-                    &["bash", "-lc", "cd . && codex resume --last; exec bash"],
-                    Some("codex"),
-                    None,
-                ),
-                v(&["bash", "-lc", "cd . && codex resume --last; exec bash"]),
-                v(&["bash", "-lc", "codex resume; exec bash"]),
-            ),
-            (
-                saved(
-                    &[
-                        "bash",
-                        "-lc",
-                        "choice=--last; codex resume \"$choice\"; exec bash",
-                    ],
-                    Some("codex"),
-                    None,
-                ),
-                v(&[
-                    "bash",
-                    "-lc",
-                    "choice=--last; codex resume \"$choice\"; exec bash",
-                ]),
-                v(&["bash", "-lc", "codex resume; exec bash"]),
-            ),
-            (
-                saved(
-                    &["bash", "-c", "cd . && claude --resume abc"],
-                    Some("claude"),
-                    None,
-                ),
-                v(&["bash", "-c", "cd . && claude --resume abc"]),
-                v(&["bash", "-lc", "claude --resume; exec bash"]),
-            ),
-            // ... with a verified id: that id.
-            (
-                id(
-                    saved(
-                        &["bash", "-c", "cd . && claude --resume abc"],
-                        Some("claude"),
-                        None,
-                    ),
-                    "sid",
-                ),
-                v(&["bash", "-lc", "claude --resume sid; exec bash"]),
-                v(&["bash", "-lc", "claude --resume sid; exec bash"]),
-            ),
-            // Shell with no agent command found; the bus name goes to the agent only.
-            (
-                named(saved(
-                    &["bash", "-lc", "x=1 make && claude"],
-                    Some("claude"),
-                    None,
-                )),
-                v(&[
-                    "bash",
-                    "-lc",
-                    "ORCH_AGENT='x-agent' claude --continue; exec 'bash'",
-                ]),
-                v(&[
-                    "bash",
-                    "-lc",
-                    "ORCH_AGENT=x-agent claude --resume; exec bash",
-                ]),
-            ),
-            // Final fallback: a command the parser does not know; a verified id is used.
-            (
-                saved(&["claude", "--unknown-flag"], Some("claude"), None),
-                v(&["claude", "--unknown-flag", "--continue"]),
-                v(&["claude", "--resume"]),
-            ),
-            (
-                id(
-                    saved(&["claude", "--unknown-flag"], Some("claude"), None),
-                    "sid",
-                ),
-                v(&["claude", "--unknown-flag", "--continue"]),
-                v(&["claude", "--resume", "sid"]),
-            ),
-            (
-                saved(&["codex", "--unknown", "--last"], Some("codex"), None),
-                v(&["codex", "resume", "--unknown", "--last"]),
-                v(&["codex", "resume"]),
-            ),
-            // Not an agent: untouched.
-            (
-                saved(&["bash", "--norc"], None, None),
-                v(&["bash", "--norc"]),
-                v(&["bash", "--norc"]),
-            ),
-        ];
-        for (pane, main, asleep) in cases {
-            assert_eq!(restart_spec(&pane).0, main, "main: {:?}", pane.argv);
-            assert_eq!(restart_spec_for(&pane, false).0, main, "{:?}", pane.argv);
-            assert_eq!(restart_spec_for(&pane, true).0, asleep, "{:?}", pane.argv);
-        }
-        // The bus name of a direct agent stays in the environment either way.
-        let p = named(saved(&["claude"], Some("claude"), None));
-        let want = vec![("ORCH_AGENT".to_string(), "x-agent".to_string())];
-        assert_eq!(restart_spec_for(&p, false).1, want);
-        assert_eq!(restart_spec_for(&p, true).1, want);
     }
 }

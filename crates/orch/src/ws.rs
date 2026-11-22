@@ -253,6 +253,15 @@ pub async fn ws(c: &mut Conn, cmd: WsCmd) -> Result<()> {
                 .map(|a| a.iter().filter_map(|p| p.as_str()).collect())
                 .unwrap_or_default();
             println!("awake: {label} ({})", panes.join(" "));
+            for n in v["not_started"].as_array().into_iter().flatten() {
+                let who = n["name"]
+                    .as_str()
+                    .unwrap_or_else(|| n["kind"].as_str().unwrap_or("agent"));
+                println!(
+                    "not started: {who} in {}: its start command could not be rebuilt safely; the pane is a shell showing the saved command",
+                    n["pane"].as_str().unwrap_or_default()
+                );
+            }
             if v["confirmed"] == false {
                 eprintln!("orch: not yet in the autosave; it is recorded as awake once it is");
             }

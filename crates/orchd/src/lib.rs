@@ -1,5 +1,6 @@
 //! orchd: owns the PTY panes, their terminal state and the attached clients.
 
+pub mod agent_start;
 pub mod autosave;
 pub mod bus;
 pub mod conversation;

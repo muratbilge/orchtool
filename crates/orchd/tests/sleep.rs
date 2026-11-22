@@ -157,7 +157,7 @@ while IFS= read -r line; do printf '%s\n' "$line" >> "$here/received"; done
 "#;
 
 fn fake(d: &D, role: &str) -> String {
-    let program = d.dir.join(role).join("fake-claude");
+    let program = d.dir.join(role).join("claude");
     std::fs::create_dir_all(program.parent().unwrap()).unwrap();
     std::fs::write(&program, FAKE).unwrap();
     std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -806,7 +806,7 @@ async fn an_agent_can_put_its_own_workspace_to_sleep() {
 }
 
 fn fake_codex(d: &D, role: &str) -> String {
-    let program = d.dir.join(role).join("fake-codex");
+    let program = d.dir.join(role).join("codex");
     std::fs::create_dir_all(program.parent().unwrap()).unwrap();
     std::fs::write(&program, FAKE).unwrap();
     std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -1160,7 +1160,7 @@ async fn f4_a_pane_that_cannot_start_keeps_its_record() {
     assert!(session(&d).await.workspace("pair").is_some(), "retry works");
     // An agent that exits at once did not start.
     sleep_op(&d, "pair", false).await.unwrap();
-    let program = d.dir.join("idle").join("fake-claude");
+    let program = d.dir.join("idle").join("claude");
     let good = std::fs::read(&program).unwrap();
     std::fs::write(&program, b"#!/bin/sh\nexit 1\n").unwrap();
     let e = wake_op(&d, "pair").await.unwrap_err();
@@ -2261,7 +2261,7 @@ async fn e7_a_pane_ending_before_the_checkpoint_does_not_hold_the_wake() {
     let mut d = daemon("e7").await;
     let dir = d.dir.join("quit");
     std::fs::create_dir_all(&dir).unwrap();
-    let program = dir.join("fake-claude");
+    let program = dir.join("claude");
     let trigger = dir.join("trigger");
     std::fs::write(
         &program,
@@ -2707,10 +2707,11 @@ async fn i_b_a_claude_beside_a_sleeping_claude_does_not_continue() {
     assert_eq!(read(&d, "clb", "args").lines().count(), 1, "B stays asleep");
 }
 
-/// (c) The `cd . && codex resume --last` wrapper beside a sleeping Codex: not replayed with
-/// `--last`, the picker instead.
+/// (c) The `cd . && codex resume --last` wrapper beside a sleeping Codex: the wrapper can't
+/// be read as one command (it starts with `cd`), so its agent is not started at all (ninth
+/// check): the pane is a shell showing the note, no `--last` and no bare `codex`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn i_c_a_wrapper_with_last_beside_a_sleeping_codex_gets_the_picker() {
+async fn i_c_a_wrapper_with_last_beside_a_sleeping_codex_is_not_started() {
     let mut d = daemon("ic").await;
     codex_on_path(&d);
     agent_ws(&d, "wrap", &wrapper(), &folder(&d, "proj"), "codex").await;
@@ -2723,7 +2724,8 @@ async fn i_c_a_wrapper_with_last_beside_a_sleeping_codex_gets_the_picker() {
     wait_for("B started", || read(&d, "cxb", "args").lines().count() == 1).await;
     sleep_op(&d, "slp", false).await.unwrap();
     planned_restart(&mut d).await;
-    assert_eq!(second_start(&d, "bin").await, "resume");
+    note_shown(&d, "wrap", "cd . && codex resume --last").await;
+    assert_eq!(read(&d, "bin", "args").lines().count(), 1, "not started");
 }
 
 /// (d) No sleepers: the same three panes come back exactly as on main (`resume --last` for
@@ -2749,9 +2751,9 @@ async fn i_d_without_sleepers_the_selectors_are_mains() {
 // ---------- eighth check ----------
 
 /// A wrapper whose selector only appears once the shell expands it (`choice=--last; codex
-/// resume "$choice"`), beside a sleeping Codex: not replayed, a fresh picker command.
+/// resume "$choice"`), beside a sleeping Codex: not replayed and not started; the note.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn j_a_wrapper_with_a_hidden_selector_gets_the_picker() {
+async fn j_a_wrapper_with_a_hidden_selector_is_not_started() {
     let mut d = daemon("ja").await;
     codex_on_path(&d);
     let script = vec![
@@ -2773,8 +2775,151 @@ async fn j_a_wrapper_with_a_hidden_selector_gets_the_picker() {
     wait_for("B started", || read(&d, "cxb", "args").lines().count() == 1).await;
     sleep_op(&d, "slp", false).await.unwrap();
     planned_restart(&mut d).await;
-    assert_eq!(second_start(&d, "bin").await, "resume");
-    // The pane is still a shell after the agent: the wrapper's shape is kept.
-    let s = session(&d).await;
-    assert!(s.workspace("wrap").is_some());
+    note_shown(&d, "wrap", "choice=--last").await;
+    assert_eq!(read(&d, "bin", "args").lines().count(), 1, "not started");
+}
+
+// ---------- ninth check ----------
+
+/// The one pane of workspace `label` (awake).
+async fn pane_of(d: &D, label: &str) -> String {
+    session(d)
+        .await
+        .workspace(label)
+        .unwrap_or_else(|| panic!("{label} is awake"))
+        .tabs[0]
+        .root
+        .panes()[0]
+        .clone()
+}
+
+/// Waits for the note in `label`'s pane, holding `saved` (part of the saved command line).
+async fn note_shown(d: &D, label: &str, saved: &str) -> String {
+    let pane = pane_of(d, label).await;
+    let mut screen = String::new();
+    for _ in 0..200 {
+        let out = orch_cli(d, &["read", &pane, "--lines", "40", "--unwrapped"]);
+        screen = String::from_utf8_lossy(&out.stdout).into_owned();
+        if screen.contains("could not be reconstructed safely") && screen.contains(saved) {
+            return screen;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("no note with {saved:?} in {label}: {screen}");
+}
+
+/// A fake Codex called `codex` (by its absolute path) in folder `role`.
+fn codex_at(d: &D, role: &str) -> String {
+    fake_codex(d, role)
+}
+
+/// An unknown option next to a read-only sandbox, beside a sleeping Codex: on a restart no
+/// Codex is started (dropping the option or the sandbox could widen its permissions); the
+/// pane is a shell with the note, the bus name is free of it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn k1_an_unknown_option_beside_a_sleeper_is_not_restarted() {
+    let mut d = daemon("k1").await;
+    let a = codex_at(&d, "cxa");
+    let argv = vec![
+        a,
+        "--sandbox".into(),
+        "read-only".into(),
+        "--some-unknown-flag".into(),
+    ];
+    agent_ws(&d, "awk", &argv, &folder(&d, "proj"), "codex").await;
+    wait_for("A started", || read(&d, "cxa", "args").lines().count() == 1).await;
+    let b = fake_codex(&d, "cxb");
+    agent_ws(&d, "slp", &[b], Path::new("/tmp"), "codex").await;
+    wait_for("B started", || read(&d, "cxb", "args").lines().count() == 1).await;
+    sleep_op(&d, "slp", false).await.unwrap();
+    planned_restart(&mut d).await;
+    note_shown(&d, "awk", "--some-unknown-flag").await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        read(&d, "cxa", "args").lines().count(),
+        1,
+        "no codex started"
+    );
+}
+
+/// The same pane put to sleep and woken: the wake succeeds, the pane is the note shell, the
+/// wake output names it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn k2_an_unknown_option_is_not_started_on_wake() {
+    let d = daemon("k2").await;
+    let a = codex_at(&d, "cxa");
+    let argv = vec![
+        a,
+        "--sandbox".into(),
+        "read-only".into(),
+        "--some-unknown-flag".into(),
+    ];
+    agent_ws(&d, "awk", &argv, &folder(&d, "proj"), "codex").await;
+    wait_for("A started", || read(&d, "cxa", "args").lines().count() == 1).await;
+    let v = sleep_op(&d, "awk", false).await.unwrap();
+    assert!(
+        v["plan"]["notes"]
+            .to_string()
+            .contains("will not be started"),
+        "{v}"
+    );
+    let out = orch_cli(&d, &["ws", "wake", "awk"]);
+    assert!(out.status.success(), "{out:?}");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("not started: awk-codex"), "{text}");
+    note_shown(&d, "awk", "--some-unknown-flag").await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        read(&d, "cxa", "args").lines().count(),
+        1,
+        "no codex started"
+    );
+    assert!(session(&d).await.sleeping.is_empty(), "the wake completed");
+}
+
+/// An opaque wrapper calling Codex by its absolute path, no discovered agent command, beside a
+/// sleeping Codex: not started (no bare `codex` from PATH); the note shows the saved line.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn k3_an_opaque_wrapper_is_not_started_and_shows_its_line() {
+    let mut d = daemon("k3").await;
+    codex_on_path(&d);
+    let a = codex_at(&d, "cxa");
+    let script = format!("cd . && {a} --sandbox read-only; exec bash");
+    let argv = vec!["bash".to_string(), "-lc".into(), script];
+    agent_ws(&d, "wrap", &argv, &folder(&d, "proj"), "codex").await;
+    wait_for("A started", || read(&d, "cxa", "args").lines().count() == 1).await;
+    let b = fake_codex(&d, "cxb");
+    agent_ws(&d, "slp", &[b], Path::new("/tmp"), "codex").await;
+    wait_for("B started", || read(&d, "cxb", "args").lines().count() == 1).await;
+    sleep_op(&d, "slp", false).await.unwrap();
+    planned_restart(&mut d).await;
+    note_shown(&d, "wrap", &format!("cd . && {a} --sandbox read-only")).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(read(&d, "cxa", "args").lines().count(), 1, "A not started");
+    assert_eq!(read(&d, "bin", "args"), "", "no bare codex from PATH");
+}
+
+/// A command that parses completely beside a sleeping Codex: restarted with both options and
+/// the picker.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn k4_a_complete_command_keeps_its_options() {
+    let mut d = daemon("k4").await;
+    let a = codex_at(&d, "cxa");
+    let argv = vec![
+        a,
+        "--sandbox".into(),
+        "read-only".into(),
+        "--approve-for-me".into(),
+    ];
+    agent_ws(&d, "awk", &argv, &folder(&d, "proj"), "codex").await;
+    wait_for("A started", || read(&d, "cxa", "args").lines().count() == 1).await;
+    let b = fake_codex(&d, "cxb");
+    agent_ws(&d, "slp", &[b], Path::new("/tmp"), "codex").await;
+    wait_for("B started", || read(&d, "cxb", "args").lines().count() == 1).await;
+    sleep_op(&d, "slp", false).await.unwrap();
+    planned_restart(&mut d).await;
+    assert_eq!(
+        second_start(&d, "cxa").await,
+        "resume --sandbox read-only --approve-for-me"
+    );
 }

@@ -44,8 +44,6 @@ const WAKE_GRACE: Duration = Duration::from_millis(1500);
 /// How long a wake waits for the autosave to hold its new panes before it returns (the
 /// sleeper is dropped once it does, also later).
 const CONFIRM_FOR: Duration = Duration::from_secs(30);
-/// Stands for "no verified conversation" while building an agent's resume command.
-const PICK: &str = "\u{1}orch-pick";
 const SHELLS: [&str; 5] = ["bash", "zsh", "sh", "fish", "dash"];
 
 fn now_ms() -> i64 {
@@ -76,68 +74,27 @@ fn shell_pane(sp: &SavedPane) -> bool {
 /// What a woken pane runs. Agents resume only a **verified** conversation (the session id the
 /// agent's hook or process reported); without one Codex and Claude come back at their resume
 /// picker, never at "the latest conversation in this folder" (another agent may have made a
-/// newer one while this one slept) and never by replaying a saved command line.
+/// newer one while this one slept) and never by replaying a saved command line. Only a
+/// command that parses completely is started; else the pane is a shell showing a note (see
+/// `agent_start`).
+pub fn wake_start(sp: &SavedPane) -> crate::agent_start::Start {
+    crate::agent_start::start(sp, crate::agent_start::Target::Verified)
+}
+
+/// [`wake_start`]'s argv and environment.
 pub fn wake_argv(sp: &SavedPane) -> (Vec<String>, Vec<(String, String)>) {
-    let Some(kind) = sp
-        .agent
-        .as_deref()
-        .filter(|a| matches!(*a, "claude" | "codex"))
-    else {
-        return (sp.argv.clone(), Vec::new());
-    };
-    let in_shell = shell_pane(sp);
-    let base_argv = sp
-        .agent_argv
-        .clone()
-        .or_else(|| (!in_shell).then(|| sp.argv.clone()))
-        .or_else(|| {
-            in_shell
-                .then(|| crate::resume_argv::shell_agent(&sp.argv, kind))
-                .flatten()
-        })
-        .filter(|a| !a.is_empty())
-        .unwrap_or_else(|| vec![kind.to_string()]);
-    let target = sp.session_id.as_deref().unwrap_or(PICK);
-    let mut argv = crate::resume_argv::rewrite(&base_argv, kind, Some(target))
-        .or_else(|| crate::resume_argv::rewrite(&base_argv[..1], kind, Some(target)))
-        .unwrap_or_else(|| {
-            let flag = if kind == "claude" {
-                "--resume"
-            } else {
-                "resume"
-            };
-            vec![kind.to_string(), flag.to_string(), target.to_string()]
-        });
-    argv.retain(|a| a != PICK);
-    if in_shell {
-        let shell = sp
-            .argv
-            .first()
-            .cloned()
-            .unwrap_or_else(|| "/bin/bash".into());
-        let name = sp
-            .bus_name
-            .as_ref()
-            .map(|n| format!("ORCH_AGENT={} ", shell_words::quote(n)))
-            .unwrap_or_default();
-        let script = format!(
-            "{name}{}; exec {}",
-            shell_words::join(&argv),
-            shell_words::quote(&shell)
-        );
-        return (vec![shell, "-lc".into(), script], Vec::new());
-    }
-    let env = sp
-        .bus_name
-        .as_ref()
-        .map(|n| vec![("ORCH_AGENT".to_string(), n.clone())])
-        .unwrap_or_default();
-    (argv, env)
+    let s = wake_start(sp);
+    (s.argv, s.env)
 }
 
 /// How an agent will come back, in words (for the plan).
 fn resume_words(sp: &SavedPane) -> String {
     let kind = sp.agent.as_deref().unwrap_or("agent");
+    if !wake_start(sp).agent {
+        return format!(
+            "{kind} will not be started: its start command can't be rebuilt safely (comes back as a shell with a note)"
+        );
+    }
     match &sp.session_id {
         Some(id) => format!("{kind} resumes conversation {id}"),
         None => format!(
@@ -552,6 +509,31 @@ impl Daemon {
     /// (Claude `--continue`, Codex `resume --last`, on any restart branch): a loaded sleeper
     /// holds a pane of the same agent kind, in any folder, so "the latest" could be the
     /// sleeper's conversation. False with no such sleeper (main's behaviour).
+    /// What the restore starts for a saved pane: main's [`crate::restore::restart_spec`],
+    /// unless an agent of this kind sleeps (`no_latest`): then a fresh command from
+    /// `agent_start` (verified id, else a target on the parsed command line, else the picker),
+    /// or, when it can't be rebuilt completely, a shell with a note (logged). The flag says
+    /// whether the agent is started.
+    pub fn restart_for(
+        &self,
+        old: &str,
+        sp: &SavedPane,
+    ) -> (Vec<String>, Vec<(String, String)>, bool) {
+        if !self.no_latest(sp) {
+            let (argv, env) = crate::restore::restart_spec(sp);
+            return (argv, env, true);
+        }
+        let s = crate::agent_start::start(sp, crate::agent_start::Target::Explicit);
+        if !s.agent {
+            let kind = sp.agent.as_deref().unwrap_or("agent");
+            eprintln!(
+                "orchd: {old}: {kind} not restarted, the pane is a shell with a note: {}",
+                crate::agent_start::note_lines(sp, kind)[1..].join("; ")
+            );
+        }
+        (s.argv, s.env, s.agent)
+    }
+
     pub fn no_latest(&self, sp: &crate::restore::SavedPane) -> bool {
         let Some(kind) = sp
             .agent
@@ -1147,6 +1129,8 @@ impl Daemon {
                     let up = p.exit_code().is_none()
                         && match sp.saved.agent.as_deref() {
                             None => true,
+                            // Not started on purpose: a shell showing the note.
+                            Some(_) if !wake_start(&sp.saved).agent => true,
                             Some(_) if !shell_pane(&sp.saved) => true,
                             Some(_) => p
                                 .pid
@@ -1213,6 +1197,24 @@ impl Daemon {
             Ok(())
         });
         let _ = self.ui_events.send(crate::ui::UiEvent::Panes);
+        let not_started: Vec<Value> = ok
+            .iter()
+            .filter(|(_, sp, _)| sp.saved.agent.is_some() && !wake_start(&sp.saved).agent)
+            .map(|(old, sp, p)| {
+                let kind = sp.saved.agent.as_deref().unwrap_or("agent");
+                let lines = crate::agent_start::note_lines(&sp.saved, kind);
+                eprintln!(
+                    "orchd: wake {label}: {} (was {old}): {kind} not started, the pane is a shell with a note: {}",
+                    p.id,
+                    lines[1..].join("; ")
+                );
+                json!({
+                    "pane": p.id, "old": old, "kind": kind,
+                    "name": sp.saved.bus_name.clone().or_else(|| sp.saved.name.clone()),
+                    "note": lines,
+                })
+            })
+            .collect();
         self.after_wake_all(&ok, &w.label);
         // 4. The sleeper goes once the autosave on disk holds the new panes (until then a crash
         //    leaves it asleep, see `install_sleepers`). The reservation lasts until then.
@@ -1222,6 +1224,7 @@ impl Daemon {
             "workspace": w.id,
             "panes": new_panes,
             "failed": [],
+            "not_started": not_started,
             "confirmed": confirmed,
         }))
     }
@@ -1415,6 +1418,9 @@ impl Daemon {
             let Some(kind) = slept.saved.agent.clone() else {
                 continue;
             };
+            if !wake_start(&slept.saved).agent {
+                continue;
+            }
             resumed += 1;
             p.set_kind(&kind);
             if !slept.auto_continue {
