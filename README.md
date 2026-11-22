@@ -44,6 +44,9 @@ Built in Rust (stable) by Claude Code and Codex with Murat Bilge steering, for o
   While a workspace with a Claude (or Codex) agent sleeps, a restart gives every awake agent of that kind without
   a known conversation its picker too (`claude --resume`, `codex resume`), never `--continue` / `resume --last`
   (also not by replaying a saved shell command word for word), since "the latest" could be the sleeper's.
+  Such an agent gets a fresh command: its verified id, else a target written on a command orch can parse, else
+  the picker; an agent that ran in a shell comes back as `<shell> -lc '<agent command>; exec <shell>'` (the
+  wrapper's other commands, e.g. a `cd`, are not kept).
   While asleep, an agent's bus name is reserved for it; mail, queued tasks and open questions wait for it.
   Nothing wakes a workspace by itself, only on request: `orch msg --wake <agent> …` (the MCP `send_message` has
   `wake`) and `orch task add <ws> --wake …` (refused for `all`: a broadcast never wakes everything). A record

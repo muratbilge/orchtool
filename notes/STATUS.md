@@ -1,5 +1,16 @@
 # Status
 
+## 2026-11-22 — Sleep: eighth check (fresh command instead of a text scan) — Claude (Opus)
+
+- `restart_spec` is main's function again, word for word; `restart_spec_for(sp, false)` calls it.
+- With `no_latest`, `fresh_spec` builds a new agent command, never replaying saved shell text: the verified
+  session id; else a target the resume parser establishes (discovered agent argv, or the pane's command /
+  its shell wrapper when that is one simple command, known options kept); else the picker. Shell panes get
+  `<shell> -lc '<agent>; exec <shell>'`; other wrapper commands are dropped. `has_latest_selector` is gone.
+- `bash -c 'cd . && claude --resume <id>'` without a verified id: the parser can't establish the id (first
+  command is `cd`), so the picker. With a verified id: that id. The unknown-option fallback uses the verified id.
+Tests `j_a…`, unit `no_latest_builds_a_fresh_command_on_every_branch` (main's argv as literals).
+
 ## 2026-11-22 — Sleep: seventh check (no latest-session selector beside a sleeper) — Claude (Opus)
 
 - One rule, no folder matching: when the loaded sleepers hold a pane of an agent kind (claude / codex), every
