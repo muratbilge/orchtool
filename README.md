@@ -41,6 +41,9 @@ Built in Rust (stable) by Claude Code and Codex with Murat Bilge steering, for o
   started, none is and the sleeper stays as it was; a started pane that then can't be ended keeps running
   outside any workspace (`orch ls`, `orch kill`) and the workspace can't wake until it is gone. Agents resume
   only a verified session id, else at their resume picker (Claude `--resume`, Codex `resume`, never `--last`).
+  While a workspace with a Claude (or Codex) agent sleeps, a restart gives every awake agent of that kind without
+  a known conversation its picker too (`claude --resume`, `codex resume`), never `--continue` / `resume --last`
+  (also not by replaying a saved shell command word for word), since "the latest" could be the sleeper's.
   While asleep, an agent's bus name is reserved for it; mail, queued tasks and open questions wait for it.
   Nothing wakes a workspace by itself, only on request: `orch msg --wake <agent> …` (the MCP `send_message` has
   `wake`) and `orch task add <ws> --wake …` (refused for `all`: a broadcast never wakes everything). A record
@@ -113,7 +116,7 @@ Rust stable via rustup with rustfmt and clippy (`rust-toolchain.toml`). The scri
   If identity is unavailable or origin validation fails, orch logs why. A Codex pane that is the
   only Codex pane in its folder then comes back with `codex resume --last` (Codex's `--last` is per
   folder, so it cannot mean another pane); with several Codex panes in one folder it comes back at
-  `codex resume` (the picker), **not** `--last`; a sleeping Codex pane in that folder counts too. Existing explicit resume IDs still work. No
+  `codex resume` (the picker), **not** `--last`. Existing explicit resume IDs still work. No
   timestamp, newest-file, or shared app-server FD guessing. Private tests must pass `--socket`
   before `hook`, or export `ORCHD_SOCKET`; keep HOME separate. Neither config file is edited by
   the build/install scripts.

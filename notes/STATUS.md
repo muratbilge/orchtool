@@ -1,12 +1,23 @@
 # Status
 
+## 2026-11-22 — Sleep: seventh check (no latest-session selector beside a sleeper) — Claude (Opus)
+
+- One rule, no folder matching: when the loaded sleepers hold a pane of an agent kind (claude / codex), every
+  awake pane of that kind is restored with a known id or its picker, on every branch of `restart_spec_for`
+  (direct and in-shell rewrite, word-for-word wrapper replay, shell fallback, the unknown-command fallback):
+  `no_latest_selector` turns Claude `-c`/`--continue` into `--resume` and drops Codex `--last`; a wrapper
+  replay holding such a selector falls back to the picker form. Decided by `Daemon::no_latest`. Without such
+  a sleeper `restart_spec_for(sp, false)` is `restart_spec` (main) unchanged. The sixth check's folder rule is
+  replaced by this one.
+Tests `i_a…`–`i_d…`, unit `no_latest_selector_on_any_branch_while_one_of_the_kind_sleeps`.
+
 ## 2026-11-22 — Sleep: sixth-check fixes (ended panes, lone Codex beside a sleeper) — Claude (Opus)
 
 - **Ended panes:** the start-up filter also leaves out every pane id in a sleeper's saved tab trees, so a pane
   whose program ended before the sleep (no restartable record) is not run again from a stale autosave. A wake
   still starts only panes with a record.
-- **Codex `--last`:** after main's `mark_sole_codex`, an awake Codex pane in a folder where a loaded sleeper has
-  a Codex pane is not alone there: picker, not `resume --last`. With no sleepers the decision is main's. A wake
+- **Codex `--last`:** (replaced by the seventh check's rule) after main's `mark_sole_codex`, an awake Codex pane
+  in a folder where a loaded sleeper has a Codex pane is not alone there: picker, not `resume --last`. With no sleepers the decision is main's. A wake
   never uses `--last` (unchanged).
 - Sweep (bus names, tasks, questions, labels): already counted sleepers. Pane names: a new awake pane may take a
   sleeping pane's name; its wake then fails (all or nothing, sleeper kept) until one is renamed. Not changed.
