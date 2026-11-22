@@ -136,15 +136,41 @@ fn resume_words(sp: &SavedPane) -> String {
     }
 }
 
-/// The pane's process has a child (an agent started inside a shell wrapper is running).
-fn has_child(pid: u32) -> bool {
+/// The program a woken agent pane runs as its agent (inside its shell wrapper).
+fn agent_exe(sp: &SavedPane) -> String {
+    let argv = wake_argv(sp).0;
+    let cmd = if shell_pane(sp) {
+        argv.get(2)
+            .and_then(|script| {
+                shell_words::split(script.split("; exec").next().unwrap_or_default()).ok()
+            })
+            .and_then(|w| w.into_iter().find(|w| !w.contains('=')))
+            .unwrap_or_default()
+    } else {
+        argv.first().cloned().unwrap_or_default()
+    };
+    std::path::Path::new(&cmd)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or(cmd)
+}
+
+/// The pane's shell has the agent itself as a child (its process name is the agent's
+/// program, as the kernel shortens it to 15 bytes): a shell that started something else does
+/// not count.
+fn has_agent_child(pid: u32, exe: &str) -> bool {
+    let want: String = exe.chars().take(15).collect();
     std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"))
-        .is_ok_and(|s| !s.trim().is_empty())
+        .unwrap_or_default()
+        .split_whitespace()
+        .any(|c| {
+            std::fs::read_to_string(format!("/proc/{c}/comm")).is_ok_and(|comm| comm.trim() == want)
+        })
 }
 
 /// `ws` with its panes renamed by `map`; panes not in it are dropped (a tab without any goes,
 /// None when nothing is left).
-fn mapped(ws: &Workspace, map: &HashMap<String, String>) -> Option<Workspace> {
+pub(crate) fn mapped(ws: &Workspace, map: &HashMap<String, String>) -> Option<Workspace> {
     fn node(n: &Node, map: &HashMap<String, String>) -> Node {
         match n {
             Node::Pane { pane } => Node::Pane {
@@ -198,6 +224,18 @@ pub struct Sleepers {
     dirty: bool,
 }
 
+/// A workspace going to sleep or waking.
+pub(crate) struct Transit {
+    /// Its panes (old ones, and the new ones of a wake): no input, kill or attach reaches them
+    /// until the transition is over, also after the workspace left the awake layout.
+    panes: HashSet<String>,
+    /// An automatic sleep: a person arriving (attach, input, a layout change) stops it instead
+    /// of being refused, as long as it has not started to commit.
+    auto: bool,
+    aborted: bool,
+    committing: bool,
+}
+
 /// Held while a workspace goes to sleep or wakes; released when dropped.
 pub(crate) struct Reservation {
     d: Arc<Daemon>,
@@ -210,54 +248,129 @@ impl Drop for Reservation {
     }
 }
 
+fn busy_err() -> ApiError {
+    err(
+        "ws_transition",
+        "its workspace is going to sleep or waking; try again",
+    )
+}
+
 impl Daemon {
     // ---------- reservations ----------
 
-    pub(crate) fn reserve(self: &Arc<Self>, ws_id: &str) -> Result<Reservation, ApiError> {
+    /// Reserves `ws_id` with its current panes. Admission is decided under the same lock a
+    /// stop uses to wait for transitions, so none starts after a stop saw none running.
+    pub(crate) fn reserve(
+        self: &Arc<Self>,
+        ws_id: &str,
+        auto: bool,
+    ) -> Result<Reservation, ApiError> {
+        let panes: HashSet<String> = {
+            let s = self.session();
+            s.workspace(ws_id)
+                .map(|w| w.tabs.iter().flat_map(|t| t.root.panes()).collect())
+                .unwrap_or_default()
+        };
+        let mut t = self.transitions.lock().unwrap();
         if self.stopping_soon.load(std::sync::atomic::Ordering::SeqCst)
             || self.stopping.load(std::sync::atomic::Ordering::SeqCst)
         {
             return Err(err("ws_transition", "orchd is stopping"));
         }
-        if !self.transitions.lock().unwrap().insert(ws_id.to_string()) {
+        if t.contains_key(ws_id) {
             return Err(err(
                 "ws_transition",
                 "that workspace is already going to sleep or waking",
             ));
         }
+        t.insert(
+            ws_id.to_string(),
+            Transit {
+                panes,
+                auto,
+                aborted: false,
+                committing: false,
+            },
+        );
         Ok(Reservation {
             d: Arc::clone(self),
             id: ws_id.to_string(),
         })
     }
 
-    pub(crate) fn ws_in_transition(&self, ws_id: &str) -> bool {
-        self.transitions.lock().unwrap().contains(ws_id)
+    /// New panes of a wake join its reservation.
+    fn reserve_panes(&self, ws_id: &str, panes: &[String]) {
+        if let Some(t) = self.transitions.lock().unwrap().get_mut(ws_id) {
+            t.panes.extend(panes.iter().cloned());
+        }
     }
 
-    /// The pane belongs to a workspace going to sleep or waking.
+    pub(crate) fn ws_in_transition(&self, ws_id: &str) -> bool {
+        self.transitions.lock().unwrap().contains_key(ws_id)
+    }
+
+    /// The pane belongs to a workspace going to sleep or waking (tasks and nudges wait).
     pub(crate) fn in_transition(&self, pane: &str) -> bool {
-        let busy = self.transitions.lock().unwrap().clone();
-        if busy.is_empty() {
-            return false;
+        self.transitions
+            .lock()
+            .unwrap()
+            .values()
+            .any(|t| t.panes.contains(pane))
+    }
+
+    /// Someone wants to use the pane (input, kill, attach): refused during a transition, except
+    /// that it stops an automatic sleep that has not started to commit (and is then let in).
+    /// Decided under the transitions lock, which the commit also takes: atomic with it.
+    pub(crate) fn admit(&self, pane: &str) -> Result<(), ApiError> {
+        let mut map = self.transitions.lock().unwrap();
+        match map.values_mut().find(|t| t.panes.contains(pane)) {
+            None => Ok(()),
+            Some(t) if t.auto && !t.committing => {
+                t.aborted = true;
+                Ok(())
+            }
+            Some(_) => Err(busy_err()),
         }
-        let s = self.session();
-        s.locate(pane)
-            .is_some_and(|(wi, _)| busy.contains(&s.workspaces[wi].id))
+    }
+
+    /// The same for a change of the workspace's layout.
+    pub(crate) fn admit_ws(&self, ws_id: &str) -> Result<(), ApiError> {
+        let mut map = self.transitions.lock().unwrap();
+        match map.get_mut(ws_id) {
+            None => Ok(()),
+            Some(t) if t.auto && !t.committing => {
+                t.aborted = true;
+                Ok(())
+            }
+            Some(_) => Err(busy_err()),
+        }
     }
 
     pub(crate) fn not_in_transition(&self, pane: &str) -> Result<(), ApiError> {
-        if self.in_transition(pane) {
-            return Err(err(
-                "ws_transition",
-                "its workspace is going to sleep or waking; try again",
-            ));
+        self.admit(pane)
+    }
+
+    /// From here on nothing more is admitted; an automatic sleep somebody interrupted stops.
+    fn begin_commit(&self, ws_id: &str) -> Result<(), ApiError> {
+        let mut map = self.transitions.lock().unwrap();
+        let Some(t) = map.get_mut(ws_id) else {
+            return Ok(());
+        };
+        if t.aborted {
+            return Err(err("auto_aborted", "somebody started using it"));
         }
+        t.committing = true;
         Ok(())
     }
 
-    /// An explicit bus name of an agent in a sleeping workspace is reserved for it: only its
-    /// own new pane (during its wake) may register it.
+    fn commit_failed(&self, ws_id: &str) {
+        if let Some(t) = self.transitions.lock().unwrap().get_mut(ws_id) {
+            t.committing = false;
+        }
+    }
+
+    /// An explicit bus name of an agent in a sleeping workspace is reserved for it: only the
+    /// new pane of **that** agent's own pane (during its wake) may register it.
     pub(crate) fn name_free_for(&self, r: &RegisterAgent) -> Result<(), ApiError> {
         let Some(name) = r
             .name
@@ -269,18 +382,19 @@ impl Daemon {
         };
         let s = self.session.lock().unwrap();
         for x in &s.sleeping {
-            if !x
+            let Some(old) = x
                 .panes
-                .values()
-                .any(|p| p.saved.bus_name.as_deref() == Some(name.as_str()))
-            {
+                .iter()
+                .find(|(_, p)| p.saved.bus_name.as_deref() == Some(name.as_str()))
+                .map(|(id, _)| id)
+            else {
                 continue;
-            }
-            let own = x.wake.as_ref().is_some_and(|w| {
-                w.map
-                    .values()
-                    .any(|n| r.pane.as_deref() == Some(format!("orch:{n}").as_str()))
-            });
+            };
+            let own = x
+                .wake
+                .as_ref()
+                .and_then(|w| w.map.get(old))
+                .is_some_and(|n| r.pane.as_deref() == Some(format!("orch:{n}").as_str()));
             if !own {
                 return Err(err(
                     "name_reserved",
@@ -315,44 +429,96 @@ impl Daemon {
 
     // ---------- the record ----------
 
-    /// Writes the sleepers as they are now (durably, a new generation). Serialized: the
-    /// state is read under the store's lock.
-    pub(crate) fn persist_sleepers(&self) -> Result<(), ApiError> {
+    /// Changes the sleepers durably. `f` is applied to a copy of the layout, the copy's
+    /// sleepers are written, and only once that write is confirmed is `f` applied to the live
+    /// layout: no snapshot, autosave or other commit sees a sleeper change before it is on
+    /// disk (commits are serialized by the store's lock; snapshots wait for one in flight).
+    /// A write that failed after its slot became visible is superseded by the unchanged state.
+    /// Blocking (disk I/O): from async code use [`Self::commit_off`].
+    pub(crate) fn commit<R>(
+        &self,
+        f: impl Fn(&mut Session) -> Result<R, ApiError>,
+    ) -> Result<R, ApiError> {
         let mut st = self.sleep_store.lock();
-        let (list, next_id) = {
-            let s = self.session.lock().unwrap();
+        let _gate = self.publish_gate.write().unwrap();
+        let mut cand = self.session();
+        f(&mut cand)?;
+        let live = |d: &Daemon| {
+            let s = d.session.lock().unwrap();
             (s.sleeping.clone(), s.next_id)
         };
-        self.sleep_store
-            .write(&mut st, &list, next_id)
-            .map_err(|e| {
-                err(
-                    "save_failed",
-                    format!("saving the sleeping workspaces failed: {e}"),
-                )
-            })
+        if let Err(e) = self
+            .sleep_store
+            .write(&mut st, &cand.sleeping, cand.next_id)
+        {
+            if e.published {
+                let (list, next) = live(self);
+                if let Err(e2) = self.sleep_store.write(&mut st, &list, next) {
+                    eprintln!(
+                        "orchd: the sleeper record on disk may show a change that was undone: {e2}"
+                    );
+                }
+            }
+            return Err(err(
+                "save_failed",
+                format!("saving the sleeping workspaces failed: {e}"),
+            ));
+        }
+        match self.edit(&f) {
+            Ok(r) => Ok(r),
+            Err(e) => {
+                // The live layout changed meanwhile: what was written is not what is live.
+                let (list, next) = live(self);
+                if let Err(e2) = self.sleep_store.write(&mut st, &list, next) {
+                    eprintln!("orchd: rewriting the sleeper record: {e2}");
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// [`Self::commit`] on a blocking thread.
+    pub(crate) async fn commit_off<R: Send + 'static>(
+        self: &Arc<Self>,
+        f: impl Fn(&mut Session) -> Result<R, ApiError> + Send + 'static,
+    ) -> Result<R, ApiError> {
+        let d = Arc::clone(self);
+        tokio::task::spawn_blocking(move || d.commit(f))
+            .await
+            .map_err(|e| err("save_failed", e.to_string()))?
+    }
+
+    /// Writes the sleepers as they are now.
+    pub(crate) fn persist_sleepers(&self) -> Result<(), ApiError> {
+        self.commit(|_| Ok(()))
     }
 
     pub fn load_sleepers(&self) -> Sleepers {
         match self.sleep_store.load() {
-            Some(r) => Sleepers {
-                list: r.sleeping,
-                next_id: r.next_id,
+            crate::sleepstore::Loaded::Found { record, .. } => Sleepers {
+                list: record.sleeping,
+                next_id: record.next_id,
                 ..Default::default()
             },
-            None => Sleepers::default(),
+            _ => Sleepers::default(),
         }
     }
 
     /// Moves the owners of `x`'s panes (running tasks, bus names) along `map` (old → new), or
-    /// back (`back`).
+    /// back (`back`). Each step is idempotent, so a partly done move can be repeated.
     fn move_owners(
         &self,
         x: &Sleeping,
         map: &HashMap<String, String>,
         back: bool,
     ) -> anyhow::Result<()> {
-        for (old, new) in map {
+        for (i, (old, new)) in map.iter().enumerate() {
+            if back && crate::fault::on("owners_back_fail") {
+                anyhow::bail!("injected failure moving owners back");
+            }
+            if !back && i > 0 && crate::fault::on("owners_fail") {
+                anyhow::bail!("injected failure moving owners");
+            }
             let (from, to) = if back { (new, old) } else { (old, new) };
             self.bus.task_rebind(from, to)?;
             let Some(sp) = x.panes.get(old) else { continue };
@@ -370,8 +536,10 @@ impl Daemon {
     }
 
     /// Start-up, before the awake layout is restored: finishes or undoes a wake that a crash
-    /// interrupted, takes over sleepers from an older layout file, and drops from `saved` every
-    /// workspace that is asleep (the sleeper record is newer than a stale awake layout).
+    /// interrupted, takes over sleepers from an older layout file, and drops from `saved` the
+    /// stale awake copies of sleepers. A copy is recognised by its panes (pane ids never
+    /// repeat), not by its id alone: an older orchd may have given that id to another
+    /// workspace, which stays (the sleeper is renumbered when it is installed).
     pub fn reconcile_sleepers(
         &self,
         sl: &mut Sleepers,
@@ -386,15 +554,18 @@ impl Daemon {
             }
             sl.next_id = sl.next_id.max(saved.session.next_id);
         }
-        let in_layout = |id: &str| {
+        let layout_panes = |id: &str| -> HashSet<String> {
             saved
                 .as_deref()
-                .is_some_and(|s| s.session.workspaces.iter().any(|w| w.id == id))
+                .and_then(|s| s.session.workspaces.iter().find(|w| w.id == id))
+                .map(|w| w.tabs.iter().flat_map(|t| t.root.panes()).collect())
+                .unwrap_or_default()
         };
         let mut keep = Vec::new();
         for mut x in std::mem::take(&mut sl.list) {
-            match x.wake.take() {
-                Some(w) if w.committed && in_layout(&x.workspace.id) => {
+            let here = layout_panes(&x.workspace.id);
+            match x.wake.clone() {
+                Some(w) if w.committed && w.map.values().any(|n| here.contains(n)) => {
                     eprintln!(
                         "orchd: the wake of {} had committed; it is awake",
                         x.workspace.label
@@ -402,29 +573,43 @@ impl Daemon {
                     sl.dirty = true;
                     continue;
                 }
-                Some(w) => {
-                    if let Err(e) = self.move_owners(&x, &w.map, true) {
+                Some(w) => match self.move_owners(&x, &w.map, true) {
+                    Ok(()) => {
+                        x.wake = None;
+                        sl.dirty = true;
                         eprintln!(
-                            "orchd: undoing the interrupted wake of {}: {e:#}",
+                            "orchd: the wake of {} was interrupted; it stays asleep",
                             x.workspace.label
                         );
                     }
-                    eprintln!(
-                        "orchd: the wake of {} was interrupted; it stays asleep",
+                    // Kept (with its map) for the next start to try again.
+                    Err(e) => eprintln!(
+                        "orchd: undoing the interrupted wake of {} failed: {e:#}; tried again at the next start",
                         x.workspace.label
-                    );
-                    sl.dirty = true;
-                }
+                    ),
+                },
                 None => {}
             }
             keep.push(x);
         }
         sl.list = keep;
         if let Some(saved) = saved {
-            saved
-                .session
-                .workspaces
-                .retain(|w| !sl.list.iter().any(|x| x.workspace.id == w.id));
+            saved.session.workspaces.retain(|w| {
+                let mine: HashSet<String> = w.tabs.iter().flat_map(|t| t.root.panes()).collect();
+                !sl.list.iter().any(|x| {
+                    x.workspace.id == w.id
+                        && (x.panes.keys().any(|p| mine.contains(p))
+                            || x.workspace
+                                .tabs
+                                .iter()
+                                .flat_map(|t| t.root.panes())
+                                .any(|p| mine.contains(&p))
+                            || x.wake
+                                .iter()
+                                .flat_map(|k| k.map.values())
+                                .any(|p| mine.contains(p)))
+                })
+            });
         }
         sl.reconciled = true;
     }
@@ -439,7 +624,8 @@ impl Daemon {
 
     /// Start-up, after the awake layout is back: the sleepers join the layout (ids that an
     /// older orchd handed out meanwhile are renumbered) and the record is rewritten if needed.
-    pub fn install_sleepers(&self, mut sl: Sleepers) {
+    /// `Err` when that write failed: the caller keeps the layout file they came from.
+    pub fn install_sleepers(&self, mut sl: Sleepers) -> Result<(), ApiError> {
         if !sl.reconciled {
             self.reconcile_sleepers(&mut sl, None);
         }
@@ -478,10 +664,9 @@ impl Daemon {
             Ok(())
         });
         if dirty {
-            if let Err(e) = self.persist_sleepers() {
-                eprintln!("orchd: {}", e.message);
-            }
+            self.persist_sleepers()?;
         }
+        Ok(())
     }
 
     // ---------- sleep ----------
@@ -640,7 +825,7 @@ impl Daemon {
             .id
             .clone();
         drop(session);
-        let _reserved = self.reserve(&ws_id)?;
+        let _reserved = self.reserve(&ws_id, auto.is_some())?;
         // A task or nudge already being typed into it finishes first; later ones see the
         // reservation.
         drop(self.task_gate.lock().await);
@@ -684,57 +869,73 @@ impl Daemon {
             .filter(|(_, p)| p.interrupted)
             .map(|(id, p)| p.saved.bus_name.clone().unwrap_or_else(|| id.clone()))
             .collect();
-        // The commit: the layout must still hold exactly the panes inspected.
-        let position = self.edit(|s| {
-            let at = s
-                .workspaces
-                .iter()
-                .position(|w| w.id == ws_id)
-                .ok_or_else(|| err("no_workspace", "the workspace is gone"))?;
-            let now: Vec<String> = s.workspaces[at]
-                .tabs
-                .iter()
-                .flat_map(|t| t.root.panes())
-                .collect();
-            if now != ids {
-                return Err(err(
-                    "ws_changed",
-                    "its panes changed while it was checked; nothing was done, try again",
-                ));
-            }
-            let workspace = s.workspaces.remove(at);
-            s.sleeping.push(Sleeping {
-                workspace,
-                position: at,
-                slept_ms: now_ms(),
-                panes,
-                wake: None,
-                stuck: Vec::new(),
-            });
-            Ok(at)
-        })?;
-        // Durable before anything ends; otherwise put it back and end nothing.
-        if let Err(e) = self.persist_sleepers() {
-            let _ = self.edit(|s| {
-                if let Some(i) = s.sleeping.iter().position(|x| x.workspace.id == ws_id) {
-                    let x = s.sleeping.remove(i);
-                    let at = position.min(s.workspaces.len());
-                    s.workspaces.insert(at, x.workspace);
+        // The commit. From here nothing more is admitted (an automatic sleep somebody
+        // interrupted stops here); the layout must still hold exactly the panes inspected; the
+        // record is written and confirmed before the workspace leaves the live layout, and
+        // before anything ends. A failed write changes nothing.
+        self.begin_commit(&ws_id)?;
+        let check_questions = auto.is_some();
+        let bus_names = agents.clone();
+        let (id, ids2, panes2) = (ws_id.clone(), ids.clone(), panes);
+        let bus = Arc::clone(&self.bus);
+        let committed = self
+            .commit_off(move |s| {
+                let at = s
+                    .workspaces
+                    .iter()
+                    .position(|w| w.id == id)
+                    .ok_or_else(|| err("no_workspace", "the workspace is gone"))?;
+                let now: Vec<String> = s.workspaces[at]
+                    .tabs
+                    .iter()
+                    .flat_map(|t| t.root.panes())
+                    .collect();
+                if now != ids2 {
+                    return Err(err(
+                        "ws_changed",
+                        "its panes changed while it was checked; nothing was done, try again",
+                    ));
                 }
+                // An automatic sleep never takes an agent with a question open (also one asked
+                // after it was checked).
+                if check_questions {
+                    let qs = bus
+                        .questions(false)
+                        .map_err(|e| err("auto_aborted", format!("bus: {e:#}")))?;
+                    if qs.iter().any(|q| bus_names.contains(&q.from)) {
+                        return Err(err("auto_aborted", "an agent in it asked a question"));
+                    }
+                }
+                let workspace = s.workspaces.remove(at);
+                s.sleeping.push(Sleeping {
+                    workspace,
+                    position: at,
+                    slept_ms: now_ms(),
+                    panes: panes2.clone(),
+                    wake: None,
+                    stuck: Vec::new(),
+                });
                 Ok(())
+            })
+            .await;
+        if let Err(e) = committed {
+            self.commit_failed(&ws_id);
+            return Err(match e.code {
+                "save_failed" => err(
+                    "save_failed",
+                    format!("{}; nothing was put to sleep", e.message),
+                ),
+                _ => e,
             });
-            return Err(err(
-                "save_failed",
-                format!("{}; nothing was put to sleep", e.message),
-            ));
         }
+        crate::fault::pause_at("sleep_before_kill_ms").await;
         crate::fault::crash_at("sleep_after_commit");
         let d = Arc::clone(self);
         let _ = tokio::task::spawn_blocking(move || d.autosave_now(false)).await;
         let failures = self.kill_panes(&ids).await;
         let mut warnings: Vec<String> = failures.iter().map(|(_, e)| e.clone()).collect();
         if !failures.is_empty() {
-            warnings.push(self.keep_survivors(&ws_id, &plan.label, &failures));
+            warnings.push(self.keep_survivors(&ws_id, &plan.label, &failures).await);
         }
         let _ = self.ui_events.send(crate::ui::UiEvent::Panes);
         for name in &agents {
@@ -796,45 +997,57 @@ impl Daemon {
 
     /// Programs that outlived SIGKILL stay visible in an awake workspace "<label>-stuck", and
     /// the sleeper can't wake (no second copy) until they are gone.
-    fn keep_survivors(&self, ws_id: &str, label: &str, failed: &[(String, String)]) -> String {
+    async fn keep_survivors(
+        self: &Arc<Self>,
+        ws_id: &str,
+        label: &str,
+        failed: &[(String, String)],
+    ) -> String {
         let ids: Vec<String> = failed
             .iter()
             .map(|(id, _)| id.clone())
             .filter(|id| !id.is_empty())
             .collect();
-        let mut stuck_label = String::new();
-        let _ = self.edit(|s| {
-            let cwd = s
-                .sleeping(ws_id)
-                .map(|x| x.workspace.cwd.clone())
-                .unwrap_or_default();
-            stuck_label = unique_label(s, &format!("{label}-stuck"));
-            let mut tabs = Vec::new();
-            for (i, id) in ids.iter().enumerate() {
-                tabs.push(Tab {
-                    id: s.new_id("t"),
-                    label: (i + 1).to_string(),
-                    root: Node::leaf(id),
-                    focus: id.clone(),
-                    zoomed: false,
+        let (wsid, lbl, ids2) = (ws_id.to_string(), label.to_string(), ids.clone());
+        let stuck_label = self
+            .commit_off(move |s| {
+                let cwd = s
+                    .sleeping(&wsid)
+                    .map(|x| x.workspace.cwd.clone())
+                    .unwrap_or_default();
+                let stuck_label = unique_label(s, &format!("{lbl}-stuck"));
+                let mut tabs = Vec::new();
+                for (i, id) in ids2.iter().enumerate() {
+                    tabs.push(Tab {
+                        id: s.new_id("t"),
+                        label: (i + 1).to_string(),
+                        root: Node::leaf(id),
+                        focus: id.clone(),
+                        zoomed: false,
+                    });
+                }
+                let id = s.new_id("w");
+                s.workspaces.push(Workspace {
+                    id,
+                    label: stuck_label.clone(),
+                    cwd,
+                    tabs,
+                    active_tab: 0,
                 });
-            }
-            let id = s.new_id("w");
-            s.workspaces.push(Workspace {
-                id,
-                label: stuck_label.clone(),
-                cwd,
-                tabs,
-                active_tab: 0,
+                if let Some(x) = s.sleeping_mut(&wsid) {
+                    for p in &ids2 {
+                        if !x.stuck.contains(p) {
+                            x.stuck.push(p.clone());
+                        }
+                    }
+                }
+                Ok(stuck_label)
+            })
+            .await
+            .unwrap_or_else(|e| {
+                eprintln!("orchd: {}", e.message);
+                format!("{label}-stuck")
             });
-            if let Some(x) = s.sleeping_mut(ws_id) {
-                x.stuck = ids.clone();
-            }
-            Ok(())
-        });
-        if let Err(e) = self.persist_sleepers() {
-            eprintln!("orchd: {}", e.message);
-        }
         format!(
             "{} pane(s) survived SIGKILL: they are in workspace {stuck_label}; {label} wakes once they are gone",
             ids.len()
@@ -861,7 +1074,7 @@ impl Daemon {
             };
         };
         drop(session);
-        let _reserved = self.reserve(&ws_id)?;
+        let _reserved = self.reserve(&ws_id, false)?;
         let sl = self
             .session()
             .sleeping(&ws_id)
@@ -884,6 +1097,12 @@ impl Daemon {
                         .collect::<Vec<_>>()
                         .join(", ")
                 ),
+            ));
+        }
+        if sl.wake.is_some() {
+            return Err(err(
+                "ws_transition",
+                format!("an earlier wake of {label} is not undone yet (its tasks / names could not be moved back); restart orchd to retry that"),
             ));
         }
         // A bus name held by a live agent elsewhere: report it, start nothing.
@@ -931,8 +1150,13 @@ impl Daemon {
         })
         .await
         .map_err(|e| err("spawn_failed", e.to_string()))?;
-        // An agent counts as started once it is still up after a moment (inside a shell
-        // wrapper: the shell still has it as a child).
+        let spawned: Vec<String> = started
+            .iter()
+            .filter_map(|(_, _, r)| r.as_ref().ok().map(|p| p.id.clone()))
+            .collect();
+        self.reserve_panes(&ws_id, &spawned);
+        // An agent counts as started once it is still up after a moment; inside a shell
+        // wrapper the agent itself must be the shell's child (not just any process).
         if started
             .iter()
             .any(|(_, sp, r)| r.is_ok() && sp.saved.agent.is_some())
@@ -945,18 +1169,23 @@ impl Daemon {
         }
         let mut ok: Vec<(String, SleptPane, Arc<Pane>)> = Vec::new();
         let mut failed: Vec<(String, String)> = Vec::new();
+        let mut dead: Vec<String> = Vec::new();
         for (old, sp, r) in started {
             match r {
                 Ok(p) => {
                     let up = p.exit_code().is_none()
-                        && (sp.saved.agent.is_none()
-                            || !shell_pane(&sp.saved)
-                            || p.pid.is_some_and(has_child));
+                        && match sp.saved.agent.as_deref() {
+                            None => true,
+                            Some(_) if !shell_pane(&sp.saved) => true,
+                            Some(_) => p
+                                .pid
+                                .is_some_and(|pid| has_agent_child(pid, &agent_exe(&sp.saved))),
+                        };
                     if up {
                         ok.push((old, sp, p));
                     } else {
                         failed.push((old, format!("{} did not start", p.id)));
-                        let _ = self.kill(&p.id).await;
+                        dead.push(p.id.clone());
                     }
                 }
                 Err(e) => failed.push((old, e)),
@@ -964,53 +1193,77 @@ impl Daemon {
         }
         let new_panes: Vec<String> = ok.iter().map(|(_, _, p)| p.id.clone()).collect();
         if ok.is_empty() || (!failed.is_empty() && !partial) {
-            self.kill_panes(&new_panes).await;
-            return Err(err(
-                "wake_failed",
-                format!(
-                    "{label} stays asleep: {}{}",
-                    failed
-                        .iter()
-                        .map(|(o, e)| format!("{o}: {e}"))
-                        .collect::<Vec<_>>()
-                        .join("; "),
-                    if ok.is_empty() {
-                        ""
-                    } else {
-                        " (retry once that is fixed, or wake with --partial)"
-                    }
-                ),
-            ));
+            let all: Vec<String> = new_panes.iter().chain(&dead).cloned().collect();
+            let mut msg = format!(
+                "{label} stays asleep: {}{}",
+                failed
+                    .iter()
+                    .map(|(o, e)| format!("{o}: {e}"))
+                    .collect::<Vec<_>>()
+                    .join("; "),
+                if ok.is_empty() {
+                    ""
+                } else {
+                    " (retry once that is fixed, or wake with --partial)"
+                }
+            );
+            let survivors = self.kill_panes(&all).await;
+            if !survivors.is_empty() {
+                msg = format!(
+                    "{msg}; {}",
+                    self.keep_survivors(&ws_id, &label, &survivors).await
+                );
+            }
+            return Err(err("wake_failed", msg));
+        }
+        let survivors = self.kill_panes(&dead).await;
+        if !survivors.is_empty() {
+            self.keep_survivors(&ws_id, &label, &survivors).await;
         }
         let map: HashMap<String, String> = ok
             .iter()
             .map(|(o, _, p)| (o.clone(), p.id.clone()))
             .collect();
         // 1. The map, durably, before any owner moves.
-        let _ = self.edit(|s| {
-            if let Some(x) = s.sleeping_mut(&ws_id) {
+        let (id, m) = (ws_id.clone(), map.clone());
+        let written = self
+            .commit_off(move |s| {
+                let x = s
+                    .sleeping_mut(&id)
+                    .ok_or_else(|| err("no_workspace", "it was closed meanwhile"))?;
                 x.wake = Some(WakeState {
-                    map: map.clone(),
+                    map: m.clone(),
                     committed: false,
                 });
-            }
-            Ok(())
-        });
-        if let Err(e) = self.persist_sleepers() {
+                Ok(())
+            })
+            .await;
+        if let Err(e) = written {
             self.undo_wake(&ws_id, &sl, &map, false, &new_panes).await;
             return Err(e);
         }
+        crate::fault::pause_at("wake_pause_ms").await;
         // 2. Owners: running tasks and bus names follow the new panes.
         if let Err(e) = self.move_owners(&sl, &map, false) {
             self.undo_wake(&ws_id, &sl, &map, true, &new_panes).await;
             return Err(err("bus", format!("moving tasks / names failed: {e:#}")));
         }
         crate::fault::crash_at("wake_after_owners");
-        // 3. The awake layout, durably.
+        // 3. The awake layout, durably (with the usage-limit continues still due, so a crash
+        //    after this keeps them).
         let Some(mut w) = mapped(&sl.workspace, &map) else {
             self.undo_wake(&ws_id, &sl, &map, true, &new_panes).await;
             return Err(err("wake_failed", "nothing of it came back"));
         };
+        for (_, sp, p) in &ok {
+            let due = sp
+                .saved
+                .continue_at
+                .or(sp.limited.then_some(sp.limit_reset).flatten());
+            if let (Some(reset), true) = (due, sp.auto_continue) {
+                self.deferred.lock().unwrap().insert(p.id.clone(), reset);
+            }
+        }
         let rest = (!failed.is_empty()).then(|| {
             let back: HashMap<String, String> =
                 failed.iter().map(|(o, _)| (o.clone(), o.clone())).collect();
@@ -1055,45 +1308,49 @@ impl Daemon {
             ));
         }
         // 4. Committed: the sleeper (and the panes that did not come back, kept asleep).
-        let mut rest_label = None;
-        let _ = self.edit(|s| {
-            if let Some(x) = s.sleeping_mut(&ws_id) {
+        let (id, lbl, rest2) = (ws_id.clone(), label.clone(), rest.clone().flatten());
+        let committed = self
+            .commit_off(move |s| {
+                let x = s
+                    .sleeping_mut(&id)
+                    .ok_or_else(|| err("no_workspace", "it was closed meanwhile"))?;
                 if let Some(wk) = &mut x.wake {
                     wk.committed = true;
                 }
-            }
-            if let Some(Some(mut r)) = rest.clone() {
-                r.workspace.id = s.new_id("w");
-                for t in &mut r.workspace.tabs {
-                    t.id = s.new_id("t");
+                let mut rest_label = None;
+                if let Some(mut r) = rest2.clone() {
+                    r.workspace.id = s.new_id("w");
+                    for t in &mut r.workspace.tabs {
+                        t.id = s.new_id("t");
+                    }
+                    r.workspace.label = unique_label(s, &format!("{lbl}-rest"));
+                    rest_label = Some(r.workspace.label.clone());
+                    s.sleeping.push(r);
                 }
-                r.workspace.label = unique_label(s, &format!("{label}-rest"));
-                rest_label = Some(r.workspace.label.clone());
-                s.sleeping.push(r);
+                Ok(rest_label)
+            })
+            .await;
+        let rest_label = match committed {
+            Ok(l) => l,
+            Err(e) => {
+                self.unplace_woken(&ws_id);
+                self.undo_wake(&ws_id, &sl, &map, true, &new_panes).await;
+                let d = Arc::clone(self);
+                let _ = tokio::task::spawn_blocking(move || d.autosave_sync()).await;
+                return Err(e);
             }
-            Ok(())
-        });
-        if let Err(e) = self.persist_sleepers() {
-            let _ = self.edit(|s| {
-                if let Some(l) = &rest_label {
-                    s.sleeping.retain(|x| &x.workspace.label != l);
-                }
-                Ok(())
-            });
-            self.unplace_woken(&ws_id);
-            self.undo_wake(&ws_id, &sl, &map, true, &new_panes).await;
-            let d = Arc::clone(self);
-            let _ = tokio::task::spawn_blocking(move || d.autosave_sync()).await;
-            return Err(e);
-        }
+        };
         crate::fault::crash_at("wake_after_commit");
         // 5. The sleeper goes.
-        let _ = self.edit(|s| {
-            s.sleeping.retain(|x| x.workspace.id != ws_id);
-            Ok(())
-        });
-        if let Err(e) = self.persist_sleepers() {
-            // The next start sees a committed wake with the workspace in the layout.
+        let id = ws_id.clone();
+        if let Err(e) = self
+            .commit_off(move |s| {
+                s.sleeping.retain(|x| x.workspace.id != id);
+                Ok(())
+            })
+            .await
+        {
+            // The next start sees a committed wake with its panes in the layout.
             eprintln!("orchd: {}", e.message);
         }
         let _ = self.ui_events.send(crate::ui::UiEvent::Panes);
@@ -1142,7 +1399,9 @@ impl Daemon {
         });
     }
 
-    /// Undoes a wake that did not commit: owners back, new panes ended, the record cleared.
+    /// Undoes a wake that did not commit: owners back, new panes ended (survivors kept
+    /// visible and blocking), the map cleared, but only once every owner is back: otherwise
+    /// it stays in the record and the next start tries again.
     async fn undo_wake(
         self: &Arc<Self>,
         ws_id: &str,
@@ -1151,21 +1410,42 @@ impl Daemon {
         owners_moved: bool,
         panes: &[String],
     ) {
-        if owners_moved {
-            if let Err(e) = self.move_owners(sl, map, true) {
-                eprintln!("orchd: undoing the wake of {}: {e:#}", sl.workspace.label);
+        let back = if owners_moved {
+            self.move_owners(sl, map, true)
+        } else {
+            Ok(())
+        };
+        {
+            let mut deferred = self.deferred.lock().unwrap();
+            for p in panes {
+                deferred.remove(p);
             }
         }
-        self.kill_panes(panes).await;
-        let _ = self.edit(|s| {
-            if let Some(x) = s.sleeping_mut(ws_id) {
-                x.wake = None;
+        let survivors = self.kill_panes(panes).await;
+        if !survivors.is_empty() {
+            self.keep_survivors(ws_id, &sl.workspace.label, &survivors)
+                .await;
+        }
+        match back {
+            Ok(()) => {
+                let id = ws_id.to_string();
+                if let Err(e) = self
+                    .commit_off(move |s| {
+                        if let Some(x) = s.sleeping_mut(&id) {
+                            x.wake = None;
+                        }
+                        Ok(())
+                    })
+                    .await
+                {
+                    // The next start undoes an uncommitted wake by itself.
+                    eprintln!("orchd: {}", e.message);
+                }
             }
-            Ok(())
-        });
-        if let Err(e) = self.persist_sleepers() {
-            // The next start undoes the owners of an uncommitted wake by itself.
-            eprintln!("orchd: {}", e.message);
+            Err(e) => eprintln!(
+                "orchd: moving the tasks / names of {} back failed: {e:#}; its map is kept, the next start tries again",
+                sl.workspace.label
+            ),
         }
     }
 
@@ -1217,25 +1497,20 @@ impl Daemon {
 
     /// `orch ws close` on a sleeping workspace: it is forgotten (nothing runs to kill). Its
     /// running tasks fail; its queued ones keep waiting for the label, as for a closed one.
-    pub fn forget_sleeping(self: &Arc<Self>, key: &str) -> Result<bool, ApiError> {
+    pub async fn forget_sleeping(self: &Arc<Self>, key: &str) -> Result<bool, ApiError> {
         let Some(id) = self.session().sleeping(key).map(|x| x.workspace.id.clone()) else {
             return Ok(false);
         };
-        let _reserved = self.reserve(&id)?;
+        let _reserved = self.reserve(&id, false)?;
         let Some(sl) = self.session().sleeping(&id).cloned() else {
             return Ok(false);
         };
-        self.edit(|s| {
-            s.sleeping.retain(|x| x.workspace.id != id);
+        let id2 = id.clone();
+        self.commit_off(move |s| {
+            s.sleeping.retain(|x| x.workspace.id != id2);
             Ok(())
-        })?;
-        if let Err(e) = self.persist_sleepers() {
-            let _ = self.edit(|s| {
-                s.sleeping.push(sl.clone());
-                Ok(())
-            });
-            return Err(e);
-        }
+        })
+        .await?;
         let old: HashSet<String> = sl.panes.keys().cloned().collect();
         if let Ok(tasks) = self.bus.tasks(false) {
             for t in tasks.iter().filter(|t| {

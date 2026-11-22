@@ -171,6 +171,28 @@ impl AutoCheck {
         }
         let working = working_panes(d)?;
         let session = d.session();
+        // A question asked by an agent in it, also after it was checked.
+        let names: Vec<String> = d
+            .bus
+            .agents()
+            .map_err(|e| format!("bus: {e:#}"))?
+            .into_iter()
+            .filter(|a| {
+                a.pane
+                    .as_deref()
+                    .and_then(|p| p.strip_prefix("orch:"))
+                    .is_some_and(|p| {
+                        session
+                            .workspace(ws_id)
+                            .is_some_and(|w| w.tabs.iter().any(|t| t.root.contains(p)))
+                    })
+            })
+            .map(|a| a.name)
+            .collect();
+        let questions = d.bus.questions(false).map_err(|e| format!("bus: {e:#}"))?;
+        if questions.iter().any(|q| names.contains(&q.from)) {
+            return Err("an agent in it asked a question".into());
+        }
         // The sleep asking holds the workspace's reservation itself.
         let (sig, active) = sample(d, &session, ws_id, &working, true)?;
         if active {

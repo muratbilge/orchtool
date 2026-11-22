@@ -375,11 +375,95 @@ pub(crate) struct Spawned {
     /// old pane id → new pane
     pub ids: HashMap<String, Arc<Pane>>,
     pub failed: Vec<String>,
+    /// Of those, the panes whose record exists but whose start failed (retryable).
+    pub errors: Vec<String>,
     /// Agents (claude / codex) started again.
     pub resumed: usize,
 }
 
+/// The panes in `errors` (records exist, start failed) as a layout of their own: their
+/// workspaces pruned to them, ids and labels as they were.
+fn unrestored_of(
+    original: &[Workspace],
+    errors: &[String],
+    panes: &HashMap<String, SavedPane>,
+    next_id: u64,
+) -> Option<Saved> {
+    if errors.is_empty() {
+        return None;
+    }
+    let keep: HashMap<String, String> = errors.iter().map(|p| (p.clone(), p.clone())).collect();
+    Some(Saved {
+        session: Session {
+            workspaces: original
+                .iter()
+                .filter_map(|w| crate::sleep::mapped(w, &keep))
+                .collect(),
+            next_id,
+            ..Default::default()
+        },
+        panes: errors
+            .iter()
+            .filter_map(|p| panes.get(p).map(|sp| (p.clone(), sp.clone())))
+            .collect(),
+    })
+}
+
 impl Daemon {
+    /// A layout kept because its panes could not be started before (`unrestored-*.json`):
+    /// added to the running layout (ids / labels taken meanwhile are renumbered). Returns how
+    /// many came back and what still could not be started.
+    pub fn restore_more(self: &Arc<Self>, mut saved: Saved) -> (usize, Option<Saved>) {
+        {
+            let s = self.session.lock().unwrap();
+            let used_ws: std::collections::HashSet<String> = s
+                .workspaces
+                .iter()
+                .map(|w| w.id.clone())
+                .chain(s.sleeping.iter().map(|x| x.workspace.id.clone()))
+                .collect();
+            let used_tabs: std::collections::HashSet<String> = s
+                .workspaces
+                .iter()
+                .chain(s.sleeping.iter().map(|x| &x.workspace))
+                .flat_map(|w| w.tabs.iter().map(|t| t.id.clone()))
+                .collect();
+            drop(s);
+            let _ = self.edit(|s| {
+                for w in &mut saved.session.workspaces {
+                    if used_ws.contains(&w.id) {
+                        w.id = s.new_id("w");
+                    }
+                    for t in &mut w.tabs {
+                        if used_tabs.contains(&t.id) {
+                            t.id = s.new_id("t");
+                        }
+                    }
+                    if s.label_taken(&w.label, None) {
+                        let base = w.label.clone();
+                        let mut n = 2;
+                        while s.label_taken(&format!("{base}-{n}"), None) {
+                            n += 1;
+                        }
+                        w.label = format!("{base}-{n}");
+                    }
+                }
+                Ok(())
+            });
+        }
+        let original = saved.session.workspaces.clone();
+        let spawned = self.spawn_saved(std::mem::take(&mut saved.session.workspaces), &saved.panes);
+        let count = spawned.ids.len();
+        let next = self.session().next_id;
+        let unrestored = unrestored_of(&original, &spawned.errors, &saved.panes, next);
+        let _ = self.edit(|s| {
+            s.workspaces.extend(spawned.workspaces.iter().cloned());
+            Ok(())
+        });
+        let _ = self.ui_events.send(crate::ui::UiEvent::Panes);
+        (count, unrestored)
+    }
+
     /// Starts every pane of `workspaces` again from `panes` (keyed by the old pane ids) and
     /// maps the layout onto the new panes. Running tasks follow their pane.
     pub(crate) fn spawn_saved(
@@ -390,6 +474,7 @@ impl Daemon {
         let mut ids: HashMap<String, Arc<Pane>> = HashMap::new();
         let mut resumed = 0;
         let mut failed: Vec<String> = Vec::new();
+        let mut errors: Vec<String> = Vec::new();
         for ws in &workspaces {
             for tab in &ws.tabs {
                 for old in tab.root.panes() {
@@ -429,6 +514,7 @@ impl Daemon {
                         }
                         Err(e) => {
                             eprintln!("orchd: restore {old}: {}", e.message);
+                            errors.push(old.clone());
                             failed.push(old);
                         }
                     }
@@ -460,6 +546,7 @@ impl Daemon {
             workspaces: session.workspaces,
             ids,
             failed,
+            errors,
             resumed,
         }
     }
@@ -471,6 +558,8 @@ impl Daemon {
 
     /// `log`: explain panes without a verified Codex id (not for the autosave, every minute).
     pub(crate) fn snapshot(&self, log: bool) -> Saved {
+        // Not while a sleeper change is being written (see `commit`).
+        let _gate = self.publish_gate.read().unwrap();
         let mut session = self.session.lock().unwrap().clone();
         // Sleeping workspaces have their own record (sleepstore.rs); the layout files, which an
         // older orchd also reads and rewrites, never carry them.
@@ -493,18 +582,29 @@ impl Daemon {
     }
 
     pub fn save_layout(&self, path: &Path) -> std::io::Result<()> {
+        if crate::fault::on("layout_save") {
+            return Err(std::io::Error::other("injected layout save failure"));
+        }
         write_atomic(path, &layout_bytes(&self.snapshot_layout())?)
     }
 
     /// Recreates a saved layout with new panes. Panes whose program can't start are left out
-    /// (their tab / workspace collapses if nothing is left). Returns how many came back.
-    pub fn restore_layout(self: &Arc<Self>, mut saved: Saved, source: Source) -> usize {
+    /// (their tab / workspace collapses if nothing is left). Returns how many came back, and
+    /// the panes that could not be started as a layout of their own (their workspaces pruned
+    /// to them): the caller keeps that before it lets go of the file it restored from.
+    pub fn restore_layout(
+        self: &Arc<Self>,
+        mut saved: Saved,
+        source: Source,
+    ) -> (usize, Option<Saved>) {
         mark_sole_codex(&mut saved.panes);
         let mut session = saved.session;
         // Sleepers come from their own record (reconciled before this), never from here.
         session.sleeping.clear();
         let had_panes = !session.workspaces.is_empty();
+        let original = session.workspaces.clone();
         let spawned = self.spawn_saved(std::mem::take(&mut session.workspaces), &saved.panes);
+        let unrestored = unrestored_of(&original, &spawned.errors, &saved.panes, session.next_id);
         let resumed = spawned.resumed;
         let mut pending = Vec::new();
         for (old, p) in &spawned.ids {
@@ -549,7 +649,7 @@ impl Daemon {
         let _ = self.ui_events.send(crate::ui::UiEvent::Panes);
         // Only sleeping workspaces were saved (a plain stop-daemon keeps them): nothing to report.
         if !had_panes {
-            return count;
+            return (count, unrestored);
         }
         let daemon = Arc::clone(self);
         tokio::spawn(async move {
@@ -584,7 +684,7 @@ impl Daemon {
                 eprintln!("orchd: restart summary: {e}");
             }
         });
-        count
+        (count, unrestored)
     }
 }
 

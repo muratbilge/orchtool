@@ -241,19 +241,96 @@ fn keep_panes_that_just_died(
 /// else the autosave from an unplanned stop, guarded against a restore loop.
 pub fn restore_at_start(daemon: &Arc<Daemon>, dir: &Path) {
     // Sleeping workspaces first: they decide which saved workspaces must not come back awake.
-    let mut sleepers = daemon.load_sleepers();
+    let sleepers = daemon.load_sleepers();
     // In the layout at once: from the first moment their panes count as asleep (their open
     // questions must not expire while the rest starts).
     daemon.preload_sleepers(&sleepers);
+    let mut sleepers = Some(sleepers);
     restore_awake(daemon, dir, &mut sleepers);
-    daemon.install_sleepers(sleepers);
+    if let Some(sl) = sleepers.take() {
+        if let Err(e) = daemon.install_sleepers(sl) {
+            eprintln!("orchd: {}", e.message);
+        }
+    }
+    retry_unrestored(daemon, dir);
 }
 
-fn restore_awake(daemon: &Arc<Daemon>, dir: &Path, sleepers: &mut crate::sleep::Sleepers) {
+/// Panes that could not be started are kept in a file of their own (`unrestored-*.json`, never
+/// written by an older orchd or by the autosave) and tried again at every start.
+pub const UNRESTORED: &str = "unrestored-";
+
+fn keep_unrestored(dir: &Path, saved: &crate::restore::Saved) -> std::io::Result<PathBuf> {
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis());
+    let mut n = 0;
+    let path = loop {
+        let p = dir.join(format!("{UNRESTORED}{ms}-{n}.json"));
+        if !p.exists() {
+            break p;
+        }
+        n += 1;
+    };
+    let data = crate::restore::layout_bytes(saved).map_err(std::io::Error::from)?;
+    crate::restore::write_atomic(&path, &data)?;
+    Ok(path)
+}
+
+/// After a layout was restored from `source` (renamed to its loop-guard name already): the
+/// source goes only once nothing in it can be lost any more: the sleepers taken from it are
+/// in their record, the panes that could not be started are in an `unrestored-*` file, and
+/// the restored layout is in the autosave. Otherwise it is kept as `failed`.
+fn finish(
+    daemon: &Arc<Daemon>,
+    dir: &Path,
+    source: &Path,
+    failed: &Path,
+    sleepers: &mut Option<crate::sleep::Sleepers>,
+    unrestored: Option<crate::restore::Saved>,
+) {
+    let keep = |why: String| {
+        let _ = std::fs::rename(source, failed);
+        eprintln!(
+            "orchd: {why}; the layout file is kept as {}",
+            failed.display()
+        );
+    };
+    if let Some(sl) = sleepers.take() {
+        if let Err(e) = daemon.install_sleepers(sl) {
+            return keep(e.message);
+        }
+    }
+    if let Some(u) = unrestored {
+        match keep_unrestored(dir, &u) {
+            Ok(p) => eprintln!(
+                "orchd: {} pane(s) could not be started; kept in {} and tried again at the next start",
+                u.panes.len(),
+                p.display()
+            ),
+            Err(e) => return keep(format!("keeping the panes that did not start failed: {e}")),
+        }
+    }
+    if let Err(e) = daemon.autosave_sync() {
+        return keep(format!("saving the restored layout failed: {e}"));
+    }
+    let _ = std::fs::remove_file(source);
+}
+
+fn restore_awake(daemon: &Arc<Daemon>, dir: &Path, sleepers: &mut Option<crate::sleep::Sleepers>) {
     let restart = dir.join("restore.json");
+    let restart_marker = dir.join("restore.json.restoring");
+    let restart_failed = dir.join("restore.json.failed");
     let auto = dir.join(FILE);
     let marker = dir.join(RESTORING);
     let failed = dir.join(FAILED);
+    // An orchd that died while restoring a planned restart: not again (kept for inspection).
+    if restart_marker.exists() {
+        let _ = std::fs::rename(&restart_marker, &restart_failed);
+        eprintln!(
+            "orchd: the last restore from restore.json did not finish; not restoring it again (kept as {})",
+            restart_failed.display()
+        );
+    }
     let loop_guard = marker.exists();
     if loop_guard {
         let _ = std::fs::rename(&marker, &failed);
@@ -262,18 +339,42 @@ fn restore_awake(daemon: &Arc<Daemon>, dir: &Path, sleepers: &mut crate::sleep::
             failed.display()
         );
     }
-    if let Ok(data) = std::fs::read(&restart) {
-        // Read once: a layout that makes orchd fail must not come back on every start.
-        let _ = std::fs::remove_file(&restart);
+    if restart.exists() {
+        // Read once: a layout that makes orchd fail must not come back on every start. Kept
+        // under the marker name until it is no longer needed (see `finish`).
+        if let Err(e) = std::fs::rename(&restart, &restart_marker) {
+            eprintln!("orchd: not restoring {}: {e}", restart.display());
+            return;
+        }
         // The planned restart is newer than any autosave.
         let _ = std::fs::remove_file(&auto);
-        match serde_json::from_slice::<crate::restore::Saved>(&data) {
+        match std::fs::read(&restart_marker)
+            .map_err(|e| e.to_string())
+            .and_then(|d| {
+                serde_json::from_slice::<crate::restore::Saved>(&d).map_err(|e| e.to_string())
+            }) {
             Ok(mut saved) => {
-                daemon.reconcile_sleepers(sleepers, Some(&mut saved));
-                let n = daemon.restore_layout(saved, Source::Restart);
+                if let Some(sl) = sleepers.as_mut() {
+                    daemon.reconcile_sleepers(sl, Some(&mut saved));
+                }
+                let (n, unrestored) = daemon.restore_layout(saved, Source::Restart);
                 eprintln!("orchd: restored the layout with {n} pane(s) from restore.json (planned restart)");
+                finish(
+                    daemon,
+                    dir,
+                    &restart_marker,
+                    &restart_failed,
+                    sleepers,
+                    unrestored,
+                );
             }
-            Err(e) => eprintln!("orchd: ignoring {}: {e}", restart.display()),
+            Err(e) => {
+                let _ = std::fs::rename(&restart_marker, &restart_failed);
+                eprintln!(
+                    "orchd: ignoring restore.json: {e} (kept as {})",
+                    restart_failed.display()
+                );
+            }
         }
         return;
     }
@@ -290,17 +391,70 @@ fn restore_awake(daemon: &Arc<Daemon>, dir: &Path, sleepers: &mut crate::sleep::
             serde_json::from_slice::<crate::restore::Saved>(&d).map_err(|e| e.to_string())
         }) {
         Ok(mut saved) => {
-            daemon.reconcile_sleepers(sleepers, Some(&mut saved));
-            let n = daemon.restore_layout(saved, Source::Recovery);
-            let _ = std::fs::remove_file(&marker);
+            if let Some(sl) = sleepers.as_mut() {
+                daemon.reconcile_sleepers(sl, Some(&mut saved));
+            }
+            let (n, unrestored) = daemon.restore_layout(saved, Source::Recovery);
             eprintln!(
                 "orchd: restored the layout with {n} pane(s) from {FILE} (recovery after an unplanned stop)"
             );
+            finish(daemon, dir, &marker, &failed, sleepers, unrestored);
         }
         Err(e) => {
             let _ = std::fs::rename(&marker, &failed);
             eprintln!("orchd: ignoring {FILE}: {e} (kept as {})", failed.display());
         }
+    }
+}
+
+/// Start-up, last: every `unrestored-*` file is tried again; each goes only once what came
+/// back is in the autosave and what still did not start is in a new file.
+fn retry_unrestored(daemon: &Arc<Daemon>, dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut files: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with(UNRESTORED) && n.ends_with(".json"))
+        })
+        .collect();
+    files.sort();
+    for f in files {
+        let saved = match std::fs::read(&f).map_err(|e| e.to_string()).and_then(|d| {
+            serde_json::from_slice::<crate::restore::Saved>(&d).map_err(|e| e.to_string())
+        }) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("orchd: {} is not usable ({e}); left alone", f.display());
+                continue;
+            }
+        };
+        let (n, still) = daemon.restore_more(saved);
+        let mut successor = None;
+        if let Some(u) = still {
+            match keep_unrestored(dir, &u) {
+                Ok(p) => successor = Some(p),
+                Err(e) => {
+                    eprintln!("orchd: keeping {} failed: {e}; it stays", f.display());
+                    continue;
+                }
+            }
+        }
+        if let Err(e) = daemon.autosave_sync() {
+            eprintln!(
+                "orchd: saving the layout failed ({e}); {} stays",
+                f.display()
+            );
+            if let Some(p) = successor {
+                let _ = std::fs::remove_file(p);
+            }
+            continue;
+        }
+        eprintln!("orchd: {n} pane(s) of {} came back", f.display());
+        let _ = std::fs::remove_file(&f);
     }
 }
 

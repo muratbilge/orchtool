@@ -176,13 +176,10 @@ impl Daemon {
             | UiOp::ToggleZoom { pane } => of_pane(pane),
             _ => None,
         };
-        if target.is_some_and(|id| self.ws_in_transition(&id)) {
-            return Err(err(
-                "ws_transition",
-                "that workspace is going to sleep or waking; try again",
-            ));
+        match target {
+            Some(id) => self.admit_ws(&id),
+            None => Ok(()),
         }
-        Ok(())
     }
 
     pub async fn ui_op(self: &Arc<Self>, op: UiOp) -> Result<Value, ApiError> {
@@ -266,7 +263,9 @@ impl Daemon {
                 };
                 self.close_panes(panes).await?;
             }
-            UiOp::CloseWorkspace { workspace } if self.forget_sleeping(&workspace)? => {}
+            UiOp::CloseWorkspace { workspace } if self.session().sleeping(&workspace).is_some() => {
+                self.forget_sleeping(&workspace).await?;
+            }
             UiOp::SleepWorkspace {
                 workspace,
                 force,

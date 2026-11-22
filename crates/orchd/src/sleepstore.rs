@@ -15,6 +15,7 @@
 use orch_proto::layout::Sleeping;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 pub const SLOTS: [&str; 2] = ["sleeping.a.json", "sleeping.b.json"];
@@ -40,10 +41,40 @@ pub struct State {
     generation: u64,
     /// Slot index holding `generation`.
     newest: usize,
+    /// Why the record must not be written (a slot that exists but can't be read, or is in a
+    /// format this orchd does not know): writing could overwrite the only good copy.
+    blocked: Option<String>,
+}
+
+/// A failed write. `published`: the new slot was renamed into place (it may be what the next
+/// start reads), so the caller must supersede it with the state it keeps.
+#[derive(Debug)]
+pub struct WriteError {
+    pub published: bool,
+    pub error: std::io::Error,
+}
+
+impl std::fmt::Display for WriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(f)
+    }
 }
 
 fn fsync_dir(dir: &Path) -> std::io::Result<()> {
     std::fs::File::open(dir)?.sync_all()
+}
+
+/// What `load` found.
+pub enum Loaded {
+    /// No slot at all (a fresh installation).
+    Missing,
+    /// The newest readable record; `problem` names a slot that exists but was not usable.
+    Found {
+        record: Record,
+        problem: Option<String>,
+    },
+    /// Slots exist, none usable.
+    Unusable(String),
 }
 
 impl Store {
@@ -51,21 +82,28 @@ impl Store {
         let _ = self.dir.set(dir);
     }
 
-    /// The newest valid record, or None (no file, or none readable: unreadable files are kept
-    /// as they are and reported).
-    pub fn load(&self) -> Option<Record> {
-        let dir = self.dir.get()?;
+    /// Reads both slots. A slot that exists but can't be read or has an unknown format is
+    /// left alone **and blocks writes** (it may be the newest generation, or a newer orchd's):
+    /// sleep and wake then fail with `save_failed` until it is moved away.
+    pub fn load(&self) -> Loaded {
+        let Some(dir) = self.dir.get() else {
+            return Loaded::Missing;
+        };
         let mut best: Option<(usize, Record)> = None;
+        let mut problems = Vec::new();
+        let mut any = false;
         for (i, name) in SLOTS.iter().enumerate() {
             let path = dir.join(name);
             let data = match std::fs::read(&path) {
                 Ok(d) => d,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(e) => {
-                    eprintln!("orchd: reading {}: {e}", path.display());
+                    any = true;
+                    problems.push(format!("{} can't be read: {e}", path.display()));
                     continue;
                 }
             };
+            any = true;
             match serde_json::from_slice::<Record>(&data) {
                 Ok(r) if r.format == FORMAT => {
                     if best
@@ -75,22 +113,29 @@ impl Store {
                         best = Some((i, r));
                     }
                 }
-                Ok(r) => eprintln!(
-                    "orchd: {} has format {} (this orchd reads {FORMAT}); left alone",
+                Ok(r) => problems.push(format!(
+                    "{} has format {} (this orchd reads {FORMAT})",
                     path.display(),
                     r.format
-                ),
-                Err(e) => eprintln!(
-                    "orchd: {} is not readable ({e}); left alone",
-                    path.display()
-                ),
+                )),
+                Err(e) => problems.push(format!("{} is damaged ({e})", path.display())),
             }
         }
-        let (i, r) = best?;
+        let problem = (!problems.is_empty()).then(|| problems.join("; "));
         let mut st = self.state.lock().unwrap();
-        st.generation = r.generation;
-        st.newest = i;
-        Some(r)
+        if let Some(p) = &problem {
+            eprintln!("orchd: sleeping-workspace record: {p}; left alone, no writes until it is moved away");
+            st.blocked = Some(p.clone());
+        }
+        match best {
+            Some((i, record)) => {
+                st.generation = record.generation;
+                st.newest = i;
+                Loaded::Found { record, problem }
+            }
+            None if any => Loaded::Unusable(problem.unwrap_or_default()),
+            None => Loaded::Missing,
+        }
     }
 
     /// The store's lock: hold it while reading the state to write, then `write`.
@@ -105,12 +150,22 @@ impl Store {
         st: &mut State,
         sleeping: &[Sleeping],
         next_id: u64,
-    ) -> std::io::Result<()> {
+    ) -> Result<(), WriteError> {
+        let fail = |published, error| Err(WriteError { published, error });
         let Some(dir) = self.dir.get() else {
-            return Err(std::io::Error::other("no folder for the sleeper record"));
+            return fail(
+                false,
+                std::io::Error::other("no folder for the sleeper record"),
+            );
         };
+        if let Some(why) = &st.blocked {
+            return fail(false, std::io::Error::other(format!("not written: {why}")));
+        }
+        if let Some(ms) = crate::fault::value("store_slow_ms").and_then(|v| v.parse().ok()) {
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+        }
         if crate::fault::on("store_write") {
-            return Err(std::io::Error::other("injected store write failure"));
+            return fail(false, std::io::Error::other("injected store write failure"));
         }
         let record = Record {
             format: FORMAT,
@@ -118,13 +173,43 @@ impl Store {
             next_id,
             sleeping: sleeping.to_vec(),
         };
-        let data = serde_json::to_vec_pretty(&record).map_err(std::io::Error::from)?;
+        let data = match serde_json::to_vec_pretty(&record) {
+            Ok(d) => d,
+            Err(e) => return fail(false, e.into()),
+        };
         let slot = 1 - st.newest;
         let path = dir.join(SLOTS[slot]);
-        crate::restore::write_atomic(&path, &data)?;
-        fsync_dir(dir)?;
+        let tmp = path.with_extension("json.new");
+        let written = (|| {
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)?;
+            std::io::Write::write_all(&mut f, &data)?;
+            f.sync_all()
+        })();
+        if let Err(e) = written {
+            return fail(false, e);
+        }
+        if let Err(e) = std::fs::rename(&tmp, &path) {
+            return fail(false, e);
+        }
+        // From here the new slot is visible: whatever happens, it is the newest generation.
         st.generation = record.generation;
         st.newest = slot;
+        if crate::fault::on("store_after_rename_once")
+            && !AFTER_RENAME_FIRED.swap(true, Ordering::SeqCst)
+        {
+            return fail(true, std::io::Error::other("injected failure after rename"));
+        }
+        if let Err(e) = fsync_dir(dir) {
+            return fail(true, e);
+        }
         Ok(())
     }
 }
+
+static AFTER_RENAME_FIRED: AtomicBool = AtomicBool::new(false);

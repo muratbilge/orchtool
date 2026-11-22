@@ -63,7 +63,10 @@ pub struct Daemon {
     pub sleep_store: crate::sleepstore::Store,
     /// Workspaces going to sleep or waking right now (by id): no layout change, input, task or
     /// nudge reaches them, and no second transition starts. A leaf lock.
-    pub(crate) transitions: Mutex<std::collections::HashSet<String>>,
+    pub(crate) transitions: Mutex<HashMap<String, crate::sleep::Transit>>,
+    /// Held (write) while a sleeper change is written and published; snapshots of the
+    /// layout take it (read), so no saved layout shows a change that is not yet durable.
+    pub(crate) publish_gate: std::sync::RwLock<()>,
     /// Usage-limit continuations still due after a wake: pane → reset (unix seconds).
     pub(crate) deferred: Mutex<HashMap<String, i64>>,
 }
@@ -104,6 +107,7 @@ impl Daemon {
             auto_sleep: Default::default(),
             sleep_store: Default::default(),
             transitions: Default::default(),
+            publish_gate: Default::default(),
             deferred: Default::default(),
         })
     }
@@ -319,9 +323,17 @@ impl Daemon {
                 .unwrap();
                 // Only on request: the task's workspace sleeps → wake it (the task is queued
                 // either way and dispatches as usual once an agent is back).
+                // The workspace the task validation resolved (task targets are labels): the
+                // sleeper with that label, by its id, never another one by id-first lookup.
                 let (label, _) = crate::tasks::parts(&target);
-                if wake && self.session().sleeping(label).is_some() {
-                    self.wake_into(&mut v, label).await;
+                let asleep = self
+                    .session()
+                    .sleeping
+                    .iter()
+                    .find(|s| s.workspace.label == label)
+                    .map(|s| s.workspace.id.clone());
+                if let (true, Some(id)) = (wake, asleep) {
+                    self.wake_into(&mut v, &id).await;
                 }
                 Ok(v)
             }
@@ -448,10 +460,18 @@ impl Daemon {
             }
             Request::StopDaemon { restart } => {
                 // Not in the middle of a sleep or wake (their own records stay consistent, but
-                // a half-done transition is better finished first).
-                self.stopping_soon.store(true, Ordering::SeqCst);
+                // a half-done transition is better finished first). The flag is set and the
+                // reservations are looked at under the lock `reserve` admits under: nothing
+                // starts after this saw none running.
                 let mut waited = 0;
-                while !self.transitions.lock().unwrap().is_empty() {
+                loop {
+                    {
+                        let t = self.transitions.lock().unwrap();
+                        self.stopping_soon.store(true, Ordering::SeqCst);
+                        if t.is_empty() {
+                            break;
+                        }
+                    }
                     if waited >= 200 {
                         self.stopping_soon.store(false, Ordering::SeqCst);
                         return Err(err(
@@ -465,13 +485,15 @@ impl Daemon {
                 // Saved while every pane still runs, before anything stops: if saving fails,
                 // nothing is killed and the caller hears why.
                 if restart {
-                    let path = self
-                        .restore_path
-                        .get()
-                        .ok_or_else(|| err("save_failed", "no place to save the layout"))?;
-                    self.save_layout(path).map_err(|e| {
-                        err("save_failed", format!("saving the layout failed: {e}"))
-                    })?;
+                    let saved = match self.restore_path.get() {
+                        Some(path) => self.save_layout(path),
+                        None => Err(std::io::Error::other("no place to save the layout")),
+                    };
+                    if let Err(e) = saved {
+                        // orchd keeps running: sleeps and wakes are allowed again.
+                        self.stopping_soon.store(false, Ordering::SeqCst);
+                        return Err(err("save_failed", format!("saving the layout failed: {e}")));
+                    }
                 } else {
                     // "End everything": the next orchd starts with no panes. Sleeping
                     // workspaces live in their own record (sleepstore.rs), which this leaves alone.
@@ -694,7 +716,12 @@ async fn connection(stream: UnixStream, daemon: Arc<Daemon>) -> std::io::Result<
             }
         };
         if let Request::Attach(a) = req {
-            let pane = match daemon.find(&a.pane) {
+            // A viewer arriving stops an automatic sleep that has not committed, and is refused
+            // during any other transition of its workspace.
+            let pane = match daemon
+                .find(&a.pane)
+                .and_then(|p| daemon.admit(&p.id).map(|_| p))
+            {
                 Ok(p) => p,
                 Err(e) => {
                     reply(&mut writer, &frame.id, Err(e)).await?;

@@ -68,7 +68,6 @@ async fn main() -> anyhow::Result<()> {
     let bus = Arc::new(Bus::open(&db)?);
     let daemon = Daemon::new(scrollback, Arc::clone(&bus));
     start_nudger(Arc::clone(&daemon));
-    orchd::ui::start_detector(Arc::clone(&daemon));
     orchd::limits::start(Arc::clone(&daemon));
     // Before the restore: a SIGTERM while it runs waits for it (then saves the restored
     // layout) instead of killing orchd half-way, which would leave the loop-guard marker.
@@ -83,6 +82,9 @@ async fn main() -> anyhow::Result<()> {
     daemon.autosave.set_path(dir.join(orchd::autosave::FILE));
     daemon.sleep_store.set_dir(dir.clone());
     orchd::autosave::restore_at_start(&daemon, &dir);
+    // After the sleepers are loaded and reconciled: its first question sweep must not see a
+    // sleeper's pane as gone.
+    orchd::ui::start_detector(Arc::clone(&daemon));
     orchd::autosave::start(Arc::clone(&daemon));
     orchd::tasks::start(Arc::clone(&daemon));
     orchd::autosleep::start(Arc::clone(&daemon));
