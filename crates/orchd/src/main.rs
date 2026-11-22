@@ -84,6 +84,7 @@ async fn main() -> anyhow::Result<()> {
     orchd::autosave::restore_at_start(&daemon, &dir);
     orchd::autosave::start(Arc::clone(&daemon));
     orchd::tasks::start(Arc::clone(&daemon));
+    orchd::autosleep::start(Arc::clone(&daemon));
     let server = tokio::spawn(serve(listener, Arc::clone(&daemon)));
     let signalled = loop {
         tokio::select! {

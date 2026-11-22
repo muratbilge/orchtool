@@ -34,6 +34,7 @@ fn spawn_orchd(dir: &Path, socket: &Path) -> Child {
         .env("ORCHD_AUTOSAVE_DEBOUNCE_MS", "100")
         .env("ORCHD_AUTOSAVE_INTERVAL_MS", "200")
         .env("ORCHD_TASK_IDLE_MS", "300")
+        .env("ORCHD_AUTO_SLEEP_TICK_MS", "100")
         .spawn()
         .unwrap()
 }
@@ -583,6 +584,7 @@ async fn mail_tasks_and_questions_wait_for_a_sleeping_agent() {
             to: "proj-claude".into(),
             text: "please check the logs".into(),
             thread: None,
+            wake: false,
         }),
     )
     .await
@@ -594,6 +596,7 @@ async fn mail_tasks_and_questions_wait_for_a_sleeping_agent() {
             text: "run the tests".into(),
             created_by: "murat".into(),
             after: None,
+            wake: false,
         },
     )
     .await
@@ -746,4 +749,295 @@ async fn an_agent_can_put_its_own_workspace_to_sleep() {
     // It comes back as a plain shell (the -c program is not run again).
     let sl = &s.sleeping[0];
     assert_eq!(sl.panes[&pane].saved.argv, vec!["sh".to_string()]);
+}
+
+fn fake_codex(d: &D, role: &str) -> String {
+    let program = d.dir.join(role).join("fake-codex");
+    std::fs::create_dir_all(program.parent().unwrap()).unwrap();
+    std::fs::write(&program, FAKE).unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+    program.to_string_lossy().into_owned()
+}
+
+/// Murat (2026-11-22): a Codex without a verified session id comes back at its picker after a
+/// wake, never `resume --last`, even when it is the only Codex in its folder.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_without_a_session_id_wakes_at_its_picker() {
+    let d = daemon("codex").await;
+    let program = fake_codex(&d, "codex");
+    let v = op(
+        &d,
+        UiOp::NewWorkspace {
+            label: Some("cx".into()),
+            spawn: spawn(&[program]),
+        },
+    )
+    .await;
+    let pane = v["pane"]["id"].as_str().unwrap().to_string();
+    req(
+        &d,
+        Request::RegisterAgent(RegisterAgent {
+            kind: "codex".into(),
+            pane: Some(format!("orch:{pane}")),
+            name: Some("cx-codex".into()),
+            cwd: None,
+            instance: None,
+        }),
+    )
+    .await
+    .unwrap();
+    wait_for("codex started", || {
+        read(&d, "codex", "args").lines().count() == 1
+    })
+    .await;
+    let v = op(
+        &d,
+        UiOp::SleepWorkspace {
+            workspace: "cx".into(),
+            force: false,
+            dry_run: false,
+        },
+    )
+    .await;
+    assert!(
+        v["plan"]["notes"].to_string().contains("resume picker"),
+        "{v}"
+    );
+    let s = session(&d).await;
+    assert!(
+        !s.sleeping("cx").unwrap().panes[&pane]
+            .saved
+            .sole_codex_in_cwd
+    );
+    op(
+        &d,
+        UiOp::WakeWorkspace {
+            workspace: "cx".into(),
+        },
+    )
+    .await;
+    wait_for("codex resumed", || {
+        read(&d, "codex", "args").lines().count() == 2
+    })
+    .await;
+    assert_eq!(read(&d, "codex", "args").lines().nth(1), Some("resume"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mail_and_tasks_wake_a_workspace_only_on_request() {
+    let d = daemon("wakeflag").await;
+    let (ws, _agent, _sh) = proj(&d).await;
+    let asleep = |s: &Session| s.sleeping("proj").is_some();
+    op(
+        &d,
+        UiOp::SleepWorkspace {
+            workspace: ws.clone(),
+            force: false,
+            dry_run: false,
+        },
+    )
+    .await;
+    // Without --wake: kept, still asleep.
+    assert!(orch_cli(&d, &["msg", "proj-claude", "later"])
+        .status
+        .success());
+    assert!(orch_cli(&d, &["task", "add", "proj", "later too"])
+        .status
+        .success());
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(asleep(&session(&d).await));
+    // A broadcast never wakes anything: refused, nothing sent.
+    let out = orch_cli(&d, &["msg", "--wake", "all", "everyone up"]);
+    assert!(!out.status.success(), "{out:?}");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("all"));
+    let log = req(
+        &d,
+        Request::Log {
+            after: None,
+            limit: Some(100),
+            follow: false,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(!log.to_string().contains("everyone up"));
+    assert!(asleep(&session(&d).await));
+    // A message with --wake wakes the addressed agent's workspace; it is told to read it.
+    let out = orch_cli(&d, &["msg", "--wake", "proj-claude", "now please"]);
+    assert!(out.status.success(), "{out:?}");
+    assert!(String::from_utf8_lossy(&out.stdout).contains("woke proj"));
+    assert!(!asleep(&session(&d).await));
+    wait_for("told about its mail", || {
+        read(&d, "idle", "received").contains("read_inbox")
+    })
+    .await;
+    // The queued task runs once it is awake.
+    wait_for("the earlier task runs", || {
+        read(&d, "idle", "received").contains("later too")
+    })
+    .await;
+    // A task with --wake wakes its workspace too.
+    op(
+        &d,
+        UiOp::SleepWorkspace {
+            workspace: ws.clone(),
+            force: true,
+            dry_run: false,
+        },
+    )
+    .await;
+    assert!(asleep(&session(&d).await));
+    let out = orch_cli(&d, &["task", "add", "proj", "--wake", "run the tests"]);
+    assert!(out.status.success(), "{out:?}");
+    assert!(!asleep(&session(&d).await));
+}
+
+async fn attach(
+    d: &D,
+    pane: &str,
+) -> (
+    orch_proto::client::FrameReader,
+    orch_proto::client::FrameWriter,
+) {
+    let (mut reader, mut writer) = Conn::unix(&d.socket).await.unwrap().into_parts();
+    let r = Request::Attach(orch_proto::api::AttachPane {
+        pane: pane.into(),
+        mode: orch_proto::api::AttachMode::Observe,
+        rows: 20,
+        cols: 100,
+    });
+    writer
+        .send_body("a", serde_json::to_value(&r).unwrap())
+        .await
+        .unwrap();
+    reader.next().await.unwrap().unwrap();
+    (reader, writer)
+}
+
+async fn shell_ws(d: &D, label: &str) -> (String, String) {
+    let v = op(
+        d,
+        UiOp::NewWorkspace {
+            label: Some(label.into()),
+            spawn: spawn(&["bash".into(), "--norc".into()]),
+        },
+    )
+    .await;
+    let s: Session = serde_json::from_value(v["session"].clone()).unwrap();
+    let pane = v["pane"]["id"].as_str().unwrap().to_string();
+    let (wi, _) = s.locate(&pane).unwrap();
+    (s.workspaces[wi].id.clone(), pane)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn idle_workspaces_fall_asleep_but_not_busy_viewed_or_exempt_ones() {
+    let d = daemon("auto").await;
+    let out = orch_cli(&d, &["auto-sleep"]);
+    assert!(String::from_utf8_lossy(&out.stdout).contains("auto-sleep: off"));
+    shell_ws(&d, "quiet").await;
+    let (_, viewed) = shell_ws(&d, "viewed").await;
+    shell_ws(&d, "kept").await;
+    let program = fake(&d, "working");
+    let v = op(
+        &d,
+        UiOp::NewWorkspace {
+            label: Some("busy".into()),
+            spawn: spawn(&[program]),
+        },
+    )
+    .await;
+    let busy = v["pane"]["id"].as_str().unwrap().to_string();
+    register(&d, &busy, "busy-claude").await;
+    wait_status(&d, &busy, "working").await;
+    let viewer = attach(&d, &viewed).await;
+    assert!(orch_cli(&d, &["ws", "keep-awake", "kept", "on"])
+        .status
+        .success());
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let out = orch_cli(&d, &["auto-sleep", "1500ms"]);
+    assert!(out.status.success(), "{out:?}");
+    assert!(String::from_utf8_lossy(&out.stdout).contains("after 1500ms idle"));
+    // Not before a full period.
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    assert!(session(&d).await.sleeping.is_empty(), "too early");
+    for _ in 0..200 {
+        if session(&d).await.sleeping("quiet").is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let s = session(&d).await;
+    assert!(s.sleeping("quiet").is_some(), "idle: asleep");
+    for awake in ["viewed", "kept", "busy"] {
+        assert!(s.workspace(awake).is_some(), "{awake} must stay awake");
+    }
+    let log = req(
+        &d,
+        Request::Log {
+            after: None,
+            limit: Some(100),
+            follow: false,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        log.to_string()
+            .contains("quiet is asleep (auto-sleep: idle for 1500ms)"),
+        "{log}"
+    );
+    let watch = orch_cli(&d, &["watch", "--once"]);
+    let line: Value = serde_json::from_slice(&watch.stdout).unwrap();
+    assert_eq!(line["auto_sleep_ms"], 1500);
+    assert!(line["workspaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|w| w["label"] == "kept" && w["keep_awake"] == true));
+    // The viewer leaves: a full period later it sleeps too.
+    drop(viewer);
+    for _ in 0..200 {
+        if session(&d).await.sleeping("viewed").is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(session(&d).await.sleeping("viewed").is_some());
+    // Woken by hand: a fresh period, not straight back to sleep.
+    assert!(orch_cli(&d, &["ws", "wake", "quiet"]).status.success());
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert!(session(&d).await.workspace("quiet").is_some());
+    assert!(orch_cli(&d, &["auto-sleep", "off"]).status.success());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restart_gives_every_workspace_a_full_period() {
+    let mut d = daemon("autorestart").await;
+    shell_ws(&d, "a").await;
+    shell_ws(&d, "b").await;
+    assert!(orch_cli(&d, &["auto-sleep", "3s"]).status.success());
+    // Almost a full period idle, then a planned restart.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert!(session(&d).await.sleeping.is_empty());
+    assert!(orch_cli(&d, &["stop-daemon", "--restart"]).status.success());
+    d.child.wait().unwrap();
+    d.child = spawn_orchd(&d.dir, &d.socket);
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(
+        session(&d).await.sleeping.is_empty(),
+        "no sleep storm right after a start"
+    );
+    let out = orch_cli(&d, &["auto-sleep"]);
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("after 3s idle"),
+        "kept"
+    );
+    for _ in 0..400 {
+        if session(&d).await.sleeping.len() == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(session(&d).await.sleeping.len(), 2, "then they do sleep");
 }

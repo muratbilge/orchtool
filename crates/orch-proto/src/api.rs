@@ -22,6 +22,9 @@ pub enum Request {
         text: String,
         created_by: String,
         after: Option<i64>,
+        /// The target workspace sleeps: wake it (only on this request; never by itself).
+        #[serde(default)]
+        wake: bool,
     },
     #[serde(rename = "task.list")]
     TaskList {
@@ -68,6 +71,20 @@ pub enum Request {
     #[serde(rename = "pane.auto_continue")]
     AutoContinue {
         pane: String,
+        #[serde(default)]
+        on: Option<bool>,
+    },
+    /// Auto-sleep after idle time: set it (`ms`: 0 = off) and/or read it. Replies
+    /// `{ms, keep_awake: [workspace ids]}`.
+    #[serde(rename = "auto_sleep")]
+    AutoSleep {
+        #[serde(default)]
+        ms: Option<u64>,
+    },
+    /// Exempt a workspace from auto-sleep (`on`) and/or read it. Replies `{workspace, keep_awake}`.
+    #[serde(rename = "ws.keep_awake")]
+    KeepAwake {
+        workspace: String,
         #[serde(default)]
         on: Option<bool>,
     },
@@ -339,6 +356,9 @@ pub struct SendMessage {
     pub text: String,
     #[serde(default)]
     pub thread: Option<String>,
+    /// The addressed agent's workspace sleeps: wake it. Refused for "all".
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub wake: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -55,6 +55,8 @@ pub struct Daemon {
     pub restore_path: std::sync::OnceLock<std::path::PathBuf>,
     /// The layout kept on disk for an unplanned stop (`autosave.json`, set by main).
     pub autosave: crate::autosave::Autosave,
+    /// Auto-sleep's idle tracking (`autosleep.rs`).
+    pub(crate) auto_sleep: crate::autosleep::State,
 }
 
 #[derive(Debug)]
@@ -89,6 +91,7 @@ impl Daemon {
             shutdown: Notify::new(),
             restore_path: Default::default(),
             autosave: Default::default(),
+            auto_sleep: Default::default(),
         })
     }
 
@@ -179,6 +182,21 @@ impl Daemon {
         }
     }
 
+    /// Wakes `ws` for a request that asked for it; the outcome goes into the reply
+    /// (`woke`: its label, or `wake_error`), the request itself already succeeded.
+    async fn wake_into(self: &Arc<Self>, v: &mut Value, ws: &str) {
+        let d = Arc::clone(self);
+        let key = ws.to_string();
+        match tokio::spawn(async move { d.wake_workspace(&key).await }).await {
+            Ok(Ok(r)) => {
+                let id = r["workspace"].as_str().unwrap_or_default().to_string();
+                v["woke"] = json!(self.session().workspace(&id).map(|w| w.label.clone()));
+            }
+            Ok(Err(e)) => v["wake_error"] = json!(e.message),
+            Err(e) => v["wake_error"] = json!(e.to_string()),
+        }
+    }
+
     pub fn expire_questions(&self) -> anyhow::Result<usize> {
         let live = self
             .all_panes()
@@ -253,6 +271,7 @@ impl Daemon {
                 text,
                 created_by,
                 after,
+                wake,
             } => {
                 self.task_target(&target)?;
                 let text = text.replace("\r\n", "\n").replace('\r', "\n");
@@ -268,12 +287,19 @@ impl Daemon {
                         return Err(err("no_task", "unknown dependency"));
                     }
                 }
-                Ok(serde_json::to_value(
+                let mut v = serde_json::to_value(
                     self.bus
                         .task_add(&target, &text, &created_by, after)
                         .map_err(bus_err)?,
                 )
-                .unwrap())
+                .unwrap();
+                // Only on request: the task's workspace sleeps → wake it (the task is queued
+                // either way and dispatches as usual once an agent is back).
+                let (label, _) = crate::tasks::parts(&target);
+                if wake && self.session().sleeping(label).is_some() {
+                    self.wake_into(&mut v, label).await;
+                }
+                Ok(v)
             }
             Request::TaskList { all } => {
                 Ok(json!({"tasks": self.bus.tasks(all).map_err(bus_err)?}))
@@ -447,12 +473,61 @@ impl Daemon {
                 Ok(json!({ "agents": rows }))
             }
             Request::SendMessage(m) => {
+                if m.wake && orch_proto::api::normalize_name(&m.to) == "all" {
+                    return Err(err(
+                        "bad_request",
+                        "--wake is for one agent: a message to all never wakes every workspace (send without --wake)",
+                    ));
+                }
                 let row = self
                     .bus
                     .send(&m.from, &m.to, "msg", &m.text, m.thread.as_deref(), None)
                     .map_err(bus_err)?;
                 self.bus.touch(&row.from);
-                Ok(serde_json::to_value(row).unwrap())
+                let mut v = serde_json::to_value(&row).unwrap();
+                // After the message is stored: the wake note then counts it as unread.
+                if m.wake {
+                    let pane = self
+                        .bus
+                        .agent(&row.to)
+                        .map_err(bus_err)?
+                        .and_then(|a| a.pane)
+                        .and_then(|p| p.strip_prefix("orch:").map(str::to_string));
+                    let ws = pane.and_then(|p| {
+                        self.session()
+                            .sleeping
+                            .iter()
+                            .find(|s| s.workspace.tabs.iter().any(|t| t.root.contains(&p)))
+                            .map(|s| s.workspace.id.clone())
+                    });
+                    if let Some(ws) = ws {
+                        self.wake_into(&mut v, &ws).await;
+                    }
+                }
+                Ok(v)
+            }
+            Request::AutoSleep { ms } => {
+                if let Some(ms) = ms {
+                    self.set_auto_sleep(ms).map_err(bus_err)?;
+                }
+                Ok(json!({
+                    "ms": self.auto_sleep_ms(),
+                    "keep_awake": self.bus.kv_keys(crate::autosleep::KEEP_AWAKE).map_err(bus_err)?,
+                }))
+            }
+            Request::KeepAwake { workspace, on } => {
+                let s = self.session();
+                let id = s
+                    .workspace(&workspace)
+                    .or_else(|| s.sleeping(&workspace).map(|x| &x.workspace))
+                    .map(|w| w.id.clone())
+                    .ok_or_else(|| err("no_workspace", format!("no workspace {workspace:?}")))?;
+                let key = format!("{}{id}", crate::autosleep::KEEP_AWAKE);
+                if let Some(on) = on {
+                    self.bus.kv_set(&key, on.then_some("1")).map_err(bus_err)?;
+                }
+                let keep = self.bus.kv_get(&key).map_err(bus_err)?.is_some();
+                Ok(json!({ "workspace": id, "keep_awake": keep }))
             }
             Request::Inbox {
                 name,

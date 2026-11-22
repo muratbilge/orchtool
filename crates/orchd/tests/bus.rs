@@ -409,6 +409,7 @@ async fn claude_stop_hook_hands_over_unread_messages() {
         to: "carol".into(),
         text: "also update the changelog".into(),
         thread: None,
+        wake: false,
     }))
     .await
     .unwrap();
@@ -515,6 +516,7 @@ async fn msg(env: &Env, to: &str, text: &str) {
             to: to.into(),
             text: text.into(),
             thread: None,
+            wake: false,
         }))
         .await
         .unwrap();

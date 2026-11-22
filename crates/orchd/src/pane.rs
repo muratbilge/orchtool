@@ -33,6 +33,8 @@ pub struct Pane {
     master: Mutex<Box<dyn MasterPty + Send>>,
     input: mpsc::Sender<Vec<u8>>,
     queued: Arc<AtomicUsize>,
+    /// Inputs written so far (keys, pastes, sends): auto-sleep's "nothing typed into it".
+    inputs: AtomicU64,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     /// Bumped on every screen change.
     rev: watch::Sender<u64>,
@@ -113,6 +115,7 @@ impl Pane {
             master: Mutex::new(pair.master),
             input,
             queued: Arc::clone(&queued),
+            inputs: AtomicU64::new(0),
             killer: Mutex::new(child.clone_killer()),
             rev: watch::Sender::new(0),
             gen: AtomicU64::new(0),
@@ -193,7 +196,16 @@ impl Pane {
             self.queued.fetch_sub(len, Ordering::SeqCst);
             return false;
         }
+        self.inputs.fetch_add(1, Ordering::Relaxed);
         true
+    }
+
+    /// For auto-sleep: (inputs written so far, attached clients).
+    pub fn activity(&self) -> (u64, usize) {
+        (
+            self.inputs.load(Ordering::Relaxed),
+            self.clients.lock().unwrap().len(),
+        )
     }
 
     /// Resize PTY and parser together under the terminal lock, so the reader never parses

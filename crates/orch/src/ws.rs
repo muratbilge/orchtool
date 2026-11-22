@@ -47,6 +47,12 @@ pub enum WsCmd {
     },
     /// Wake a sleeping workspace: the layout comes back, agents resume their conversation
     Wake { workspace: String },
+    /// Exempt a workspace from auto-sleep (`orch auto-sleep`): on | off (without: show)
+    KeepAwake {
+        workspace: String,
+        #[arg(value_parser = ["on", "off"])]
+        state: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -255,6 +261,27 @@ pub async fn ws(c: &mut Conn, cmd: WsCmd) -> Result<()> {
             if let Some(failed) = v["failed"].as_array().filter(|f| !f.is_empty()) {
                 eprintln!("orch: {} pane(s) could not be started", failed.len());
             }
+        }
+        WsCmd::KeepAwake { workspace, state } => {
+            let s = session(c).await?;
+            let w = if workspace == "." {
+                own(&s)?
+            } else {
+                s.workspace(&workspace)
+                    .or_else(|| s.sleeping(&workspace).map(|x| &x.workspace))
+                    .ok_or_else(|| CliError::NotFound(format!("no workspace {workspace:?}")))?
+            };
+            let label = w.label.clone();
+            let v = c
+                .request(&Request::KeepAwake {
+                    workspace: w.id.clone(),
+                    on: state.map(|s| s == "on"),
+                })
+                .await?;
+            println!(
+                "{label}: keep-awake {}",
+                if v["keep_awake"] == true { "on" } else { "off" }
+            );
         }
         WsCmd::Close { workspace } => {
             let s = session(c).await?;

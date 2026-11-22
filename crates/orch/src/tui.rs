@@ -1810,6 +1810,7 @@ impl App {
                                     to: to.into(),
                                     text: body.trim().into(),
                                     thread: None,
+                                    wake: false,
                                 }),
                             );
                             Mode::Comms(String::new())

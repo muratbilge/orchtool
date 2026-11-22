@@ -170,16 +170,34 @@ async fn snapshot(c: &mut Conn) -> Result<String> {
             screens.insert(pane.to_string(), Value::String(text));
         }
     }
-    let workspaces = workspaces(&session, &panes);
-    let sleeping = sleeping(&session);
+    // An older orchd has no auto-sleep: the line is still complete without it.
+    let auto = c.request(&Request::AutoSleep { ms: None }).await.ok();
+    let keep: HashSet<String> = auto
+        .as_ref()
+        .and_then(|v| serde_json::from_value(v["keep_awake"].clone()).ok())
+        .unwrap_or_default();
+    let mut workspaces = workspaces(&session, &panes);
+    let mut sleeping = sleeping(&session);
+    for w in workspaces.iter_mut().chain(sleeping.iter_mut()) {
+        w["keep_awake"] = json!(w["id"].as_str().is_some_and(|id| keep.contains(id)));
+    }
+    let auto_sleep_ms = auto.map_or(Value::Null, |v| v["ms"].clone());
     Ok(compose(
-        list, &questions, screens, &timeline, workspaces, sleeping, tasks,
+        list,
+        &questions,
+        screens,
+        &timeline,
+        workspaces,
+        sleeping,
+        auto_sleep_ms,
+        tasks,
     )
     .to_string())
 }
 
 /// The watch line from its parts: agents (from `merge`) sorted blocked-first, the open questions,
 /// the blocked agents' screens and the timeline tail. Pure, so the fixture test can build one.
+#[allow(clippy::too_many_arguments)]
 fn compose(
     mut agents: Vec<Value>,
     questions: &[QuestionRow],
@@ -187,6 +205,7 @@ fn compose(
     timeline: &[MessageRow],
     workspaces: Vec<Value>,
     sleeping: Vec<Value>,
+    auto_sleep_ms: Value,
     tasks: Value,
 ) -> Value {
     let hashes: serde_json::Map<String, Value> = screens
@@ -217,6 +236,7 @@ fn compose(
         "timeline": timeline,
         "workspaces": workspaces,
         "sleeping": sleeping,
+        "auto_sleep_ms": auto_sleep_ms,
         "tasks": tasks,
     })
 }
@@ -757,7 +777,11 @@ mod tests {
             error: None,
             saw_working: false,
         };
-        let asleep = sleeping(&with_sleeping(session_p1()));
+        let mut ws = ws;
+        let mut asleep = sleeping(&with_sleeping(session_p1()));
+        for w in ws.iter_mut().chain(asleep.iter_mut()) {
+            w["keep_awake"] = json!(false);
+        }
         let line = compose(
             list,
             &[question],
@@ -765,6 +789,7 @@ mod tests {
             &[row],
             ws,
             asleep,
+            json!(1_800_000),
             json!([task]),
         );
         if std::env::var_os("ORCH_UPDATE_WATCH_FIXTURE").is_some() {

@@ -244,9 +244,9 @@ impl Daemon {
                 // In its own task: when the caller's own pane is in the workspace, its
                 // connection drops half-way and the sleep must still finish.
                 let d = Arc::clone(self);
-                return tokio::spawn(
-                    async move { d.sleep_workspace(&workspace, force, dry_run).await },
-                )
+                return tokio::spawn(async move {
+                    d.sleep_workspace(&workspace, force, dry_run, None).await
+                })
                 .await
                 .map_err(|e| err("bus", e.to_string()))?;
             }

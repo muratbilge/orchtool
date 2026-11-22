@@ -120,6 +120,13 @@ enum Cmd {
         #[arg(value_parser = ["on", "off"])]
         state: Option<String>,
     },
+    /// Put idle workspaces to sleep automatically: show it, or set the idle time (30m, 2h,
+    /// 1h30m, 90s) or off (the default). Only a workspace a plain `orch ws sleep` would accept
+    /// is put to sleep; exempt one with `orch ws keep-awake <ws> on`
+    AutoSleep {
+        /// DURATION | off (without: show)
+        setting: Option<String>,
+    },
     /// Workspaces: focus, new, rename, close, sleep, wake (by id or label, as `orch watch` lists them)
     Ws {
         #[command(subcommand)]
@@ -183,6 +190,10 @@ enum Cmd {
         text: Vec<String>,
         #[arg(long, default_value = "murat")]
         from: String,
+        /// If the agent's workspace sleeps, wake it (without: the message waits until it is
+        /// woken). Refused for "all": a broadcast never wakes everything
+        #[arg(long)]
+        wake: bool,
     },
     /// Unread messages for you (or --name AGENT)
     Inbox {
@@ -249,6 +260,10 @@ enum TaskCmd {
         text: String,
         #[arg(long)]
         after: Option<i64>,
+        /// If the target workspace sleeps, wake it so the task runs now (without: the task
+        /// waits until the workspace is woken)
+        #[arg(long)]
+        wake: bool,
     },
     Ls {
         #[arg(long)]
@@ -541,7 +556,9 @@ async fn run(cli: Cli) -> Result<()> {
                     target,
                     text,
                     after,
+                    wake,
                 } => Request::TaskAdd {
+                    wake: *wake,
                     target: target.clone(),
                     text: text.clone(),
                     after: *after,
@@ -558,7 +575,15 @@ async fn run(cli: Cli) -> Result<()> {
             };
             let v = conn.request(&req).await?;
             match cmd {
-                TaskCmd::Add { .. } => println!("{}", v["id"]),
+                TaskCmd::Add { .. } => {
+                    println!("{}", v["id"]);
+                    if let Some(e) = v["wake_error"].as_str() {
+                        eprintln!(
+                            "orch: task #{} is queued, but waking its workspace failed: {e}",
+                            v["id"]
+                        );
+                    }
+                }
                 TaskCmd::Ls { all } => {
                     for t in v["tasks"].as_array().into_iter().flatten() {
                         if !all && t["state"] != "queued" && t["state"] != "running" {
@@ -591,6 +616,37 @@ async fn run(cli: Cli) -> Result<()> {
         Cmd::StopDaemon { restart } => {
             conn.request(&Request::StopDaemon { restart }).await?;
         }
+        Cmd::AutoSleep { setting } => {
+            let ms = match setting.as_deref() {
+                None => None,
+                Some("off" | "0") => Some(0),
+                Some(d) => Some(parse_duration(d).with_context(|| {
+                    format!("{d:?}: give a time like 30m, 2h, 1h30m, 90s, or off")
+                })?),
+            };
+            let v = conn.request(&Request::AutoSleep { ms }).await?;
+            match v["ms"].as_u64() {
+                Some(ms) => println!(
+                    "auto-sleep: after {} idle",
+                    words(std::time::Duration::from_millis(ms))
+                ),
+                None => println!("auto-sleep: off"),
+            }
+            let keep: Vec<String> = serde_json::from_value(v["keep_awake"].clone())?;
+            if !keep.is_empty() {
+                let s: orch_proto::layout::Session =
+                    serde_json::from_value(conn.request(&Request::UiGet {}).await?)?;
+                let labels: Vec<String> = keep
+                    .iter()
+                    .map(|id| {
+                        s.workspace(id)
+                            .or_else(|| s.sleeping(id).map(|x| &x.workspace))
+                            .map_or(id.clone(), |w| w.label.clone())
+                    })
+                    .collect();
+                println!("kept awake: {}", labels.join(", "));
+            }
+        }
         Cmd::AutoContinue { pane, state } => {
             let v = conn
                 .request(&Request::AutoContinue {
@@ -613,7 +669,12 @@ async fn run(cli: Cli) -> Result<()> {
         Cmd::Proxy { .. } | Cmd::Hook { .. } | Cmd::Ui | Cmd::Watch { .. } => unreachable!(),
         Cmd::Agents { json } => bus::agents(&mut conn, json).await?,
         Cmd::Tail { follow, lines } => bus::tail(conn, follow, lines).await?,
-        Cmd::Msg { to, text, from } => bus::msg(&mut conn, &from, &to, &text.join(" ")).await?,
+        Cmd::Msg {
+            to,
+            text,
+            from,
+            wake,
+        } => bus::msg(&mut conn, &from, &to, &text.join(" "), wake).await?,
         Cmd::Inbox { name, wait, peek } => bus::inbox(&mut conn, &name, wait, peek).await?,
         Cmd::Questions { all } => bus::questions(&mut conn, all).await?,
         Cmd::Question {
@@ -829,4 +890,69 @@ fn clock_ms(ms: i64) -> String {
         tm.tm_hour,
         tm.tm_min
     )
+}
+
+/// "30m", "2h", "1h30m", "90s", "500ms", "1d" → milliseconds (> 0).
+fn parse_duration(s: &str) -> Option<u64> {
+    let mut total = 0u64;
+    let mut num = String::new();
+    let mut chars = s.trim().chars().peekable();
+    let mut any = false;
+    while let Some(c) = chars.next() {
+        if c.is_ascii_digit() {
+            num.push(c);
+            continue;
+        }
+        let n: u64 = num.parse().ok()?;
+        num.clear();
+        let unit = match c {
+            'm' if chars.peek() == Some(&'s') => {
+                chars.next();
+                1
+            }
+            'd' => 86_400_000,
+            'h' => 3_600_000,
+            'm' => 60_000,
+            's' => 1000,
+            _ => return None,
+        };
+        total = total.checked_add(n.checked_mul(unit)?)?;
+        any = true;
+    }
+    (num.is_empty() && any && total > 0).then_some(total)
+}
+
+/// The inverse of [`parse_duration`] for display.
+fn words(d: std::time::Duration) -> String {
+    let ms = d.as_millis() as u64;
+    if !ms.is_multiple_of(1000) {
+        return format!("{ms}ms");
+    }
+    let mut s = ms / 1000;
+    let mut out = String::new();
+    for (unit, n) in [("d", 86_400), ("h", 3600), ("m", 60), ("s", 1)] {
+        if s >= n {
+            out.push_str(&format!("{}{unit}", s / n));
+            s %= n;
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod duration_tests {
+    use super::*;
+
+    #[test]
+    fn auto_sleep_durations() {
+        assert_eq!(parse_duration("30m"), Some(1_800_000));
+        assert_eq!(parse_duration("1h30m"), Some(5_400_000));
+        assert_eq!(parse_duration("90s"), Some(90_000));
+        assert_eq!(parse_duration("500ms"), Some(500));
+        assert_eq!(parse_duration("2d"), Some(172_800_000));
+        for bad in ["", "30", "m", "1x", "0m", "-5m"] {
+            assert_eq!(parse_duration(bad), None, "{bad}");
+        }
+        assert_eq!(words(std::time::Duration::from_millis(5_400_000)), "1h30m");
+    }
 }
