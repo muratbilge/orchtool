@@ -13,6 +13,7 @@
 //! | 12   | the pane's program has exited, nothing was sent |
 //! | 13   | the program is not reading its input, nothing was sent |
 //! | 14   | no such pane, question, workspace, tab, task or task target, or the pane is not in a workspace |
+//! | 15   | `ws sleep`: the workspace is busy (an agent works, waits on a dialog or question, runs a task, or a program runs that can't be resumed); nothing was done, `--force` sleeps anyway |
 //! | 20   | orchd unreachable: not running, did not start, or did not answer in time |
 //!
 //! 3 and 4 are never used: Kabuk's own `sh` wrapper takes them (no `orch` binary, no such folder).
@@ -27,6 +28,7 @@ pub const ANSWERED: i32 = 11;
 pub const EXITED: i32 = 12;
 pub const INPUT_FULL: i32 = 13;
 pub const NOT_FOUND: i32 = 14;
+pub const BUSY: i32 = 15;
 pub const UNREACHABLE: i32 = 20;
 
 /// Shown by `orch --help`.
@@ -39,6 +41,7 @@ pub const HELP: &str = "Exit codes:
   12  the pane's program has exited, nothing sent
   13  the program is not reading its input, nothing sent
   14  no such pane, question, workspace, tab, task or task target, or the pane is not in a workspace
+  15  ws sleep: the workspace is busy, nothing done (stderr says why; --force sleeps anyway)
   20  orchd unreachable (not running, did not start, or did not answer in time)";
 
 /// Outcomes decided on the client side that have their own exit code (orchd's own come back as
@@ -96,6 +99,7 @@ fn remote(code: &str) -> i32 {
         "input_full" => INPUT_FULL,
         "no_task" | "no_target" | "no_pane" | "no_question" | "not_placed" | "no_workspace"
         | "no_tab" => NOT_FOUND,
+        "ws_busy" => BUSY,
         _ => FAILURE,
     }
 }
@@ -142,6 +146,7 @@ mod tests {
         assert_eq!(code(&remote_err("no_pane")), 14);
         assert_eq!(code(&remote_err("no_question")), 14);
         assert_eq!(code(&remote_err("not_placed")), 14);
+        assert_eq!(code(&remote_err("ws_busy")), 15);
         assert_eq!(code(&remote_err("bus")), 1);
         assert_eq!(code(&remote_err("bad_request")), 1);
         assert_eq!(code(&io_err(ErrorKind::ConnectionRefused)), 20);
@@ -166,6 +171,7 @@ mod tests {
             EXITED,
             INPUT_FULL,
             NOT_FOUND,
+            BUSY,
             UNREACHABLE,
         ] {
             assert!(c >= 10, "{c}");

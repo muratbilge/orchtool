@@ -120,7 +120,7 @@ enum Cmd {
         #[arg(value_parser = ["on", "off"])]
         state: Option<String>,
     },
-    /// Workspaces: focus, new, rename, close (by id or label, as `orch watch` lists them)
+    /// Workspaces: focus, new, rename, close, sleep, wake (by id or label, as `orch watch` lists them)
     Ws {
         #[command(subcommand)]
         cmd: ws::WsCmd,
@@ -435,6 +435,32 @@ async fn run(cli: Cli) -> Result<()> {
                     format!("{}x{}", p.cols, p.rows),
                     p.argv.join(" ")
                 );
+            }
+            let s: orch_proto::layout::Session =
+                serde_json::from_value(conn.request(&Request::UiGet {}).await?)?;
+            if !s.sleeping.is_empty() {
+                println!("\nSLEEPING WORKSPACES (orch ws wake <label>)");
+                for sl in &s.sleeping {
+                    let agents: Vec<String> = sl
+                        .agents()
+                        .map(|p| {
+                            p.saved
+                                .bus_name
+                                .clone()
+                                .or_else(|| p.saved.agent.clone())
+                                .unwrap_or_default()
+                        })
+                        .collect();
+                    println!(
+                        "{:<5} {:<16} asleep since {}  {} tab(s), {} pane(s)  {}",
+                        sl.workspace.id,
+                        sl.workspace.label,
+                        clock_ms(sl.slept_ms),
+                        sl.workspace.tabs.len(),
+                        sl.panes.len(),
+                        agents.join(", ")
+                    );
+                }
             }
         }
         Cmd::Attach {
@@ -788,4 +814,19 @@ async fn proxy(socket: &Path, mux: bool) -> Result<()> {
         _ = async { up.await; std::future::pending::<()>().await } => {}
     }
     Ok(())
+}
+
+/// Local "MM-DD HH:MM" of a unix-ms time.
+fn clock_ms(ms: i64) -> String {
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    let t = (ms / 1000) as libc::time_t;
+    // SAFETY: plain libc time conversion on stack values.
+    unsafe { libc::localtime_r(&t, &mut tm) };
+    format!(
+        "{:02}-{:02} {:02}:{:02}",
+        tm.tm_mon + 1,
+        tm.tm_mday,
+        tm.tm_hour,
+        tm.tm_min
+    )
 }

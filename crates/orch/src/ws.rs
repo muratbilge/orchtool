@@ -29,8 +29,24 @@ pub enum WsCmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         label: Vec<String>,
     },
-    /// Close a workspace: kills every pane in it
+    /// Close a workspace: kills every pane in it (a sleeping one is forgotten)
     Close { workspace: String },
+    /// Put a workspace to sleep: its layout and how to resume each agent are kept, then its
+    /// programs end (memory freed). Refused while an agent works, waits on a dialog or a
+    /// question, runs a task, or a program runs that can't be resumed (exit 15).
+    /// WORKSPACE "." = the one this command runs in
+    Sleep {
+        workspace: String,
+        /// Sleep anyway: busy agents are interrupted (they get a note on wake), running
+        /// programs end and come back as fresh shells
+        #[arg(long)]
+        force: bool,
+        /// Only show what would happen
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Wake a sleeping workspace: the layout comes back, agents resume their conversation
+    Wake { workspace: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -115,6 +131,39 @@ fn print_pane(v: &serde_json::Value) {
     }
 }
 
+/// The sleep plan: what blocks it (without --force) and how each pane comes back.
+fn print_plan(plan: &serde_json::Value, dry_run: bool) {
+    let list = |k: &str| -> Vec<String> {
+        plan[k]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let blockers = list("blockers");
+    if dry_run {
+        let label = plan["label"].as_str().unwrap_or_default();
+        if blockers.is_empty() {
+            println!("{label} can sleep now:");
+        } else {
+            println!("{label} is busy: sleep needs --force, which interrupts this:");
+            for b in &blockers {
+                println!("  ! {b}");
+            }
+        }
+    } else {
+        for b in &blockers {
+            println!("  ! {b} (forced)");
+        }
+    }
+    for n in list("notes") {
+        println!("  - {n}");
+    }
+}
+
 pub async fn ws(c: &mut Conn, cmd: WsCmd) -> Result<()> {
     match cmd {
         WsCmd::Focus { workspace } => {
@@ -150,8 +199,71 @@ pub async fn ws(c: &mut Conn, cmd: WsCmd) -> Result<()> {
             }))
             .await?;
         }
+        WsCmd::Sleep {
+            workspace,
+            force,
+            dry_run,
+        } => {
+            let s = session(c).await?;
+            let w = if workspace == "." {
+                own(&s)?
+            } else if let Some(sl) = s.sleeping(&workspace) {
+                println!("already asleep: {}", sl.workspace.label);
+                return Ok(());
+            } else {
+                find(&s, &workspace)?
+            };
+            let (id, label) = (w.id.clone(), w.label.clone());
+            let mine = std::env::var("ORCH_PANE")
+                .ok()
+                .is_some_and(|p| w.tabs.iter().any(|t| holds(t, &p)));
+            if mine && !dry_run {
+                eprintln!("orch: this pane is in {label}: it ends with the workspace");
+            }
+            let v = c
+                .request(&Request::Ui(UiOp::SleepWorkspace {
+                    workspace: id,
+                    force,
+                    dry_run,
+                }))
+                .await?;
+            print_plan(&v["plan"], dry_run);
+            if v["slept"] == true {
+                println!("asleep: {label} (wake: orch ws wake {label})");
+            }
+        }
+        WsCmd::Wake { workspace } => {
+            let v = c
+                .request(&Request::Ui(UiOp::WakeWorkspace {
+                    workspace: workspace.clone(),
+                }))
+                .await?;
+            let s: Session = serde_json::from_value(v["session"].clone())?;
+            let id = v["workspace"].as_str().unwrap_or_default();
+            let label = s
+                .workspace(id)
+                .map_or(workspace.as_str(), |w| w.label.as_str());
+            if v["already"] == true {
+                println!("already awake: {label}");
+                return Ok(());
+            }
+            let panes: Vec<&str> = v["panes"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|p| p.as_str()).collect())
+                .unwrap_or_default();
+            println!("awake: {label} ({})", panes.join(" "));
+            if let Some(failed) = v["failed"].as_array().filter(|f| !f.is_empty()) {
+                eprintln!("orch: {} pane(s) could not be started", failed.len());
+            }
+        }
         WsCmd::Close { workspace } => {
             let s = session(c).await?;
+            if let Some(sl) = s.sleeping(&workspace) {
+                let id = sl.workspace.id.clone();
+                c.request(&Request::Ui(UiOp::CloseWorkspace { workspace: id }))
+                    .await?;
+                return Ok(());
+            }
             let id = find(&s, &workspace)?.id.clone();
             c.request(&Request::Ui(UiOp::CloseWorkspace { workspace: id }))
                 .await?;

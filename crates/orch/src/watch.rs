@@ -171,7 +171,11 @@ async fn snapshot(c: &mut Conn) -> Result<String> {
         }
     }
     let workspaces = workspaces(&session, &panes);
-    Ok(compose(list, &questions, screens, &timeline, workspaces, tasks).to_string())
+    let sleeping = sleeping(&session);
+    Ok(compose(
+        list, &questions, screens, &timeline, workspaces, sleeping, tasks,
+    )
+    .to_string())
 }
 
 /// The watch line from its parts: agents (from `merge`) sorted blocked-first, the open questions,
@@ -182,6 +186,7 @@ fn compose(
     screens: serde_json::Map<String, Value>,
     timeline: &[MessageRow],
     workspaces: Vec<Value>,
+    sleeping: Vec<Value>,
     tasks: Value,
 ) -> Value {
     let hashes: serde_json::Map<String, Value> = screens
@@ -211,6 +216,7 @@ fn compose(
         "screens": screens,
         "timeline": timeline,
         "workspaces": workspaces,
+        "sleeping": sleeping,
         "tasks": tasks,
     })
 }
@@ -274,6 +280,41 @@ fn workspaces(session: &Session, panes: &[PaneInfo]) -> Vec<Value> {
                 "shown": shown == Some(w.id.as_str()),
                 "active_tab": w.active_tab.min(w.tabs.len().saturating_sub(1)),
                 "tabs": tabs,
+            })
+        })
+        .collect()
+}
+
+/// Sleeping workspaces (`orch ws sleep`), in the order they were put to sleep. `position` is
+/// where the workspace stood among `workspaces` (it wakes up there); its agents are not in
+/// `agents` while it sleeps. Wake with `orch ws wake <id>`.
+fn sleeping(session: &Session) -> Vec<Value> {
+    session
+        .sleeping
+        .iter()
+        .map(|s| {
+            let w = &s.workspace;
+            let mut agents: Vec<Value> = s
+                .agents()
+                .map(|p| {
+                    json!({
+                        "name": p.saved.bus_name,
+                        "kind": p.saved.agent,
+                        "limited": p.limited,
+                        "interrupted": p.interrupted,
+                    })
+                })
+                .collect();
+            agents.sort_by(|a, b| a["name"].to_string().cmp(&b["name"].to_string()));
+            json!({
+                "id": w.id,
+                "label": w.label,
+                "cwd": w.cwd,
+                "position": s.position,
+                "slept_ms": s.slept_ms,
+                "panes": s.panes.len(),
+                "tabs": w.tabs.iter().map(|t| json!({"id": t.id, "label": t.label})).collect::<Vec<_>>(),
+                "agents": agents,
             })
         })
         .collect()
@@ -574,7 +615,46 @@ mod tests {
                 seq: 1,
                 workspace: "w1".into(),
             }),
+            sleeping: Vec::new(),
         }
+    }
+
+    /// session_p1 plus a sleeping workspace "docs" with one Claude agent.
+    fn with_sleeping(mut s: Session) -> Session {
+        let saved: orch_proto::layout::SavedPane = serde_json::from_value(json!({
+            "argv": ["claude"], "cwd": "/d", "rows": 24, "cols": 80,
+            "agent": "claude", "bus_name": "docs-claude",
+        }))
+        .unwrap();
+        s.sleeping.push(orch_proto::layout::Sleeping {
+            workspace: Workspace {
+                id: "w2".into(),
+                label: "docs".into(),
+                cwd: "/d".into(),
+                tabs: vec![Tab {
+                    id: "t2".into(),
+                    label: "1".into(),
+                    root: Node::leaf("p7"),
+                    focus: "p7".into(),
+                    zoomed: false,
+                }],
+                active_tab: 0,
+            },
+            position: 1,
+            slept_ms: 1000,
+            panes: [(
+                "p7".to_string(),
+                orch_proto::layout::SleptPane {
+                    saved,
+                    limited: false,
+                    limit_reset: None,
+                    auto_continue: true,
+                    interrupted: false,
+                },
+            )]
+            .into(),
+        });
+        s
     }
 
     #[test]
@@ -677,7 +757,16 @@ mod tests {
             error: None,
             saw_working: false,
         };
-        let line = compose(list, &[question], screens, &[row], ws, json!([task]));
+        let asleep = sleeping(&with_sleeping(session_p1()));
+        let line = compose(
+            list,
+            &[question],
+            screens,
+            &[row],
+            ws,
+            asleep,
+            json!([task]),
+        );
         if std::env::var_os("ORCH_UPDATE_WATCH_FIXTURE").is_some() {
             std::fs::write(
                 concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/watch-v1.json"),
@@ -748,6 +837,20 @@ mod tests {
                 "tab key {k:?} missing"
             );
         }
+        for k in keys(&fixture["sleeping"][0]) {
+            assert!(
+                line["sleeping"][0].get(&k).is_some(),
+                "sleeping key {k:?} missing"
+            );
+        }
+        for k in keys(&fixture["sleeping"][0]["agents"][0]) {
+            assert!(
+                line["sleeping"][0]["agents"][0].get(&k).is_some(),
+                "sleeping agent key {k:?} missing"
+            );
+        }
+        assert_eq!(line["sleeping"][0]["label"], "docs");
+        assert_eq!(line["sleeping"][0]["agents"][0]["name"], "docs-claude");
         let w = &line["workspaces"][0];
         assert_eq!(w["status"], "blocked");
         assert_eq!(w["tabs"][0]["panes"][0], "orch:p1");
