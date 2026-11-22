@@ -1,5 +1,19 @@
 # Status
 
+## 2026-11-22 — Sleep: ninth check (fail-safe agent start) — Claude (Opus)
+
+- New `agent_start.rs`, used by manual wake (`wake_start`) and by the restart beside a sleeper
+  (`Daemon::restart_for`): an agent starts only from a completely parsed command (program word = the agent's,
+  kept as written; every option recognised; a wrapper must be one plain command without variables other than
+  `ORCH_AGENT`, unless the agent's own argv was discovered). No bare-name fallback, no retry with argv[0] only.
+- Otherwise: a shell in the pane's folder printing the note (why, saved command, agent command, conversation id);
+  nothing of the saved text runs. Wake succeeds; result `not_started`, `orch ws wake` prints `not started: …`,
+  the sleep plan says "will not be started", the daemon logs it. The restore does not count/nudge such panes.
+- `restore.rs` against main: SavedPane re-export, `skip_asleep`, `restart_for` call, `started &&` on the agent
+  bookkeeping. `restart_spec` (main's) runs whenever no agent of that kind sleeps.
+- Test fakes are now named `claude`/`codex` (the program word must be the agent's).
+Tests `k1…`–`k4…`, `i_c…`/`j_a…` now expect the note; unit tests in `agent_start.rs` (main's argv as literals).
+
 ## 2026-11-22 — Sleep: eighth check (fresh command instead of a text scan) — Claude (Opus)
 
 - `restart_spec` is main's function again, word for word; `restart_spec_for(sp, false)` calls it.

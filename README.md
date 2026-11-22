@@ -47,6 +47,16 @@ Built in Rust (stable) by Claude Code and Codex with Murat Bilge steering, for o
   Such an agent gets a fresh command: its verified id, else a target written on a command orch can parse, else
   the picker; an agent that ran in a shell comes back as `<shell> -lc '<agent command>; exec <shell>'` (the
   wrapper's other commands, e.g. a `cd`, are not kept).
+  **Fail-safe start (wake, and a restart beside a sleeper):** an agent is started only from a command that parses
+  completely: its program word is `claude`/`codex` (any folder) and is kept as written, every option is recognised
+  and carried over (sandbox, approval, model ...), and a shell wrapper is one plain command (no `cd`, no variables
+  other than `ORCH_AGENT`), unless orch saw the agent's own command line. Otherwise the agent is **not started**:
+  the pane comes back as a plain shell in its folder (its own shell, or your login shell for a direct agent pane)
+  that prints `orch: <kind> was not restarted: its start command could not be reconstructed safely.`, the saved
+  command line (shell-quoted, to run or adapt yourself) and the verified conversation id if known. Nothing of the
+  saved text is run. The wake still succeeds; `orch ws wake`, the sleep plan and the daemon log name such panes.
+  Known limit: the program word is used as written (as main's restart does); a bare `codex`/`claude` is found on
+  the shell's PATH at that time, which is not checked against the program that ran before.
   While asleep, an agent's bus name is reserved for it; mail, queued tasks and open questions wait for it.
   Nothing wakes a workspace by itself, only on request: `orch msg --wake <agent> …` (the MCP `send_message` has
   `wake`) and `orch task add <ws> --wake …` (refused for `all`: a broadcast never wakes everything). A record
