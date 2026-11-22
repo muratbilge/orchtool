@@ -1,5 +1,21 @@
 # Status
 
+## 2026-11-22 — Sleep: fourth-check fixes (start-up rule, split by name, wake confirmation) — Claude (Opus)
+
+- **Start-up rule (finding 5):** the sleeper record always wins. `load_sleepers` takes every pane of a sleeper
+  (old ids, and the new ids of an interrupted wake) out of the layout file the restore is about to read (atomic
+  rewrite, only when one overlaps; if that write fails the file is set aside as `*.sleeper-conflict` and not
+  restored). The restore never starts them; start-up never retires a sleeper. A crash after a wake's autosave
+  but before its sleeper is dropped brings it back asleep.
+- **Finding 6:** pane-addressed layout changes resolve a pane name to its canonical id before admission and
+  carry that id through placement.
+- **Wake confirmation:** a woken pane that has ended is no longer waited for; the reservation is released at
+  confirmation or after 30 s; a sleep of a workspace whose wake is not confirmed yet is refused.
+- Known limits (README): a failed folder sync after rename can leave the record on disk (comes back asleep after
+  a restart); a repaired slot with the same generation number is not told apart.
+Tests `e5_…` (four cases), `e6_…`, `e7_…` in `crates/orchd/tests/sleep.rs`.
+
+
 ## 2026-11-22 — Sleep cut down to manual sleep / wake — Claude (Opus)
 
 Murat's decision after Codex's third re-check: smaller feature instead of a fourth fix round. **Supersedes the

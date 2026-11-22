@@ -32,9 +32,12 @@ Built in Rust (stable) by Claude Code and Codex with Murat Bilge steering, for o
   Sleeping workspaces have their own record next to the socket (`sleeping.a.json` / `sleeping.b.json`, two
   alternating generations, the newest valid one used), written and synced before any of the workspace's programs
   end (a failed write, folder sync included, ends nothing). Restarts, crashes and a plain `stop-daemon` keep it;
-  the restart path itself (`restore.json`, the autosave) is unchanged. If orchd dies before the autosave has
-  caught up with a sleep (about 2 s), the workspace comes back awake and its sleeper record is dropped; a wake
-  drops the sleeper only once the autosave holds the woken panes. A wake is all or nothing: if a pane can't be
+  the restart path itself (`restore.json`, the autosave) is unchanged. The sleeper record is the truth for
+  its panes: if orchd dies before the autosave has caught up with a sleep or a wake (about 2 s), the next start
+  takes those panes out of the layout file before restoring it, so they are never started twice, and the
+  workspace comes back asleep (wake it again). A wake drops the sleeper only once the autosave holds the
+  woken workspace; a woken pane that ends before that is not waited for, and the workspace is never held
+  reserved for more than 30 s. A wake is all or nothing: if a pane can't be
   started, none is and the sleeper stays as it was; a started pane that then can't be ended keeps running
   outside any workspace (`orch ls`, `orch kill`) and the workspace can't wake until it is gone. Agents resume
   only a verified session id, else at their resume picker (Claude `--resume`, Codex `resume`, never `--last`).
@@ -43,7 +46,9 @@ Built in Rust (stable) by Claude Code and Codex with Murat Bilge steering, for o
   `wake`) and `orch task add <ws> --wake …` (refused for `all`: a broadcast never wakes everything). A record
   slot that is damaged or in an unknown format is left alone and blocks sleep / wake (`save_failed`); moving it
   away is enough while it was not the newest record, otherwise (or after a repaired slot) restart orchd to load
-  it. Starts on demand from `orch`, or as a user service (`contrib/orchd.service`).
+  it. Known limits: if the folder sync after a record's rename fails, the sleep is reported failed and nothing
+  ends, but that record may still be on disk, so after a restart the workspace can come back asleep; and a
+  repaired slot carrying the same generation number as the one loaded is not told apart. Starts on demand from `orch`, or as a user service (`contrib/orchd.service`).
 - **`orch`**, the CLI and the TUI (`ratatui`; mouse and touch: tap a pane or a tab, `+` for a new tab, `☰` for
   the workspace list). Panes: `new`, `ls`, `attach`, `send`, `read` (`--unwrapped` joins soft-wrapped
   rows), `kill`, `focus`, `auto-continue`; layout: `ws` and `tab`
