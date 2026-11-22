@@ -239,3 +239,28 @@ show sleeping workspaces.
   …"), and in thread `limits` for a limited agent continued after a wake.
 - **Fixture:** `crates/orch/tests/fixtures/watch-v1.json` was regenerated with one sleeping workspace; copy it
   into Kabuk (`app/src/test/resources/orch-watch.json`) the same day.
+
+### Follow-ups (Murat, 2026-11-22: "1 yes 2. yes 3. with request, 4. yes")
+
+1. A plain `stop-daemon` keeps sleeping workspaces (as above).
+2. A Codex without a verified session id comes back at its resume picker after a wake, never `resume --last`
+   (a restart keeps its own rule). The plan notes say so.
+3. Waking only on request:
+   - `"$O" msg --wake -- <agent> <text>`: the message is stored, then the agent's sleeping workspace wakes and
+     the agent is told to read its inbox. Prints `sent #<id>` and `woke <label>`. `--wake` with `all` is
+     refused (exit 1, nothing sent): a broadcast never wakes every workspace. To a pane-less or awake agent it
+     changes nothing.
+   - `"$O" task add <label> --wake <text>`: the task is queued, then its sleeping workspace wakes; the task
+     dispatches as usual. A failed wake leaves the task queued (exit 0, warning on stderr).
+   - The MCP tool `send_message` has an optional boolean `wake` (default false), same rules.
+   - Without `--wake` nothing changes: mail and tasks wait for the workspace.
+4. Auto-sleep (off by default): `"$O" auto-sleep` prints `auto-sleep: off` or `auto-sleep: after 30m idle`
+   (+ `kept awake: <labels>`); `"$O" auto-sleep <30m|2h|1h30m|90s|off>` sets it;
+   `"$O" ws keep-awake <id|label> on|off` exempts a workspace (prints `<label>: keep-awake on|off`). The idle
+   definition is in README. An automatic sleep is a normal sleep (never forced) and posts
+   "<label> is asleep (auto-sleep: idle for 30m): …" to murat, thread `sleep`.
+   - **Stream (additive):** top-level `auto_sleep_ms` (int, null = off); `workspaces[].keep_awake` and
+     `sleeping[].keep_awake` (bool). Against an older orchd `auto_sleep_ms` is null and `keep_awake` false.
+   - Note for Kabuk: a workspace Kabuk raised (`orch focus`) counts as viewed and never auto-sleeps while it
+     stays the raised one.
+

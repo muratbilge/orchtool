@@ -30,7 +30,20 @@ Built in Rust (stable) by Claude Code and Codex with Murat Bilge steering, for o
   asleep across restarts and crashes, also a plain `stop-daemon`. orchd refuses (exit 15) while an agent in it
   works, waits on a dialog or a question, runs a task, or a program runs that can't be resumed; `--force`
   sleeps anyway (busy agents get a note on wake), `--dry-run` shows the plan. Mail, queued tasks and open
-  questions for a sleeping agent wait for it; nothing wakes a workspace by itself. Starts on demand from `orch`, or as a user service (`contrib/orchd.service`).
+  questions for a sleeping agent wait for it; nothing wakes a workspace by itself, only on request:
+  `orch msg --wake <agent> …` (the MCP `send_message` has `wake`) and `orch task add <ws> --wake …` wake the
+  addressed agent's / the target's workspace (refused for `all`: a broadcast never wakes everything). A Codex
+  without a verified session id comes back at its resume picker after a wake (never `resume --last`).
+  **Auto-sleep** (off by default): `orch auto-sleep 30m` (or `2h`, `1h30m`, `90s`; `off`; without an argument it
+  shows the setting; kept in the database) puts a workspace to sleep once it has been idle that long, never
+  forced: a workspace a plain `orch ws sleep` would refuse is left awake and gets a new period.
+  `orch ws keep-awake <ws> on|off` exempts one. *Idle* for the whole period means: no agent in it working
+  (screen or bus status), no change of any of its panes' screens (the normalised `read --hash`, so spinners
+  don't count), no input written into any of its panes, no client attached to any of its panes (a TUI showing
+  it, `orch attach`), and it is not the workspace last raised (`orch focus`, Kabuk, a TUI's switch). Any of
+  these starts a new period, and so does creating or waking a workspace, changing the setting, and starting
+  orchd (after a restart every workspace gets a full period). Each automatic sleep is posted to the timeline
+  (thread `sleep`, "… is asleep (auto-sleep: idle for 30m) …"). Starts on demand from `orch`, or as a user service (`contrib/orchd.service`).
 - **`orch`**, the CLI and the TUI (`ratatui`; mouse and touch: tap a pane or a tab, `+` for a new tab, `☰` for
   the workspace list). Panes: `new`, `ls`, `attach`, `send`, `read` (`--unwrapped` joins soft-wrapped
   rows), `kill`, `focus`, `auto-continue`; layout: `ws` and `tab`

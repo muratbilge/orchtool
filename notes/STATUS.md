@@ -1,5 +1,18 @@
 # Status
 
+## 2026-11-22 — Sleep follow-ups: wake on request, Codex picker, auto-sleep — Claude (Opus)
+
+Murat's answers: "1 yes 2. yes 3. with request, 4. yes". (1) plain `stop-daemon` keeps sleeping workspaces
+(unchanged). (2) Wake never uses `codex resume --last`: an unidentified Codex comes back at its picker (restart
+unchanged). (3) `orch msg --wake` / MCP `send_message` `wake` / `orch task add --wake` wake the addressed
+workspace; refused for `all`; default off. (4) `orch auto-sleep <duration>|off` (kv `auto_sleep_ms`, off by
+default) and `orch ws keep-awake` (kv `keep_awake:<ws id>`): `crates/orchd/src/autosleep.rs` tracks per
+workspace the panes' screen hashes, inputs written, attached clients, working agents and the raised workspace;
+idle for the whole period → a normal (unforced) sleep with a timeline entry; refused → a new period; created,
+woken, setting changed or orchd started → a new period. Watch: `auto_sleep_ms`, `keep_awake` (additive). Tests
+in `crates/orchd/tests/sleep.rs` (9 now). Not installed; not tried with real agents, a real TUI or Kabuk.
+
+
 ## 2026-11-22 — Workspaces sleep and wake — Claude (Opus, standing in for Codex)
 
 Murat: "we should be able to close and reopen the workspaces for efficiency". `orch ws sleep <ws>` keeps the
