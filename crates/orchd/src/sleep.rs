@@ -804,7 +804,8 @@ impl Daemon {
             } else {
                 busy.push(format!(
                     "runs {}, which cannot be resumed: it comes back as a fresh shell in {}",
-                    sp.argv[0], sp.cwd
+                    sp.argv.first().map_or("a program", |a| base(a)),
+                    sp.cwd
                 ));
                 sp.argv = Vec::new();
             }

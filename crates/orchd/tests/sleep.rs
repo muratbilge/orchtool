@@ -547,10 +547,12 @@ async fn busy_workspaces_are_refused_unless_forced() {
     let s = session(&d).await;
     let sl = s.sleeping("busy").unwrap();
     assert!(sl.panes[&agent].interrupted);
-    assert!(sl
-        .panes
+    // (Recovery arguments are only in the daemon's own record, not in the session.)
+    assert!(recorded_panes(&d, "busy")
+        .as_object()
+        .unwrap()
         .values()
-        .any(|p| p.saved.argv.is_empty() && p.saved.agent.is_none()));
+        .any(|p| p["argv"] == json!([]) && p["agent"].is_null()));
     let out = orch_cli(&d, &["ws", "wake", "busy"]);
     assert!(out.status.success(), "{out:?}");
     wait_for("the interrupted agent gets its note", || {
@@ -816,8 +818,22 @@ async fn an_agent_can_put_its_own_workspace_to_sleep() {
     }
     assert!(!running_panes(&d).await.contains(&pane));
     // It comes back as a plain shell (the -c program is not run again).
-    let sl = &s.sleeping[0];
-    assert_eq!(sl.panes[&pane].saved.argv, vec!["sh".to_string()]);
+    assert!(s.sleeping[0].panes.contains_key(&pane));
+    assert_eq!(
+        recorded_panes(&d, &s.sleeping[0].workspace.label)[&pane]["argv"],
+        json!(["sh"])
+    );
+}
+
+/// The panes of sleeper `label` in the daemon's own sleeper record (with recovery arguments).
+fn recorded_panes(d: &D, label: &str) -> Value {
+    record(d)["sleeping"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["workspace"]["label"] == label)
+        .unwrap_or_else(|| panic!("{label} in the record"))["panes"]
+        .clone()
 }
 
 fn fake_codex(d: &D, role: &str) -> String {
@@ -3024,4 +3040,105 @@ async fn l3_the_note_shows_odd_text_and_runs_none_of_it() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(!pwned.exists(), "nothing of the saved text ran");
     assert_eq!(read(&d, "bin", "args").lines().count(), 1, "not started");
+}
+
+// ---------- eleventh check ----------
+
+/// A marker in a sleeper's direct argv and discovered agent argv never reaches a client: not
+/// in the full replies of sleep, a dry run, wake (of another workspace), an ordinary session
+/// request or UI operation, the snapshot, nor in events. The daemon's own record keeps them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn m1_recovery_arguments_never_reach_a_client() {
+    const MARK: &str = "SECRET-MARK-7f3a";
+    let mut d = daemon("m1").await;
+    // Sleeper S: a direct agent with the marker in its argv.
+    let a = codex_at(&d, "cxa");
+    let argv = vec![a, "-c".into(), format!("token={MARK}")];
+    let s_pane = agent_ws(&d, "sec", &argv, &folder(&d, "proj"), "codex").await;
+    wait_for("S started", || read(&d, "cxa", "args").lines().count() == 1).await;
+    let v = sleep_op(&d, "sec", false).await.unwrap();
+    assert!(!v.to_string().contains(MARK), "sleep reply: {v}");
+    // Its discovered agent argv carries the marker too (written into the record as a stale
+    // one would be; the daemon loads it at the next start).
+    let _ = d.child.kill();
+    let _ = d.child.wait();
+    let mut rec = record(&d);
+    let slot = ["sleeping.a.json", "sleeping.b.json"]
+        .iter()
+        .find(|n| {
+            std::fs::read(d.dir.join(n))
+                .ok()
+                .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+                .is_some_and(|v| v["generation"] == rec["generation"])
+        })
+        .unwrap();
+    rec["sleeping"][0]["panes"][&s_pane]["agent_argv"] = json!(["/opt/codex", "-c", MARK]);
+    std::fs::write(d.dir.join(slot), serde_json::to_vec(&rec).unwrap()).unwrap();
+    restart_with(&mut d, "").await;
+    assert_eq!(
+        recorded_panes(&d, "sec")[&s_pane]["agent_argv"],
+        json!(["/opt/codex", "-c", MARK]),
+        "the daemon's own record keeps it"
+    );
+    // A client subscribed to events from here on.
+    let socket = d.socket.clone();
+    let events = tokio::spawn(async move {
+        let mut c = Conn::unix(&socket).await.unwrap();
+        let body = serde_json::to_value(Request::Subscribe {}).unwrap();
+        c.writer.send_body("sub", body).await.unwrap();
+        let mut seen = String::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+        while let Ok(Ok(Some(frame))) = tokio::time::timeout_at(deadline, c.reader.next()).await {
+            seen.push_str(&frame.body.to_string());
+        }
+        seen
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let mut replies = Vec::new();
+    // Another workspace: a dry run, a sleep, a wake; ordinary requests and a UI operation.
+    shell_ws(&d, "other").await;
+    replies.push(
+        req(
+            &d,
+            Request::Ui(UiOp::SleepWorkspace {
+                workspace: "other".into(),
+                force: false,
+                dry_run: true,
+            }),
+        )
+        .await
+        .unwrap(),
+    );
+    replies.push(sleep_op(&d, "other", false).await.unwrap());
+    replies.push(wake_op(&d, "other").await.unwrap());
+    replies.push(req(&d, Request::UiGet {}).await.unwrap());
+    replies.push(
+        op(
+            &d,
+            UiOp::RenameWorkspace {
+                workspace: "other".into(),
+                label: "other2".into(),
+            },
+        )
+        .await,
+    );
+    for r in &replies {
+        assert!(!r.to_string().contains(MARK), "a reply carries it: {r}");
+    }
+    assert!(
+        replies[3].to_string().contains("\"sec\""),
+        "the sleeper itself is still listed"
+    );
+    for args in [
+        ["ws", "ls"].as_slice(),
+        &["watch", "--once"],
+        &["ls", "--json"],
+    ] {
+        let out = orch_cli(&d, args);
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(!text.contains(MARK), "orch {args:?}: {text}");
+    }
+    let seen = events.await.unwrap();
+    assert!(seen.contains("session"), "events were seen: {seen}");
+    assert!(!seen.contains(MARK), "an event carries it: {seen}");
 }

@@ -115,7 +115,11 @@ pub struct WakeState {
     pub map: HashMap<String, String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// A slept pane. Serialized for clients (session replies, events, the snapshot) **without** its
+/// recovery arguments: `argv` and `agent_argv` are left out (they can carry credentials and
+/// clients don't need them). Only the daemon's own sleeper record writes them, inside
+/// [`with_recovery_args`]. Deserializing reads either form.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct SleptPane {
     #[serde(flatten)]
     pub saved: SavedPane,
@@ -135,6 +139,56 @@ pub struct SleptPane {
 
 fn yes() -> bool {
     true
+}
+
+thread_local! {
+    static RECOVERY_ARGS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` (a serialization on this thread) with slept panes' recovery arguments included:
+/// for the daemon's private sleeper record only.
+pub fn with_recovery_args<T>(f: impl FnOnce() -> T) -> T {
+    struct Reset(bool);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            RECOVERY_ARGS.with(|c| c.set(self.0));
+        }
+    }
+    let _reset = Reset(RECOVERY_ARGS.with(|c| c.replace(true)));
+    f()
+}
+
+impl Serialize for SleptPane {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct Out<'a> {
+            #[serde(flatten)]
+            saved: &'a SavedPane,
+            limited: bool,
+            limit_reset: Option<i64>,
+            auto_continue: bool,
+            interrupted: bool,
+        }
+        let public;
+        let saved = if RECOVERY_ARGS.with(|c| c.get()) {
+            &self.saved
+        } else {
+            public = SavedPane {
+                argv: Vec::new(),
+                agent_argv: None,
+                ..self.saved.clone()
+            };
+            &public
+        };
+        Out {
+            saved,
+            limited: self.limited,
+            limit_reset: self.limit_reset,
+            auto_continue: self.auto_continue,
+            interrupted: self.interrupted,
+        }
+        .serialize(s)
+    }
 }
 
 impl Sleeping {

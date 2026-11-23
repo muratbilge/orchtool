@@ -225,10 +225,11 @@ impl Store {
             next_id,
             sleeping: sleeping.to_vec(),
         };
-        let data = match serde_json::to_vec_pretty(&record) {
-            Ok(d) => d,
-            Err(e) => return fail(false, e.into()),
-        };
+        let data =
+            match orch_proto::layout::with_recovery_args(|| serde_json::to_vec_pretty(&record)) {
+                Ok(d) => d,
+                Err(e) => return fail(false, e.into()),
+            };
         let slot = 1 - st.newest;
         let path = dir.join(SLOTS[slot]);
         let tmp = path.with_extension("json.new");
