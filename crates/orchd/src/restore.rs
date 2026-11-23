@@ -392,7 +392,7 @@ impl Daemon {
                         failed.push(old);
                         continue;
                     };
-                    let (argv, extra, started) = self.restart_for(&old, sp);
+                    let (argv, extra, note) = self.restart_for(&old, sp);
                     // orchd's own environment, plus the agent's bus name.
                     let env = (!extra.is_empty()).then(|| {
                         orch_proto::env::full_env()
@@ -414,7 +414,12 @@ impl Daemon {
                         .or_else(|_| self.new_pane(req(None)));
                     match pane {
                         Ok(p) => {
-                            if started && matches!(sp.agent.as_deref(), Some("claude" | "codex")) {
+                            if let Some(n) = &note {
+                                p.show(n);
+                            }
+                            if note.is_none()
+                                && matches!(sp.agent.as_deref(), Some("claude" | "codex"))
+                            {
                                 resumed += 1;
                                 if sp.was_working {
                                     let name = sp

@@ -512,16 +512,16 @@ impl Daemon {
     /// What the restore starts for a saved pane: main's [`crate::restore::restart_spec`],
     /// unless an agent of this kind sleeps (`no_latest`): then a fresh command from
     /// `agent_start` (verified id, else a target on the parsed command line, else the picker),
-    /// or, when it can't be rebuilt completely, a shell with a note (logged). The flag says
-    /// whether the agent is started.
+    /// or, when it can't be rebuilt completely, a plain shell (logged) and the note to show on
+    /// its screen (`Pane::show`; `None` = the agent is started, or main's restart).
     pub fn restart_for(
         &self,
         old: &str,
         sp: &SavedPane,
-    ) -> (Vec<String>, Vec<(String, String)>, bool) {
+    ) -> (Vec<String>, Vec<(String, String)>, Option<String>) {
         if !self.no_latest(sp) {
             let (argv, env) = crate::restore::restart_spec(sp);
-            return (argv, env, true);
+            return (argv, env, None);
         }
         let s = crate::agent_start::start(sp, crate::agent_start::Target::Explicit);
         if let Some(why) = s.refused {
@@ -530,7 +530,7 @@ impl Daemon {
                 "orchd: {old}: {kind} not restarted ({why}); the pane is a shell with a note"
             );
         }
-        (s.argv, s.env, s.agent)
+        (s.argv, s.env, s.note)
     }
 
     pub fn no_latest(&self, sp: &crate::restore::SavedPane) -> bool {
@@ -1354,7 +1354,8 @@ impl Daemon {
         if !Path::new(&sp.cwd).is_dir() {
             return Err(format!("its folder {} is gone", sp.cwd));
         }
-        let (argv, extra) = wake_argv(sp);
+        let start = wake_start(sp);
+        let (argv, extra) = (start.argv, start.env);
         let env = (!extra.is_empty()).then(|| {
             orch_proto::env::full_env()
                 .into_iter()
@@ -1372,6 +1373,11 @@ impl Daemon {
             },
             Some(ws_id),
         )
+        .inspect(|p| {
+            if let Some(note) = &start.note {
+                p.show(note);
+            }
+        })
         .map_err(|e| e.message)
     }
 

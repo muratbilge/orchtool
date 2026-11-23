@@ -88,7 +88,17 @@ impl Pane {
         let mut child = pair
             .slave
             .spawn_command(cmd)
-            .with_context(|| format!("spawn {:?}", req.argv))?;
+            // The program's name only: its arguments can carry credentials and this message
+            // reaches logs and clients.
+            .with_context(|| {
+                let exe = req.argv.first().map_or("the login shell", |a| {
+                    std::path::Path::new(a)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("a program")
+                });
+                format!("spawn {exe}")
+            })?;
         drop(pair.slave);
         let mut reader = pair.master.try_clone_reader().context("pty reader")?;
         let mut writer = pair.master.take_writer().context("pty writer")?;
@@ -178,6 +188,23 @@ impl Pane {
                 }
             })?;
         Ok(pane)
+    }
+
+    /// Shows `text` on the pane's screen as if the program had printed it (the program does
+    /// not see it). Control characters other than newline and tab are shown as `?`, so the
+    /// text can't drive the terminal; terminal replies are dropped.
+    pub fn show(&self, text: &str) {
+        let clean: String = text
+            .chars()
+            .map(|c| match c {
+                '\n' => "\r\n".to_string(),
+                '\t' => "\t".to_string(),
+                c if c.is_control() => "?".to_string(),
+                c => c.to_string(),
+            })
+            .collect();
+        let _ = self.term.lock().unwrap().process(clean.as_bytes());
+        self.rev.send_modify(|r| *r += 1);
     }
 
     /// Queue bytes for the program. `false` = input budget exhausted (the program is not

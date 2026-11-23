@@ -4,9 +4,10 @@
 //! Fail-safe: the agent is started only from a command that parses completely, every option
 //! recognised and carried over, with its saved program word (argv[0]) unchanged. Never a bare
 //! `claude`/`codex`, never a retry with only the program, never a dropped option. When the
-//! command can't be rebuilt that way, the pane comes back as a plain shell in its folder that
-//! prints a note (why, the saved command line, the verified conversation id): nothing of the
-//! saved text is run.
+//! command can't be rebuilt that way, the pane comes back as a plain shell in its folder with a
+//! note on its screen (why, the saved command line, the verified conversation id): nothing of
+//! the saved text is run, and it is never in the pane's argv or environment (published in
+//! pane lists and events), only on its screen.
 use crate::restore::SavedPane;
 use std::path::Path;
 
@@ -23,6 +24,9 @@ pub struct Start {
     pub env: Vec<(String, String)>,
     pub agent: bool,
     pub refused: Option<&'static str>,
+    /// Refused: the note to show on the shell's screen (`Pane::show`). It holds the saved
+    /// command, so it is never part of the argv or environment (both are published).
+    pub note: Option<String>,
 }
 
 /// Which conversation to name: `Verified` = the verified id, else the picker (a wake);
@@ -58,16 +62,18 @@ pub fn start(sp: &SavedPane, target: Target) -> Start {
             env: Vec::new(),
             agent: true,
             refused: None,
+            note: None,
         };
     };
     let argv = match rebuild(sp, kind, target) {
         Ok(argv) => argv,
         Err(why) => {
             return Start {
-                argv: note(sp, kind, why),
+                argv: vec![pane_shell(sp)],
                 env: Vec::new(),
                 agent: false,
                 refused: Some(why),
+                note: Some(note_lines(sp, kind, why).join("\n") + "\n"),
             }
         }
     };
@@ -88,6 +94,7 @@ pub fn start(sp: &SavedPane, target: Target) -> Start {
             env: Vec::new(),
             agent: true,
             refused: None,
+            note: None,
         };
     }
     Start {
@@ -99,6 +106,7 @@ pub fn start(sp: &SavedPane, target: Target) -> Start {
             .collect(),
         agent: true,
         refused: None,
+        note: None,
     }
 }
 
@@ -202,24 +210,6 @@ pub fn note_lines(sp: &SavedPane, kind: &str, why: &str) -> Vec<String> {
         lines.push(format!("Conversation id: {id}"));
     }
     lines
-}
-
-/// The script of the note: fixed, POSIX `sh`. The lines and the shell to continue in are its
-/// arguments, never part of the script text, so no shell's quoting rules apply to them.
-pub const NOTE_SCRIPT: &str = "shell=$1; shift; printf '%s\\n' \"$@\"; exec \"$shell\"";
-
-/// `/bin/sh` printing the note, then the pane's shell (the user's login shell for a direct
-/// agent pane) in the pane's folder. Nothing of the saved command runs.
-fn note(sp: &SavedPane, kind: &str, why: &str) -> Vec<String> {
-    let mut argv = vec![
-        "/bin/sh".to_string(),
-        "-c".into(),
-        NOTE_SCRIPT.into(),
-        "orch-note".into(),
-        pane_shell(sp),
-    ];
-    argv.extend(note_lines(sp, kind, why));
-    argv
 }
 
 #[cfg(test)]
@@ -412,17 +402,16 @@ mod tests {
                 None => {
                     assert!(!s.agent, "{:?}", pane.argv);
                     let why = s.refused.expect("a reason");
-                    assert_eq!(
-                        &s.argv[..4],
-                        &v(&["/bin/sh", "-c", NOTE_SCRIPT, "orch-note"])[..]
-                    );
-                    assert!(s.argv[5].contains(why));
-                    assert_eq!(
-                        s.argv[6],
-                        format!("Saved command: {}", shell_words::join(&pane.argv))
+                    // Only the shell runs; the note (with the saved command) is screen text.
+                    assert_eq!(s.argv.len(), 1, "{:?}", s.argv);
+                    assert!(s.env.is_empty());
+                    let note = s.note.expect("a note");
+                    assert!(note.contains(why));
+                    assert!(
+                        note.contains(&format!("Saved command: {}", shell_words::join(&pane.argv)))
                     );
                     if let Some(i) = &pane.session_id {
-                        assert!(s.argv.contains(&format!("Conversation id: {i}")));
+                        assert!(note.contains(&format!("Conversation id: {i}")));
                     }
                 }
             }
@@ -507,52 +496,29 @@ mod tests {
         assert!(start(&saved(&["/opt/x/codex"], Some("codex")), Target::Verified).agent);
     }
 
-    /// Tenth check 3: the note's lines are process arguments of a fixed POSIX script; quotes,
-    /// backslashes, `$(...)`, newlines come out exactly as text and nothing runs.
+    /// Twelfth check: the note, with any saved text, is never in the argv or environment
+    /// (published in pane lists and events): the pane runs only its shell.
     #[test]
-    fn the_note_prints_any_saved_text_verbatim_and_runs_nothing() {
-        let dir = std::env::temp_dir().join(format!("orch-note-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let pwned = dir.join("pwned");
-        let nasty = format!(
-            "cd . && codex 'it'\\''s' \\x \"$(touch {})\" `touch {}`\nsecond line; exec fish",
-            pwned.display(),
-            pwned.display()
-        );
-        let mut p = saved(&["fish", "-c", &nasty], Some("codex"));
+    fn the_note_is_never_in_the_argv_or_environment() {
+        let nasty = "cd . && codex 'it'\\''s' \\x \"$(touch x)\" `touch y`\nMARK-1; exec fish";
+        let mut p = saved(&["fish", "-c", nasty], Some("codex"));
+        p.agent_argv = Some(v(&["/opt/codex", "--nope", "MARK-2"]));
         p.session_id = Some("sid-1".into());
+        p.bus_name = Some("x-codex".into());
         let s = start(&p, Target::Verified);
         assert!(!s.agent);
-        assert_eq!(
-            &s.argv[..4],
-            &v(&["/bin/sh", "-c", NOTE_SCRIPT, "orch-note"])[..]
-        );
-        assert_eq!(s.argv[4], "fish", "continues in the pane's own shell");
-        let lines = s.argv[5..].to_vec();
-        // Run the note itself, with `true` as the shell to continue in.
-        let out = std::process::Command::new(&s.argv[0])
-            .args(&s.argv[1..4])
-            .arg("true")
-            .args(&lines)
-            .output()
-            .unwrap();
-        assert!(out.status.success());
-        assert_eq!(
-            String::from_utf8(out.stdout).unwrap(),
-            lines.join("\n") + "\n"
-        );
-        assert!(lines
-            .iter()
-            .any(|l| l.contains("$(touch") && l.contains('\n')));
-        assert!(lines.contains(&"Conversation id: sid-1".to_string()));
-        assert!(!pwned.exists(), "nothing of the saved text ran");
-        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(s.argv, v(&["fish"]), "the pane's own shell, nothing else");
+        assert!(s.env.is_empty());
+        let note = s.note.unwrap();
+        for want in ["MARK-1", "MARK-2", "Conversation id: sid-1", "$(touch x)"] {
+            assert!(note.contains(want), "{want} in {note}");
+        }
         // A direct agent pane continues in the login shell.
         let s = start(
             &saved(&["codex", "--nope"], Some("codex")),
             Target::Verified,
         );
-        assert_eq!(s.argv[0], "/bin/sh");
-        assert!(s.env.is_empty());
+        assert_eq!(s.argv.len(), 1);
+        assert!(!s.argv[0].contains("--nope"));
     }
 }

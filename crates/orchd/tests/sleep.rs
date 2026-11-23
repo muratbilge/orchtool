@@ -3142,3 +3142,132 @@ async fn m1_recovery_arguments_never_reach_a_client() {
     assert!(seen.contains("session"), "events were seen: {seen}");
     assert!(!seen.contains(MARK), "an event carries it: {seen}");
 }
+
+// ---------- twelfth check ----------
+
+/// Puts workspace `label` (one fake Codex pane) to sleep, stops orchd, writes `edit` into that
+/// pane's entry of the newest sleeper record slot, starts orchd again (its stderr to
+/// `orchd.log`). Returns the old pane id.
+async fn asleep_with_record(d: &mut D, label: &str, edit: impl Fn(&mut Value)) -> String {
+    let a = codex_at(d, "cxa");
+    let pane = agent_ws(d, label, &[a], &folder(d, "proj"), "codex").await;
+    wait_for("started", || read(d, "cxa", "args").lines().count() == 1).await;
+    sleep_op(d, label, false).await.unwrap();
+    let _ = d.child.kill();
+    let _ = d.child.wait();
+    let mut rec = record(d);
+    let slot = ["sleeping.a.json", "sleeping.b.json"]
+        .iter()
+        .find(|n| {
+            std::fs::read(d.dir.join(n))
+                .ok()
+                .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+                .is_some_and(|v| v["generation"] == rec["generation"])
+        })
+        .unwrap();
+    edit(&mut rec["sleeping"][0]["panes"][&pane]);
+    std::fs::write(d.dir.join(slot), serde_json::to_vec(&rec).unwrap()).unwrap();
+    std::fs::write(d.dir.join("log-to-file"), b"").unwrap();
+    restart_with(d, "").await;
+    pane
+}
+
+/// Everything a subscriber receives for `secs` seconds, as text.
+fn subscribe(d: &D, secs: u64) -> tokio::task::JoinHandle<String> {
+    let socket = d.socket.clone();
+    tokio::spawn(async move {
+        let mut c = Conn::unix(&socket).await.unwrap();
+        let body = serde_json::to_value(Request::Subscribe {}).unwrap();
+        c.writer.send_body("sub", body).await.unwrap();
+        let mut seen = String::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+        while let Ok(Ok(Some(frame))) = tokio::time::timeout_at(deadline, c.reader.next()).await {
+            seen.push_str(&frame.body.to_string());
+        }
+        seen
+    })
+}
+
+/// A refused wake of the workspace whose discovered agent command holds a marker: the marker
+/// is on the note pane's screen and nowhere published (wake reply, `ls` text and JSON, the
+/// subscription snapshot and later events, the daemon log).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn m2_a_refused_wake_publishes_no_saved_arguments() {
+    const MARK: &str = "SECRET-MARK-91c2";
+    let mut d = daemon("m2").await;
+    asleep_with_record(&mut d, "sec", |p| {
+        p["agent_argv"] = json!(["/opt/codex", "--nope", format!("token={MARK}")]);
+    })
+    .await;
+    let early = subscribe(&d, 4);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let v = wake_op(&d, "sec").await.unwrap();
+    assert!(!v.to_string().contains(MARK), "wake reply: {v}");
+    assert_eq!(v["not_started"].as_array().unwrap().len(), 1, "{v}");
+    let screen = note_shown(&d, "sec", MARK).await;
+    assert!(screen.contains("Agent command:"), "{screen}");
+    let late = subscribe(&d, 1).await.unwrap();
+    for args in [
+        ["ls"].as_slice(),
+        &["ls", "--json"],
+        &["ws", "ls"],
+        &["watch", "--once"],
+    ] {
+        let out = orch_cli(&d, args);
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(!text.contains(MARK), "orch {args:?}: {text}");
+    }
+    let list = req(&d, Request::ListPanes {}).await.unwrap();
+    assert!(!list.to_string().contains(MARK), "{list}");
+    let seen = early.await.unwrap() + &late;
+    assert!(seen.contains("panes"), "pane events were seen");
+    assert!(!seen.contains(MARK), "a subscription carries it: {seen}");
+    let log = std::fs::read_to_string(d.dir.join("orchd.log")).unwrap();
+    assert!(!log.contains(MARK), "the log carries it: {log}");
+}
+
+/// The note shell itself can't be started (its shell is gone): the wake fails as a whole and
+/// its error names the program only, not the saved command.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn m3_a_failed_note_spawn_error_carries_no_saved_arguments() {
+    const MARK: &str = "SECRET-MARK-44d0";
+    let mut d = daemon("m3").await;
+    asleep_with_record(&mut d, "sec", |p| {
+        p["argv"] = json!([
+            "/nonexistent-orch-test/bash",
+            "-lc",
+            format!("codex {MARK}")
+        ]);
+        p["agent_argv"] = json!(["/opt/codex", "--nope", MARK]);
+    })
+    .await;
+    let e = wake_op(&d, "sec").await.unwrap_err();
+    let text = format!("{e:?}");
+    assert!(text.contains("spawn bash"), "{text}");
+    assert!(!text.contains(MARK), "the wake error carries it: {text}");
+    assert!(session(&d).await.sleeping("sec").is_some(), "still asleep");
+    let log = std::fs::read_to_string(d.dir.join("orchd.log")).unwrap();
+    assert!(!log.contains(MARK), "the log carries it: {log}");
+}
+
+/// An agent start rebuilt in full whose program is gone: the wake error and the log name the
+/// program only, not its arguments.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn m4_a_failed_agent_spawn_error_carries_no_arguments() {
+    const MARK: &str = "SECRET-MARK-0b5e";
+    let mut d = daemon("m4").await;
+    asleep_with_record(&mut d, "sec", |p| {
+        p["argv"] = json!([
+            "/nonexistent-orch-test/codex",
+            "-c",
+            format!("token={MARK}")
+        ]);
+    })
+    .await;
+    let e = wake_op(&d, "sec").await.unwrap_err();
+    let text = format!("{e:?}");
+    assert!(text.contains("spawn codex"), "{text}");
+    assert!(!text.contains(MARK), "the wake error carries it: {text}");
+    let log = std::fs::read_to_string(d.dir.join("orchd.log")).unwrap();
+    assert!(!log.contains(MARK), "the log carries it: {log}");
+}
