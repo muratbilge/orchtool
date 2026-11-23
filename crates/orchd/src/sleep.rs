@@ -513,7 +513,7 @@ impl Daemon {
     /// unless an agent of this kind sleeps (`no_latest`): then a fresh command from
     /// `agent_start` (verified id, else a target on the parsed command line, else the picker),
     /// or, when it can't be rebuilt completely, a plain shell (logged) and the note to show on
-    /// its screen (`Pane::show`; `None` = the agent is started, or main's restart).
+    /// its screen (given to `Pane::spawn`; `None` = the agent is started, or main's restart).
     pub fn restart_for(
         &self,
         old: &str,
@@ -1372,12 +1372,8 @@ impl Daemon {
                 cols: Some(sp.cols.max(2)),
             },
             Some(ws_id),
+            start.note.as_deref(),
         )
-        .inspect(|p| {
-            if let Some(note) = &start.note {
-                p.show(note);
-            }
-        })
         .map_err(|e| e.message)
     }
 

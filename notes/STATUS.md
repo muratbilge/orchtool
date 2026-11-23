@@ -1,9 +1,21 @@
 # Status
 
+## 2026-11-23 — Sleep: the note can't join the pane title — Claude (Opus, for Codex)
+
+- Codex's review (c): `Pane::show` fed the note into the live parser after the PTY reader had started, so a
+  shell title sequence split across reads (`ESC ]2;shell-` … `end BEL`) took the note in (reproduced: title
+  `shell-NOTE-TEXTend`, which `PaneInfo.title` publishes).
+- `Pane::show` is gone. The note goes to `Pane::spawn(.., note)` (via `new_pane_in(req, ws, note)`) and
+  `Term::with_note` parses it on the fresh terminal before the reader thread exists: from the ground state, ending
+  in it (control characters as `?`). No API adds screen text to a pane that has parsed program output.
+- Tests: `term::note_never_joins_a_split_program_sequence`, `term::note_control_characters_are_shown_not_parsed`,
+  `pane::spawn_note_is_screen_text_never_title` (real `sh` with a paused title).
+
 ## 2026-11-23 — Sleep: twelfth check (note off the pane's argv, spawn errors) — Claude (Opus)
 
 - A refused start runs only the shell (`[<pane's shell | $SHELL>]`); the note is written onto the pane's
-  screen by `Pane::show` (control characters as `?`, terminal replies dropped). Pane lists, events and
+  screen by `Pane::show` (control characters as `?`, terminal replies dropped; since replaced by
+  `Pane::spawn`'s note, see above). Pane lists, events and
   `ls --json` carry no saved command. No note file, nothing to clean up.
 - `Pane::spawn`'s error names the program's base name (plus the OS error), never the argv (all spawns).
 - `restore.rs`: `restart_for` returns the note; `restore_layout` shows it and skips agent bookkeeping for it.

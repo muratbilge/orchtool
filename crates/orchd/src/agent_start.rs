@@ -24,8 +24,9 @@ pub struct Start {
     pub env: Vec<(String, String)>,
     pub agent: bool,
     pub refused: Option<&'static str>,
-    /// Refused: the note to show on the shell's screen (`Pane::show`). It holds the saved
-    /// command, so it is never part of the argv or environment (both are published).
+    /// Refused: the note to show on the shell's screen (`Pane::spawn` writes it before the
+    /// PTY reader starts). It holds the saved command, so it is never part of the argv or
+    /// environment (both are published).
     pub note: Option<String>,
 }
 

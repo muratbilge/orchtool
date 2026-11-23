@@ -410,13 +410,10 @@ impl Daemon {
                     };
                     // A folder that is gone: start in the home folder instead.
                     let pane = self
-                        .new_pane(req(Some(sp.cwd.clone())))
-                        .or_else(|_| self.new_pane(req(None)));
+                        .new_pane_in(req(Some(sp.cwd.clone())), None, note.as_deref())
+                        .or_else(|_| self.new_pane_in(req(None), None, note.as_deref()));
                     match pane {
                         Ok(p) => {
-                            if let Some(n) = &note {
-                                p.show(n);
-                            }
                             if note.is_none()
                                 && matches!(sp.agent.as_deref(), Some("claude" | "codex"))
                             {
