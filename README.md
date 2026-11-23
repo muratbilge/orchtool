@@ -57,7 +57,8 @@ Built in Rust (stable) by Claude Code and Codex with Murat Bilge steering, for o
   folder (its own shell, or your login shell for a direct agent pane), and orch writes a note onto its screen:
   `orch: <kind> was not restarted: its start command could not be reconstructed safely (<reason>).`, the saved
   command line (shell-quoted, to run or adapt yourself) and the verified conversation id if known. The note is
-  screen text only (control characters shown as `?`): the pane runs just the shell, so the saved command is not
+  screen text only (control characters shown as `?`, written before any of the shell's output is read, so it can never
+  become part of the pane's title): the pane runs just the shell, so the saved command is not
   in the pane's command line or environment (`orch ls`, pane events) and nothing of it is run. It appears
   only on that pane's screen: the daemon log, the sleep plan and `orch ws wake` name the pane, the agent kind and the
   reason (a command line can carry credentials); a start that fails names the program, not its arguments. The

@@ -128,15 +128,17 @@ impl Daemon {
     }
 
     pub(crate) fn new_pane(&self, req: NewPane) -> Result<Arc<Pane>, ApiError> {
-        self.new_pane_in(req, None)
+        self.new_pane_in(req, None, None)
     }
 
     /// `new_pane` that, with `reserve_for`, joins that workspace's reservation (a wake) before
-    /// the pane can be found by anything else.
+    /// the pane can be found by anything else, and with `note` starts with that note on its
+    /// screen (`Pane::spawn`; a refused agent start).
     pub(crate) fn new_pane_in(
         &self,
         req: NewPane,
         reserve_for: Option<&str>,
+        note: Option<&str>,
     ) -> Result<Arc<Pane>, ApiError> {
         if let Some(name) = &req.name {
             if name.is_empty() || name.starts_with('p') && name[1..].parse::<u64>().is_ok() {
@@ -167,7 +169,7 @@ impl Daemon {
         if let Some(ws) = reserve_for {
             self.reserve_panes(ws, &[format!("p{n}")]);
         }
-        let pane = Pane::spawn(format!("p{n}"), req, self.scrollback)
+        let pane = Pane::spawn(format!("p{n}"), req, self.scrollback, note)
             .map_err(|e| err("spawn_failed", format!("{e:#}")))?;
         self.panes.lock().unwrap().insert(n, Arc::clone(&pane));
         Ok(pane)

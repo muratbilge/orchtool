@@ -94,6 +94,29 @@ impl Term {
         }
     }
 
+    /// A new terminal whose screen starts with `note` (the program does not see it). It is
+    /// parsed before any program output, so from the parser's ground state: it can't join a
+    /// title or any other unfinished sequence of the program's. Control characters other than
+    /// newline and tab are shown as `?`, so the note itself can't drive the terminal (and it
+    /// ends in the ground state too); terminal replies are dropped. There is no way to add a
+    /// note to a terminal that has parsed program output.
+    pub fn with_note(rows: u16, cols: u16, scrollback: usize, note: Option<&str>) -> Self {
+        let mut t = Self::new(rows, cols, scrollback);
+        if let Some(text) = note {
+            let clean: String = text
+                .chars()
+                .map(|c| match c {
+                    '\n' => "\r\n".to_string(),
+                    '\t' => "\t".to_string(),
+                    c if c.is_control() => "?".to_string(),
+                    c => c.to_string(),
+                })
+                .collect();
+            let _ = t.process(clean.as_bytes());
+        }
+        t
+    }
+
     /// Feed program output; returns query replies to write back to the program.
     pub fn process(&mut self, bytes: &[u8]) -> Vec<u8> {
         self.parser.process(bytes);
@@ -215,6 +238,43 @@ mod tests {
         let mut t = Term::new(5, 20, 0);
         t.process(b"\x1b]2;hello title\x07");
         assert_eq!(t.title(), "hello title");
+    }
+
+    /// The program's title sequence split across reads around the note: the note is parsed
+    /// first, from the ground state, so it is never part of the title (it was when the note
+    /// was fed to a live parser between the two halves: title "shell-NOTEend").
+    #[test]
+    fn note_never_joins_a_split_program_sequence() {
+        let mut t = Term::with_note(5, 40, 0, Some("NOTE token=x\n"));
+        assert!(t.process(b"\x1b]2;shell-").is_empty());
+        assert!(t.process(b"end\x07$ ").is_empty());
+        assert_eq!(t.title(), "shell-end");
+        assert_eq!(t.visible_text(), "NOTE token=x\n$ ");
+        // Same for a split CSI query: answered as the program sent it, the note not in it.
+        let mut t = Term::with_note(5, 40, 0, Some("NOTE"));
+        assert!(t.process(b"\x1b[").is_empty());
+        assert_eq!(t.process(b"6n"), b"\x1b[1;5R");
+    }
+
+    /// The note can't drive the terminal: no title, no replies, no unfinished sequence left
+    /// for the program's output to land in.
+    #[test]
+    fn note_control_characters_are_shown_not_parsed() {
+        for note in [
+            "\x1b]2;evil\x07a",
+            "\u{9d}2;evil\u{9c}a",
+            "\x1b[6na",
+            "\x1bPqa",
+            "\x1b]2;a",
+            "\x1b[a",
+        ] {
+            let mut t = Term::with_note(5, 40, 0, Some(note));
+            assert!(t.process(b"\r\nok\x1b]2;prog\x07").is_empty(), "{note:?}");
+            assert_eq!(t.title(), "prog", "{note:?}");
+            assert!(t.visible_text().ends_with("\nok"), "{note:?}");
+            assert!(t.visible_text().contains('?'), "{note:?}");
+        }
+        assert_eq!(Term::with_note(5, 40, 0, None).visible_text(), "");
     }
 
     #[test]

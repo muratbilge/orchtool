@@ -50,7 +50,16 @@ pub struct Pane {
 }
 
 impl Pane {
-    pub fn spawn(id: String, req: NewPane, scrollback: usize) -> Result<Arc<Pane>> {
+    /// Starts `req` in a new PTY. `note`, if any, is written onto the fresh screen before the
+    /// PTY reader exists (see `Term::with_note`): the program's output can never be mid-way
+    /// through a terminal sequence when the note is parsed, so the note can't become part of
+    /// the title or any other parser state, only screen text.
+    pub fn spawn(
+        id: String,
+        req: NewPane,
+        scrollback: usize,
+        note: Option<&str>,
+    ) -> Result<Arc<Pane>> {
         let rows = req.rows.unwrap_or(DEFAULT_ROWS).max(2);
         let cols = req.cols.unwrap_or(DEFAULT_COLS).max(2);
         let pair = native_pty_system()
@@ -119,7 +128,7 @@ impl Pane {
                 .map(|d| d.as_secs())
                 .unwrap_or(0),
             pid: child.process_id(),
-            term: Mutex::new(Term::new(rows, cols, scrollback)),
+            term: Mutex::new(Term::with_note(rows, cols, scrollback, note)),
             master: Mutex::new(pair.master),
             input,
             queued: Arc::clone(&queued),
@@ -188,23 +197,6 @@ impl Pane {
                 }
             })?;
         Ok(pane)
-    }
-
-    /// Shows `text` on the pane's screen as if the program had printed it (the program does
-    /// not see it). Control characters other than newline and tab are shown as `?`, so the
-    /// text can't drive the terminal; terminal replies are dropped.
-    pub fn show(&self, text: &str) {
-        let clean: String = text
-            .chars()
-            .map(|c| match c {
-                '\n' => "\r\n".to_string(),
-                '\t' => "\t".to_string(),
-                c if c.is_control() => "?".to_string(),
-                c => c.to_string(),
-            })
-            .collect();
-        let _ = self.term.lock().unwrap().process(clean.as_bytes());
-        self.rev.send_modify(|r| *r += 1);
     }
 
     /// Queue bytes for the program. `false` = input budget exhausted (the program is not
@@ -436,5 +428,39 @@ impl Pane {
                 ),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A real program whose title sequence is split by a pause: the note given to `spawn` is
+    /// on the screen and never in the title (`PaneInfo.title`), however the output is read.
+    #[test]
+    fn spawn_note_is_screen_text_never_title() {
+        let req = NewPane {
+            name: None,
+            argv: vec![
+                "sh".into(),
+                "-c".into(),
+                r"printf '\033]2;shell-'; sleep 0.3; printf 'end\007'; sleep 5".into(),
+            ],
+            cwd: Some("/".into()),
+            env: None,
+            rows: Some(10),
+            cols: Some(80),
+        };
+        let p = Pane::spawn("t".into(), req, 0, Some("NOTE-TEXT\n")).unwrap();
+        let t0 = std::time::Instant::now();
+        while p.term.lock().unwrap().title().is_empty() {
+            assert!(t0.elapsed() < Duration::from_secs(10), "no title");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let info = p.info();
+        p.kill();
+        assert_eq!(info.title, "shell-end");
+        assert!(p.visible_text().contains("NOTE-TEXT"));
+        assert!(!serde_json::to_string(&info).unwrap().contains("NOTE"));
     }
 }
