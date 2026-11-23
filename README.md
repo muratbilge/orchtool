@@ -54,12 +54,14 @@ Built in Rust (stable) by Claude Code and Codex with Murat Bilge steering, for o
   command line must set nothing: a plain shell, or a `-c` script whose first command is the agent itself with no
   variable other than orch's own `ORCH_AGENT` (no `cd`, `export`, `env X=`, `$...`), also when orch saw the
   agent's own command line. Otherwise the agent is **not started**: the pane comes back as a plain shell in its
-  folder (its own shell, or your login shell for a direct agent pane). A fixed `/bin/sh` script first prints
+  folder (its own shell, or your login shell for a direct agent pane), and orch writes a note onto its screen:
   `orch: <kind> was not restarted: its start command could not be reconstructed safely (<reason>).`, the saved
-  command line (shell-quoted, to run or adapt yourself) and the verified conversation id if known; the lines are
-  passed as arguments, so nothing of the saved text is run, whatever your shell. The saved command line appears
-  only in that pane: the daemon log, the sleep plan and `orch ws wake` name the pane, the agent kind and the
-  reason (a command line can carry credentials). The wake still succeeds.
+  command line (shell-quoted, to run or adapt yourself) and the verified conversation id if known. The note is
+  screen text only (control characters shown as `?`): the pane runs just the shell, so the saved command is not
+  in the pane's command line or environment (`orch ls`, pane events) and nothing of it is run. It appears
+  only on that pane's screen: the daemon log, the sleep plan and `orch ws wake` name the pane, the agent kind and the
+  reason (a command line can carry credentials); a start that fails names the program, not its arguments. The
+  wake still succeeds.
   A sleeping workspace's recovery arguments (each pane's saved command line and the agent's discovered command
   line) stay in orchd's own sleeper record (`sleeping.a.json`/`sleeping.b.json`, 0600). Clients (session replies,
   `ws sleep`/`ws wake` and dry-run replies, the event stream, `orch watch`, the MCP tools) get the sleeper's

@@ -1,5 +1,14 @@
 # Status
 
+## 2026-11-23 — Sleep: twelfth check (note off the pane's argv, spawn errors) — Claude (Opus)
+
+- A refused start runs only the shell (`[<pane's shell | $SHELL>]`); the note is written onto the pane's
+  screen by `Pane::show` (control characters as `?`, terminal replies dropped). Pane lists, events and
+  `ls --json` carry no saved command. No note file, nothing to clean up.
+- `Pane::spawn`'s error names the program's base name (plus the OS error), never the argv (all spawns).
+- `restore.rs`: `restart_for` returns the note; `restore_layout` shows it and skips agent bookkeeping for it.
+Tests `m2…` (refused wake: reply, ls, events, log), `m3…` (note shell can't start), `m4…` (agent spawn fails).
+
 ## 2026-11-23 — Sleep: eleventh check (no recovery arguments to clients) — Claude (Opus)
 
 - `SleptPane` serializes without `argv` / `agent_argv` by default (hand-written `Serialize` in orch-proto);
