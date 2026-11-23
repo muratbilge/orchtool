@@ -15,6 +15,13 @@ impl Daemon {
     pub(crate) fn task_target(&self, target: &str) -> Result<Vec<Arc<Pane>>, ApiError> {
         let (label, tab) = parts(target);
         let session = self.session();
+        // A sleeping workspace is a valid target with nobody to run it yet: work waits for it.
+        if let Some(s) = session.sleeping.iter().find(|s| s.workspace.label == label) {
+            if tab.is_some_and(|id| !s.workspace.tabs.iter().any(|t| t.id == id)) {
+                return Err(err("no_target", "unknown tab id"));
+            }
+            return Ok(Vec::new());
+        }
         let w = session
             .workspaces
             .iter()
@@ -33,6 +40,7 @@ impl Daemon {
     }
     fn task_ready(&self, p: &Pane) -> bool {
         if self.bus.task_input_uncertain(&p.id).unwrap_or(true)
+            || self.in_transition(&p.id)
             || p.exit_code().is_some()
             || p.detect() != Detected::Idle
         {
@@ -97,12 +105,17 @@ async fn check(
         }
     }
     let ready = |id: &str| idle_since.get(id).is_some_and(|at| at.elapsed() >= stable);
+    let asleep = d.asleep_panes();
     for t in d
         .bus
         .tasks(false)?
         .into_iter()
         .filter(|t| t.state == "running")
     {
+        // Its pane sleeps: the task follows the pane when the workspace wakes.
+        if t.pane.as_ref().is_some_and(|p| asleep.contains(p)) {
+            continue;
+        }
         let p = t
             .pane
             .as_deref()

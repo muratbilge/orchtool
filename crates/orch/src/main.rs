@@ -120,7 +120,7 @@ enum Cmd {
         #[arg(value_parser = ["on", "off"])]
         state: Option<String>,
     },
-    /// Workspaces: focus, new, rename, close (by id or label, as `orch watch` lists them)
+    /// Workspaces: focus, new, rename, close, sleep, wake (by id or label, as `orch watch` lists them)
     Ws {
         #[command(subcommand)]
         cmd: ws::WsCmd,
@@ -183,6 +183,10 @@ enum Cmd {
         text: Vec<String>,
         #[arg(long, default_value = "murat")]
         from: String,
+        /// If the agent's workspace sleeps, wake it (without: the message waits until it is
+        /// woken). Refused for "all": a broadcast never wakes everything
+        #[arg(long)]
+        wake: bool,
     },
     /// Unread messages for you (or --name AGENT)
     Inbox {
@@ -249,6 +253,10 @@ enum TaskCmd {
         text: String,
         #[arg(long)]
         after: Option<i64>,
+        /// If the target workspace sleeps, wake it so the task runs now (without: the task
+        /// waits until the workspace is woken)
+        #[arg(long)]
+        wake: bool,
     },
     Ls {
         #[arg(long)]
@@ -436,6 +444,34 @@ async fn run(cli: Cli) -> Result<()> {
                     p.argv.join(" ")
                 );
             }
+            let s: orch_proto::layout::Session =
+                serde_json::from_value(conn.request(&Request::UiGet {}).await?)?;
+            // One being woken is back among the panes already.
+            let asleep: Vec<_> = s.sleeping.iter().filter(|x| x.wake.is_none()).collect();
+            if !asleep.is_empty() {
+                println!("\nSLEEPING WORKSPACES (orch ws wake <label>)");
+                for sl in asleep {
+                    let agents: Vec<String> = sl
+                        .agents()
+                        .map(|p| {
+                            p.saved
+                                .bus_name
+                                .clone()
+                                .or_else(|| p.saved.agent.clone())
+                                .unwrap_or_default()
+                        })
+                        .collect();
+                    println!(
+                        "{:<5} {:<16} asleep since {}  {} tab(s), {} pane(s)  {}",
+                        sl.workspace.id,
+                        sl.workspace.label,
+                        clock_ms(sl.slept_ms),
+                        sl.workspace.tabs.len(),
+                        sl.panes.len(),
+                        agents.join(", ")
+                    );
+                }
+            }
         }
         Cmd::Attach {
             pane,
@@ -515,7 +551,9 @@ async fn run(cli: Cli) -> Result<()> {
                     target,
                     text,
                     after,
+                    wake,
                 } => Request::TaskAdd {
+                    wake: *wake,
                     target: target.clone(),
                     text: text.clone(),
                     after: *after,
@@ -532,7 +570,15 @@ async fn run(cli: Cli) -> Result<()> {
             };
             let v = conn.request(&req).await?;
             match cmd {
-                TaskCmd::Add { .. } => println!("{}", v["id"]),
+                TaskCmd::Add { .. } => {
+                    println!("{}", v["id"]);
+                    if let Some(e) = v["wake_error"].as_str() {
+                        eprintln!(
+                            "orch: task #{} is queued, but waking its workspace failed: {e}",
+                            v["id"]
+                        );
+                    }
+                }
                 TaskCmd::Ls { all } => {
                     for t in v["tasks"].as_array().into_iter().flatten() {
                         if !all && t["state"] != "queued" && t["state"] != "running" {
@@ -587,7 +633,12 @@ async fn run(cli: Cli) -> Result<()> {
         Cmd::Proxy { .. } | Cmd::Hook { .. } | Cmd::Ui | Cmd::Watch { .. } => unreachable!(),
         Cmd::Agents { json } => bus::agents(&mut conn, json).await?,
         Cmd::Tail { follow, lines } => bus::tail(conn, follow, lines).await?,
-        Cmd::Msg { to, text, from } => bus::msg(&mut conn, &from, &to, &text.join(" ")).await?,
+        Cmd::Msg {
+            to,
+            text,
+            from,
+            wake,
+        } => bus::msg(&mut conn, &from, &to, &text.join(" "), wake).await?,
         Cmd::Inbox { name, wait, peek } => bus::inbox(&mut conn, &name, wait, peek).await?,
         Cmd::Questions { all } => bus::questions(&mut conn, all).await?,
         Cmd::Question {
@@ -788,4 +839,19 @@ async fn proxy(socket: &Path, mux: bool) -> Result<()> {
         _ = async { up.await; std::future::pending::<()>().await } => {}
     }
     Ok(())
+}
+
+/// Local "MM-DD HH:MM" of a unix-ms time.
+fn clock_ms(ms: i64) -> String {
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    let t = (ms / 1000) as libc::time_t;
+    // SAFETY: plain libc time conversion on stack values.
+    unsafe { libc::localtime_r(&t, &mut tm) };
+    format!(
+        "{:02}-{:02} {:02}:{:02}",
+        tm.tm_mon + 1,
+        tm.tm_mday,
+        tm.tm_hour,
+        tm.tm_min
+    )
 }

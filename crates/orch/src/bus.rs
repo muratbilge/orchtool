@@ -102,16 +102,23 @@ pub async fn tail(mut conn: Conn, follow: bool, lines: usize) -> Result<()> {
     Ok(())
 }
 
-pub async fn msg(conn: &mut Conn, from: &str, to: &str, text: &str) -> Result<()> {
+pub async fn msg(conn: &mut Conn, from: &str, to: &str, text: &str, wake: bool) -> Result<()> {
     let v = conn
         .request(&Request::SendMessage(SendMessage {
             from: from.into(),
             to: to.into(),
             text: text.into(),
             thread: None,
+            wake,
         }))
         .await?;
     println!("sent #{}", v["id"]);
+    if let Some(label) = v["woke"].as_str() {
+        println!("woke {label}");
+    }
+    if let Some(e) = v["wake_error"].as_str() {
+        eprintln!("orch: the message is kept, but waking the workspace failed: {e}");
+    }
     Ok(())
 }
 

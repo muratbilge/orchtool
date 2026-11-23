@@ -38,7 +38,10 @@ impl Daemon {
     }
 
     /// Apply a change to the session and announce it.
-    fn edit<R>(&self, f: impl FnOnce(&mut Session) -> Result<R, ApiError>) -> Result<R, ApiError> {
+    pub(crate) fn edit<R>(
+        &self,
+        f: impl FnOnce(&mut Session) -> Result<R, ApiError>,
+    ) -> Result<R, ApiError> {
         let r = {
             let mut s = self.session.lock().unwrap();
             let r = f(&mut s)?;
@@ -65,7 +68,7 @@ impl Daemon {
     fn unique_label(s: &Session, base: &str) -> String {
         let mut label = base.to_string();
         let mut n = 1;
-        while s.workspaces.iter().any(|w| w.label == label) {
+        while s.label_taken(&label, None) {
             n += 1;
             label = format!("{base}-{n}");
         }
@@ -100,6 +103,13 @@ impl Daemon {
             let w = s
                 .workspace_mut(ws)
                 .ok_or_else(|| err("no_workspace", format!("no workspace {ws:?}")))?;
+            // Checked where the pane is placed: a workspace going to sleep takes none.
+            if self.ws_in_transition(&w.id) {
+                return Err(err(
+                    "ws_transition",
+                    "that workspace is going to sleep or waking; try again",
+                ));
+            }
             w.tabs.push(Tab {
                 id: tab,
                 label: (w.tabs.len() + 1).to_string(),
@@ -119,10 +129,13 @@ impl Daemon {
             .session()
             .workspaces
             .iter()
-            .find(|w| w.cwd == info.cwd)
+            .find(|w| w.cwd == info.cwd && !self.ws_in_transition(&w.id))
             .map(|w| w.id.clone());
         match ws {
-            Some(ws) => self.add_tab(&ws, info),
+            // It started to sleep in between: a workspace of its own instead.
+            Some(ws) => self
+                .add_tab(&ws, info)
+                .or_else(|_| self.add_workspace(None, info).map(|_| ())),
             None => self.add_workspace(None, info).map(|_| ()),
         }
     }
@@ -152,7 +165,55 @@ impl Daemon {
         Ok(())
     }
 
-    pub async fn ui_op(&self, op: UiOp) -> Result<Value, ApiError> {
+    /// A layout change of a workspace is counted from here until it is placed (refused while it
+    /// goes to sleep or wakes): a sleep waits for it and never captures a pane list about to
+    /// change.
+    fn op_guard(self: &Arc<Self>, op: &UiOp) -> Result<Option<crate::sleep::OpGuard>, ApiError> {
+        let s = self.session();
+        let ws = |key: &str| {
+            s.workspace(key)
+                .map(|w| w.id.clone())
+                .or_else(|| s.sleeping(key).map(|x| x.workspace.id.clone()))
+        };
+        let of_pane = |pane: &str| s.locate(pane).map(|(wi, _)| s.workspaces[wi].id.clone());
+        let target = match op {
+            UiOp::NewTab { workspace, .. }
+            | UiOp::CloseTab { workspace, .. }
+            | UiOp::CloseWorkspace { workspace }
+            | UiOp::RenameWorkspace { workspace, .. }
+            | UiOp::RenameTab { workspace, .. } => ws(workspace),
+            UiOp::Split { pane, .. }
+            | UiOp::ClosePane { pane }
+            | UiOp::Resize { pane, .. }
+            | UiOp::ToggleZoom { pane } => of_pane(pane),
+            _ => None,
+        };
+        target.map(|id| self.admit_ws_op(&id)).transpose()
+    }
+
+    /// A pane given by name (or id) becomes its canonical pane id, so the guard below and the
+    /// placement afterwards act on the same pane.
+    fn canonical(&self, mut op: UiOp) -> UiOp {
+        let fix = |p: &mut String| {
+            if let Ok(pane) = self.find(p) {
+                *p = pane.id.clone();
+            }
+        };
+        match &mut op {
+            UiOp::Split { pane, .. }
+            | UiOp::ClosePane { pane }
+            | UiOp::Resize { pane, .. }
+            | UiOp::ToggleZoom { pane }
+            | UiOp::Focus { pane }
+            | UiOp::Raise { pane } => fix(pane),
+            _ => {}
+        }
+        op
+    }
+
+    pub async fn ui_op(self: &Arc<Self>, op: UiOp) -> Result<Value, ApiError> {
+        let op = self.canonical(op);
+        let _op = self.op_guard(&op)?;
         let mut created: Option<PaneInfo> = None;
         match op {
             UiOp::NewWorkspace { label, spawn } => {
@@ -183,6 +244,7 @@ impl Daemon {
                     return Err(err("not_placed", format!("{id} is not in a workspace")));
                 }
                 let info = self.spawn(spawn, Some(pane_cwd(&at.info())))?;
+                crate::fault::pause_at("split_pause_ms").await;
                 let new_id = info.id.clone();
                 let placed = self.edit(|s| {
                     let (wi, ti) = s
@@ -232,6 +294,29 @@ impl Daemon {
                 };
                 self.close_panes(panes).await?;
             }
+            UiOp::CloseWorkspace { workspace } if self.session().sleeping(&workspace).is_some() => {
+                self.forget_sleeping(&workspace).await?;
+            }
+            UiOp::SleepWorkspace {
+                workspace,
+                force,
+                dry_run,
+            } => {
+                // In its own task: when the caller's own pane is in the workspace, its
+                // connection drops half-way and the sleep must still finish.
+                let d = Arc::clone(self);
+                return tokio::spawn(
+                    async move { d.sleep_workspace(&workspace, force, dry_run).await },
+                )
+                .await
+                .map_err(|e| err("bus", e.to_string()))?;
+            }
+            UiOp::WakeWorkspace { workspace } => {
+                let d = Arc::clone(self);
+                return tokio::spawn(async move { d.wake_workspace(&workspace).await })
+                    .await
+                    .map_err(|e| err("bus", e.to_string()))?;
+            }
             UiOp::CloseWorkspace { workspace } => {
                 let panes: Vec<String> = {
                     let s = self.session.lock().unwrap();
@@ -274,10 +359,8 @@ impl Daemon {
                 Ok(())
             })?,
             UiOp::RenameWorkspace { workspace, label } => self.edit(|s| {
-                if s.workspaces
-                    .iter()
-                    .any(|w| w.label == label && w.id != workspace)
-                {
+                let id = s.workspace(&workspace).map(|w| w.id.clone());
+                if s.label_taken(&label, id.as_deref().or(Some(&workspace))) {
                     return Err(err("label_taken", label.clone()));
                 }
                 s.workspace_mut(&workspace)

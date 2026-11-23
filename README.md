@@ -24,11 +24,67 @@ Built in Rust (stable) by Claude Code and Codex with Murat Bilge steering, for o
   restores it when there is no `restore.json` and agents that were working get a note that their last tool call
   and background work were lost. A plain `orch stop-daemon` removes it (the next orchd starts empty). A restore
   that does not finish is not tried again: the file is kept as `autosave.json.failed`. Questions from agents
-  whose pane is gone expire by themselves. Starts on demand from `orch`, or as a user service (`contrib/orchd.service`).
+  whose pane is gone expire by themselves. A workspace you don't need now can **sleep** (`orch ws sleep <label>`, TUI
+  `S` or the `w` list): its layout and how to resume each agent are kept, its programs end and their memory is
+  free; `orch ws wake <label>` (or Enter on it in the `w` list) brings it back with the agents resumed. orchd
+  refuses (exit 15) while an agent in it works, waits on a dialog or a question, runs a task, or a program runs
+  that can't be resumed; `--force` sleeps anyway (busy agents get a note on wake), `--dry-run` shows the plan.
+  Sleeping workspaces have their own record next to the socket (`sleeping.a.json` / `sleeping.b.json`, two
+  alternating generations, the newest valid one used), written and synced before any of the workspace's programs
+  end (a failed write, folder sync included, ends nothing). Restarts, crashes and a plain `stop-daemon` keep it;
+  the restart path itself (`restore.json`, the autosave) is unchanged. The sleeper record is the truth for
+  its panes: if orchd dies before the autosave has caught up with a sleep or a wake (about 2 s), the restore
+  leaves those panes out of whatever layout it reads (in memory; no file is rewritten), also ones whose program
+  had already ended before the sleep, so they are never started twice, and the workspace comes back asleep (wake it again). A wake drops the sleeper only once the autosave holds the
+  woken workspace; a woken pane that ends before that is not waited for, and the workspace is never held
+  reserved for more than 30 s. A wake is all or nothing: if a pane can't be
+  started, none is and the sleeper stays as it was; a started pane that then can't be ended keeps running
+  outside any workspace (`orch ls`, `orch kill`) and the workspace can't wake until it is gone. Agents resume
+  only a verified session id, else at their resume picker (Claude `--resume`, Codex `resume`, never `--last`).
+  While a workspace with a Claude (or Codex) agent sleeps, a restart gives every awake agent of that kind without
+  a known conversation its picker too (`claude --resume`, `codex resume`), never `--continue` / `resume --last`
+  (also not by replaying a saved shell command word for word), since "the latest" could be the sleeper's.
+  Such an agent gets a fresh command: its verified id, else a target written on a command orch can parse, else
+  the picker; an agent that ran in a shell comes back as `<shell> -lc '<agent command>; exec <shell>'` (the
+  wrapper's other commands, e.g. a `cd`, are not kept).
+  **Fail-safe start (wake, and a restart beside a sleeper):** an agent is started only from a command that parses
+  completely: its program word is `claude`/`codex`, written as a bare name or an absolute path (a relative path
+  like `./bin/codex` is refused: it would be looked up from the pane's folder, not necessarily where it ran) and
+  kept as written; every option is recognised and carried over (sandbox, approval, model ...). A shell pane's
+  command line must set nothing: a plain shell, or a `-c` script whose first command is the agent itself with no
+  variable other than orch's own `ORCH_AGENT` (no `cd`, `export`, `env X=`, `$...`), also when orch saw the
+  agent's own command line. Otherwise the agent is **not started**: the pane comes back as a plain shell in its
+  folder (its own shell, or your login shell for a direct agent pane), and orch writes a note onto its screen:
+  `orch: <kind> was not restarted: its start command could not be reconstructed safely (<reason>).`, the saved
+  command line (shell-quoted, to run or adapt yourself) and the verified conversation id if known. The note is
+  screen text only (control characters shown as `?`): the pane runs just the shell, so the saved command is not
+  in the pane's command line or environment (`orch ls`, pane events) and nothing of it is run. It appears
+  only on that pane's screen: the daemon log, the sleep plan and `orch ws wake` name the pane, the agent kind and the
+  reason (a command line can carry credentials); a start that fails names the program, not its arguments. The
+  wake still succeeds.
+  A sleeping workspace's recovery arguments (each pane's saved command line and the agent's discovered command
+  line) stay in orchd's own sleeper record (`sleeping.a.json`/`sleeping.b.json`, 0600). Clients (session replies,
+  `ws sleep`/`ws wake` and dry-run replies, the event stream, `orch watch`, the MCP tools) get the sleeper's
+  workspace, layout, position, folder, and per pane its name, agent kind, bus name and flags, without them.
+  Known limits: the program word is used as written (as main's restart does); a bare `codex`/`claude` is found
+  on the shell's PATH at that time, which is not checked against the program that ran before. Variables set
+  interactively in a shell pane (or by orch's spawn environment) are not seen; main's restart drops them too.
+  While asleep, an agent's bus name is reserved for it; mail, queued tasks and open questions wait for it.
+  Nothing wakes a workspace by itself, only on request: `orch msg --wake <agent> …` (the MCP `send_message` has
+  `wake`) and `orch task add <ws> --wake …` (refused for `all`: a broadcast never wakes everything). A record
+  slot that is damaged or in an unknown format is left alone and blocks sleep / wake (`save_failed`); moving it
+  away is enough while it was not the newest record, otherwise (or after a repaired slot) restart orchd to load
+  it. Known limits: if the folder sync after a record's rename fails, the sleep is reported failed and nothing
+  ends, but that record may still be on disk, so after a restart the workspace can come back asleep; and a
+  repaired slot carrying the same generation number as the one loaded is not told apart; when SQLite can't
+  hand out pane ids, the inherited in-memory fallback can repeat an id across starts and the restore then also
+  leaves out an unrelated pane with a sleeper's old id; and if every woken pane exits before the next
+  autosave, the sleeper is retired without a checkpoint (a crash right then could start a program that already
+  ran from an older autosave). Starts on demand from `orch`, or as a user service (`contrib/orchd.service`).
 - **`orch`**, the CLI and the TUI (`ratatui`; mouse and touch: tap a pane or a tab, `+` for a new tab, `☰` for
   the workspace list). Panes: `new`, `ls`, `attach`, `send`, `read` (`--unwrapped` joins soft-wrapped
   rows), `kill`, `focus`, `auto-continue`; layout: `ws` and `tab`
-  (focus, new, rename, close, by id); bus: `agents`, `tail`, `msg`, `inbox`, `questions`, `question close`, `answer`,
+  (focus, new, rename, close, sleep, wake, by id); bus: `agents`, `tail`, `msg`, `inbox`, `questions`, `question close`, `answer`,
   `ask`, `status`, `hook`; `watch --json` streams everything for clients; `--host H` talks to an orchd on another
   machine through `ssh H orch proxy`; `ping` and `latency` measure the round trip.
 - **`orch-mcp`**, an MCP server for agents on the bus: `send_message`, `read_inbox`, `ask_human`,
@@ -103,7 +159,7 @@ commands, the exit codes and the shared fixture `crates/orch/tests/fixtures/watc
 
 Exit codes (`orch --help`): 0 done · 1 other error · 2 usage · 10 the screen changed, nothing sent · 11 answered
 already · 12 the program exited · 13 the program isn't reading input · 14 no such pane, question, workspace or
-tab · 20 orchd unreachable.
+tab · 15 `ws sleep`: the workspace is busy, nothing done · 20 orchd unreachable.
 
 ## License
 

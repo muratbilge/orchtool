@@ -189,7 +189,8 @@ fn tools() -> Value {
             "inputSchema": { "type": "object", "properties": {
                 "to": { "type": "string", "description": "Agent name, \"murat\", or \"all\"" },
                 "text": { "type": "string" },
-                "thread": { "type": "string", "description": "Optional topic to group related messages" }
+                "thread": { "type": "string", "description": "Optional topic to group related messages" },
+                "wake": { "type": "boolean", "description": "If the addressed agent's orch workspace is asleep, wake it so the message is read now (default false: it waits until the workspace is woken). Not allowed for \"all\"." }
             }, "required": ["to", "text"] }
         },
         {
@@ -368,6 +369,7 @@ async fn call_tool_inner(
                 to: to.clone(),
                 text,
                 thread: str_arg("thread"),
+                wake: args.get("wake").and_then(Value::as_bool).unwrap_or(false),
             }))
             .await?;
             Ok((format!("Sent (#{}) to {to}.", row["id"]), None))

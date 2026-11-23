@@ -42,6 +42,8 @@ pub struct Daemon {
     pub task_gate: tokio::sync::Mutex<()>,
     /// Set once shutdown starts: panes dying from `kill_all` are not task failures.
     pub stopping: std::sync::atomic::AtomicBool,
+    /// A `daemon.stop` is waiting for transitions to end: no new sleep / wake starts.
+    pub(crate) stopping_soon: std::sync::atomic::AtomicBool,
     pub bus: Arc<Bus>,
     pub(crate) session: Mutex<orch_proto::layout::Session>,
     pub(crate) ui_events: tokio::sync::broadcast::Sender<crate::ui::UiEvent>,
@@ -55,6 +57,19 @@ pub struct Daemon {
     pub restore_path: std::sync::OnceLock<std::path::PathBuf>,
     /// The layout kept on disk for an unplanned stop (`autosave.json`, set by main).
     pub autosave: crate::autosave::Autosave,
+    /// The durable record of sleeping workspaces (`sleepstore.rs`).
+    pub sleep_store: crate::sleepstore::Store,
+    /// Workspaces going to sleep or waking right now (by id): no layout change, input, task or
+    /// nudge reaches them, and no second transition starts. A leaf lock.
+    pub(crate) transitions: Mutex<HashMap<String, crate::sleep::Transit>>,
+    /// Requests that are writing into a pane right now (pane → count): a sleep waits for them
+    /// to finish (taken after `transitions`).
+    pub(crate) inflight: Mutex<HashMap<String, usize>>,
+    /// Sleepers read at start-up until they are installed (their panes count as asleep).
+    pub(crate) loading_sleepers: Mutex<Vec<orch_proto::layout::Sleeping>>,
+    /// Programs of a workspace that could not be ended (sleep, or a failed wake), by workspace
+    /// id: it can't wake while one runs. In memory: a restart ends them anyway.
+    pub(crate) strays: Mutex<HashMap<String, Vec<String>>>,
 }
 
 #[derive(Debug)]
@@ -79,6 +94,7 @@ impl Daemon {
         Arc::new(Self {
             task_gate: tokio::sync::Mutex::new(()),
             stopping: std::sync::atomic::AtomicBool::new(false),
+            stopping_soon: std::sync::atomic::AtomicBool::new(false),
             bus,
             session: Mutex::new(orch_proto::layout::Session::default()),
             ui_events: tokio::sync::broadcast::channel(256).0,
@@ -89,6 +105,11 @@ impl Daemon {
             shutdown: Notify::new(),
             restore_path: Default::default(),
             autosave: Default::default(),
+            sleep_store: Default::default(),
+            transitions: Default::default(),
+            inflight: Default::default(),
+            loading_sleepers: Default::default(),
+            strays: Default::default(),
         })
     }
 
@@ -107,6 +128,16 @@ impl Daemon {
     }
 
     pub(crate) fn new_pane(&self, req: NewPane) -> Result<Arc<Pane>, ApiError> {
+        self.new_pane_in(req, None)
+    }
+
+    /// `new_pane` that, with `reserve_for`, joins that workspace's reservation (a wake) before
+    /// the pane can be found by anything else.
+    pub(crate) fn new_pane_in(
+        &self,
+        req: NewPane,
+        reserve_for: Option<&str>,
+    ) -> Result<Arc<Pane>, ApiError> {
         if let Some(name) = &req.name {
             if name.is_empty() || name.starts_with('p') && name[1..].parse::<u64>().is_ok() {
                 return Err(err(
@@ -133,6 +164,9 @@ impl Daemon {
             .bus
             .next_counter("next_pane")
             .unwrap_or_else(|_| self.next_pane.fetch_add(1, Ordering::SeqCst) + 1_000_000);
+        if let Some(ws) = reserve_for {
+            self.reserve_panes(ws, &[format!("p{n}")]);
+        }
         let pane = Pane::spawn(format!("p{n}"), req, self.scrollback)
             .map_err(|e| err("spawn_failed", format!("{e:#}")))?;
         self.panes.lock().unwrap().insert(n, Arc::clone(&pane));
@@ -143,6 +177,12 @@ impl Daemon {
     /// The pane is only forgotten once its program is really gone.
     pub(crate) async fn kill(&self, key: &str) -> Result<(), ApiError> {
         let pane = self.find(key)?;
+        if crate::fault::value("kill_fail").is_some_and(|name| pane.name.as_deref() == Some(name)) {
+            return Err(err(
+                "kill_failed",
+                format!("{} survived (injected)", pane.id),
+            ));
+        }
         let mut exit = pane.subscribe_exit();
         for step in 0..3 {
             if pane.exit_code().is_some() {
@@ -179,6 +219,21 @@ impl Daemon {
         }
     }
 
+    /// Wakes `ws` for a request that asked for it; the outcome goes into the reply
+    /// (`woke`: its label, or `wake_error`), the request itself already succeeded.
+    async fn wake_into(self: &Arc<Self>, v: &mut Value, ws: &str) {
+        let d = Arc::clone(self);
+        let key = ws.to_string();
+        match tokio::spawn(async move { d.wake_workspace(&key).await }).await {
+            Ok(Ok(r)) => {
+                let id = r["workspace"].as_str().unwrap_or_default().to_string();
+                v["woke"] = json!(self.session().workspace(&id).map(|w| w.label.clone()));
+            }
+            Ok(Err(e)) => v["wake_error"] = json!(e.message),
+            Err(e) => v["wake_error"] = json!(e.to_string()),
+        }
+    }
+
     pub fn expire_questions(&self) -> anyhow::Result<usize> {
         let live = self
             .all_panes()
@@ -186,14 +241,20 @@ impl Daemon {
             .filter(|p| p.exit_code().is_none())
             .map(|p| format!("orch:{}", p.id))
             .collect();
+        // An agent in a sleeping workspace keeps its questions: answered, they wait for it.
+        let asleep = self
+            .asleep_panes()
+            .into_iter()
+            .map(|p| format!("orch:{p}"))
+            .collect();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as i64;
-        self.bus.expire_questions(&live, now)
+        self.bus.expire_questions(&live, &asleep, now)
     }
 
-    async fn handle(&self, req: Request) -> Result<Value, ApiError> {
+    async fn handle(self: &Arc<Self>, req: Request) -> Result<Value, ApiError> {
         match req {
             Request::ReportSession {
                 pane,
@@ -247,6 +308,7 @@ impl Daemon {
                 text,
                 created_by,
                 after,
+                wake,
             } => {
                 self.task_target(&target)?;
                 let text = text.replace("\r\n", "\n").replace('\r', "\n");
@@ -262,12 +324,27 @@ impl Daemon {
                         return Err(err("no_task", "unknown dependency"));
                     }
                 }
-                Ok(serde_json::to_value(
+                let mut v = serde_json::to_value(
                     self.bus
                         .task_add(&target, &text, &created_by, after)
                         .map_err(bus_err)?,
                 )
-                .unwrap())
+                .unwrap();
+                // Only on request: the task's workspace sleeps → wake it (the task is queued
+                // either way and dispatches as usual once an agent is back).
+                // The workspace the task validation resolved (task targets are labels): the
+                // sleeper with that label, by its id, never another one by id-first lookup.
+                let (label, _) = crate::tasks::parts(&target);
+                let asleep = self
+                    .session()
+                    .sleeping
+                    .iter()
+                    .find(|s| s.workspace.label == label)
+                    .map(|s| s.workspace.id.clone());
+                if let (true, Some(id)) = (wake, asleep) {
+                    self.wake_into(&mut v, &id).await;
+                }
+                Ok(v)
             }
             Request::TaskList { all } => {
                 Ok(json!({"tasks": self.bus.tasks(all).map_err(bus_err)?}))
@@ -341,6 +418,9 @@ impl Daemon {
             }
             Request::Send(s) => {
                 let pane = self.find(&s.pane)?;
+                // Held until the last byte (the Enter after its delay) is written: a sleep
+                // waits for it instead of inspecting a pane that is still being typed into.
+                let _op = self.admit_op(&pane.id)?;
                 let enter_delay = send_enter_delay(pane.kind().as_deref(), &s.text);
                 if pane.exit_code().is_some() {
                     return Err(err("exited", "pane has exited"));
@@ -366,6 +446,7 @@ impl Daemon {
                 } else if !s.text.is_empty() && !pane.write(s.text.into_bytes()) {
                     return Err(full());
                 }
+                crate::fault::pause_at("send_pause_ms").await;
                 if s.enter {
                     // A separate, later CR is an Enter key press, not part of a paste. Codex's
                     // paste-burst detection swallowed a CR sent 60 ms after the text.
@@ -384,29 +465,57 @@ impl Daemon {
             }
             Request::Kill { pane } => {
                 let id = self.find(&pane)?.id.clone();
+                let _op = self.admit_op(&id)?;
                 self.kill(&id).await?;
                 self.unplace(&id);
                 Ok(json!({ "pane": id }))
             }
             Request::StopDaemon { restart } => {
+                // Not in the middle of a sleep or wake (their own records stay consistent, but
+                // a half-done transition is better finished first). The flag is set and the
+                // reservations are looked at under the lock `reserve` admits under: nothing
+                // starts after this saw none running.
+                let mut waited = 0;
+                loop {
+                    {
+                        let t = self.transitions.lock().unwrap();
+                        self.stopping_soon.store(true, Ordering::SeqCst);
+                        if t.is_empty() {
+                            break;
+                        }
+                    }
+                    if waited >= 200 {
+                        self.stopping_soon.store(false, Ordering::SeqCst);
+                        return Err(err(
+                            "ws_transition",
+                            "a workspace is going to sleep or waking; try again",
+                        ));
+                    }
+                    waited += 1;
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
                 // Saved while every pane still runs, before anything stops: if saving fails,
                 // nothing is killed and the caller hears why.
                 if restart {
-                    let path = self
-                        .restore_path
-                        .get()
-                        .ok_or_else(|| err("save_failed", "no place to save the layout"))?;
-                    self.save_layout(path).map_err(|e| {
-                        err("save_failed", format!("saving the layout failed: {e}"))
-                    })?;
+                    let saved = match self.restore_path.get() {
+                        Some(path) => self.save_layout(path),
+                        None => Err(std::io::Error::other("no place to save the layout")),
+                    };
+                    if let Err(e) = saved {
+                        // orchd keeps running: sleeps and wakes are allowed again.
+                        self.stopping_soon.store(false, Ordering::SeqCst);
+                        return Err(err("save_failed", format!("saving the layout failed: {e}")));
+                    }
                 } else {
-                    // "End everything": the next orchd starts empty.
+                    // "End everything": the next orchd starts empty. Sleeping workspaces live in
+                    // their own record (sleepstore.rs), which this leaves alone.
                     self.autosave.forget();
                 }
                 self.shutdown.notify_one();
                 Ok(json!({ "stopping": true }))
             }
             Request::RegisterAgent(r) => {
+                self.name_free_for(&r)?;
                 if let Some(id) = r.pane.as_deref().and_then(|p| p.strip_prefix("orch:")) {
                     if let Ok(p) = self.find(id) {
                         p.set_kind(&r.kind);
@@ -439,12 +548,38 @@ impl Daemon {
                 Ok(json!({ "agents": rows }))
             }
             Request::SendMessage(m) => {
+                if m.wake && orch_proto::api::normalize_name(&m.to) == "all" {
+                    return Err(err(
+                        "bad_request",
+                        "--wake is for one agent: a message to all never wakes every workspace (send without --wake)",
+                    ));
+                }
                 let row = self
                     .bus
                     .send(&m.from, &m.to, "msg", &m.text, m.thread.as_deref(), None)
                     .map_err(bus_err)?;
                 self.bus.touch(&row.from);
-                Ok(serde_json::to_value(row).unwrap())
+                let mut v = serde_json::to_value(&row).unwrap();
+                // After the message is stored: the wake note then counts it as unread.
+                if m.wake {
+                    let pane = self
+                        .bus
+                        .agent(&row.to)
+                        .map_err(bus_err)?
+                        .and_then(|a| a.pane)
+                        .and_then(|p| p.strip_prefix("orch:").map(str::to_string));
+                    let ws = pane.and_then(|p| {
+                        self.session()
+                            .sleeping
+                            .iter()
+                            .find(|s| s.workspace.tabs.iter().any(|t| t.root.contains(&p)))
+                            .map(|s| s.workspace.id.clone())
+                    });
+                    if let Some(ws) = ws {
+                        self.wake_into(&mut v, &ws).await;
+                    }
+                }
+                Ok(v)
             }
             Request::Inbox {
                 name,
@@ -570,7 +705,12 @@ async fn connection(stream: UnixStream, daemon: Arc<Daemon>) -> std::io::Result<
             }
         };
         if let Request::Attach(a) = req {
-            let pane = match daemon.find(&a.pane) {
+            // A viewer arriving stops an automatic sleep that has not committed, and is refused
+            // during any other transition of its workspace.
+            let pane = match daemon
+                .find(&a.pane)
+                .and_then(|p| daemon.admit(&p.id).map(|_| p))
+            {
                 Ok(p) => p,
                 Err(e) => {
                     reply(&mut writer, &frame.id, Err(e)).await?;
@@ -724,6 +864,12 @@ async fn pane_idle(daemon: &Daemon, pane: &str) -> Option<bool> {
 
 async fn nudge(daemon: &Daemon, agent: &str, pane: &str, text: &str) {
     let _gate = daemon.task_gate.lock().await;
+    if pane
+        .strip_prefix("orch:")
+        .is_some_and(|id| daemon.in_transition(id))
+    {
+        return;
+    }
     if pane_idle(daemon, pane).await != Some(true) {
         return;
     }

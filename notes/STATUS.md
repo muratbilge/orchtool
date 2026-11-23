@@ -1,5 +1,243 @@
 # Status
 
+## 2026-11-23 — Sleep: twelfth check (note off the pane's argv, spawn errors) — Claude (Opus)
+
+- A refused start runs only the shell (`[<pane's shell | $SHELL>]`); the note is written onto the pane's
+  screen by `Pane::show` (control characters as `?`, terminal replies dropped). Pane lists, events and
+  `ls --json` carry no saved command. No note file, nothing to clean up.
+- `Pane::spawn`'s error names the program's base name (plus the OS error), never the argv (all spawns).
+- `restore.rs`: `restart_for` returns the note; `restore_layout` shows it and skips agent bookkeeping for it.
+Tests `m2…` (refused wake: reply, ls, events, log), `m3…` (note shell can't start), `m4…` (agent spawn fails).
+
+## 2026-11-23 — Sleep: eleventh check (no recovery arguments to clients) — Claude (Opus)
+
+- `SleptPane` serializes without `argv` / `agent_argv` by default (hand-written `Serialize` in orch-proto);
+  only the daemon's sleeper-record write runs inside `layout::with_recovery_args`. No client sends a session to
+  orchd, so every outward path (replies, events, snapshot, MCP, `orch watch`) is covered by the default. The
+  autosave's copy of the sleepers is the public form too (start-up takes them from the sleeper record).
+- A busy plan note names the program's base name only.
+Test `m1_recovery_arguments_never_reach_a_client`.
+
+## 2026-11-22 — Sleep: tenth check (wrapper variables, relative programs, note script, logs) — Claude (Opus)
+
+- `agent_start::rebuild` refuses (note) a shell pane whose command line sets a variable or can't be read, also
+  with a discovered agent argv; and a program word that is a relative path with a slash.
+- The note is `/bin/sh -c <fixed script> orch-note <shell> <lines...>`: the lines are arguments, never script
+  text; then `exec` of the pane's / login shell.
+- Logs, the sleep plan and `orch ws wake` carry pane, kind and a fixed reason only, never the command line.
+- Fact for the install decision: main's own restart (`restart_spec`, unchanged) already drops wrapper variables
+  and replays a relative program from the pane's root folder (asserted in
+  `agent_start::tests::wrapper_variables_and_relative_programs_are_refused`).
+Tests `l2…`, `l3…`, log/plan checks in `k1…`/`k2…`, unit tests in `agent_start.rs`.
+
+## 2026-11-22 — Sleep: ninth check (fail-safe agent start) — Claude (Opus)
+
+- New `agent_start.rs`, used by manual wake (`wake_start`) and by the restart beside a sleeper
+  (`Daemon::restart_for`): an agent starts only from a completely parsed command (program word = the agent's,
+  kept as written; every option recognised; a wrapper must be one plain command without variables other than
+  `ORCH_AGENT`, unless the agent's own argv was discovered). No bare-name fallback, no retry with argv[0] only.
+- Otherwise: a shell in the pane's folder printing the note (why, saved command, agent command, conversation id);
+  nothing of the saved text runs. Wake succeeds; result `not_started`, `orch ws wake` prints `not started: …`,
+  the sleep plan says "will not be started", the daemon logs it. The restore does not count/nudge such panes.
+- `restore.rs` against main: SavedPane re-export, `skip_asleep`, `restart_for` call, `started &&` on the agent
+  bookkeeping. `restart_spec` (main's) runs whenever no agent of that kind sleeps.
+- Test fakes are now named `claude`/`codex` (the program word must be the agent's).
+Tests `k1…`–`k4…`, `i_c…`/`j_a…` now expect the note; unit tests in `agent_start.rs` (main's argv as literals).
+
+## 2026-11-22 — Sleep: eighth check (fresh command instead of a text scan) — Claude (Opus)
+
+- `restart_spec` is main's function again, word for word; `restart_spec_for(sp, false)` calls it.
+- With `no_latest`, `fresh_spec` builds a new agent command, never replaying saved shell text: the verified
+  session id; else a target the resume parser establishes (discovered agent argv, or the pane's command /
+  its shell wrapper when that is one simple command, known options kept); else the picker. Shell panes get
+  `<shell> -lc '<agent>; exec <shell>'`; other wrapper commands are dropped. `has_latest_selector` is gone.
+- `bash -c 'cd . && claude --resume <id>'` without a verified id: the parser can't establish the id (first
+  command is `cd`), so the picker. With a verified id: that id. The unknown-option fallback uses the verified id.
+Tests `j_a…`, unit `no_latest_builds_a_fresh_command_on_every_branch` (main's argv as literals).
+
+## 2026-11-22 — Sleep: seventh check (no latest-session selector beside a sleeper) — Claude (Opus)
+
+- One rule, no folder matching: when the loaded sleepers hold a pane of an agent kind (claude / codex), every
+  awake pane of that kind is restored with a known id or its picker, on every branch of `restart_spec_for`
+  (direct and in-shell rewrite, word-for-word wrapper replay, shell fallback, the unknown-command fallback):
+  `no_latest_selector` turns Claude `-c`/`--continue` into `--resume` and drops Codex `--last`; a wrapper
+  replay holding such a selector falls back to the picker form. Decided by `Daemon::no_latest`. Without such
+  a sleeper `restart_spec_for(sp, false)` is `restart_spec` (main) unchanged. The sixth check's folder rule is
+  replaced by this one.
+Tests `i_a…`–`i_d…`, unit `no_latest_selector_on_any_branch_while_one_of_the_kind_sleeps`.
+
+## 2026-11-22 — Sleep: sixth-check fixes (ended panes, lone Codex beside a sleeper) — Claude (Opus)
+
+- **Ended panes:** the start-up filter also leaves out every pane id in a sleeper's saved tab trees, so a pane
+  whose program ended before the sleep (no restartable record) is not run again from a stale autosave. A wake
+  still starts only panes with a record.
+- **Codex `--last`:** (replaced by the seventh check's rule) after main's `mark_sole_codex`, an awake Codex pane
+  in a folder where a loaded sleeper has a Codex pane is not alone there: picker, not `resume --last`. With no sleepers the decision is main's. A wake
+  never uses `--last` (unchanged).
+- Sweep (bus names, tasks, questions, labels): already counted sleepers. Pane names: a new awake pane may take a
+  sleeping pane's name; its wake then fails (all or nothing, sleeper kept) until one is renamed. Not changed.
+Tests `h1_…`, `h2_…` (two).
+
+## 2026-11-22 — Sleep: fifth-check fixes (in-memory start-up filter, wake-bound confirmer) — Claude (Opus)
+
+- **A1/A2:** no layout file is rewritten or set aside at start-up any more. `restore_layout` calls
+  `skip_asleep` on the layout it parsed (the planned file or the autosave it fell back to): the loaded
+  sleepers' panes are left out, other workspaces stay; with no sleepers it returns at once.
+- **C3:** the wake confirmation is bound to its wake's pane map; the sleeper is removed only if it still
+  carries that map (checked in the same commit), and it stops once that sleeper is gone or changed. The 30 s
+  reservation bound is a timer of its own, so a stalled read or commit can't hold it longer.
+- Known limits (README): pane-id reuse by the inherited counter fallback; every woken pane exiting before the
+  next autosave.
+Tests `g5_…` (two), `g7_…`.
+
+
+## 2026-11-22 — Sleep: fourth-check fixes (start-up rule, split by name, wake confirmation) — Claude (Opus)
+
+- **Start-up rule (finding 5):** the sleeper record always wins. `load_sleepers` takes every pane of a sleeper
+  (old ids, and the new ids of an interrupted wake) out of the layout file the restore is about to read (atomic
+  rewrite, only when one overlaps; if that write fails the file is set aside as `*.sleeper-conflict` and not
+  restored). The restore never starts them; start-up never retires a sleeper. A crash after a wake's autosave
+  but before its sleeper is dropped brings it back asleep.
+- **Finding 6:** pane-addressed layout changes resolve a pane name to its canonical id before admission and
+  carry that id through placement.
+- **Wake confirmation:** a woken pane that has ended is no longer waited for; the reservation is released at
+  confirmation or after 30 s; a sleep of a workspace whose wake is not confirmed yet is refused.
+- Known limits (README): a failed folder sync after rename can leave the record on disk (comes back asleep after
+  a restart); a repaired slot with the same generation number is not told apart.
+Tests `e5_…` (four cases), `e6_…`, `e7_…` in `crates/orchd/tests/sleep.rs`.
+
+
+## 2026-11-22 — Sleep cut down to manual sleep / wake — Claude (Opus)
+
+Murat's decision after Codex's third re-check: smaller feature instead of a fourth fix round. **Supersedes the
+sleep entries below** (auto-sleep, keep-awake, partial wake, `-stuck` / `-rest` workspaces, pane lineage,
+`unrestored*.json` retry, `restore.json.restoring`, durable-only pane counter: all removed).
+- The restart path is main's: `autosave.rs`, `restore.rs` (except `SavedPane` moved to orch-proto) and the pane
+  id allocation are unchanged; `main.rs` only loads the sleeper record before the restore and installs it after.
+- Kept: `orch ws sleep|wake [--force|--dry-run]`, `msg --wake`, `task add --wake`, the two-slot record, plain
+  stop keeps sleepers, verified-id / picker resume, name reservation, id-before-label lookup, stop/reservation
+  admission, single-pass commits, the in-flight send/kill guard (now also layout changes, through placement).
+- Start-up rule (one): a sleeper whose panes are in the layout file the restore used came back awake (crash
+  before the autosave caught up with a sleep, or after a wake's autosave) and is dropped; duplicate sleepers of one
+  workspace id keep the first; an interrupted wake moves its owners back. A wake drops its sleeper only once the
+  autosave on disk holds the new panes. A failed folder sync is a failed sleep. A blocked record store unblocks
+  only when the record on disk is the one it loaded (else: restart).
+Tests: `crates/orchd/tests/sleep.rs` (manual sleep/wake, faults, d5/d6/d_store for the remaining findings).
+
+
+## 2026-11-22 — Sleep: second re-check (1, 3–8, 14, store, commit ids) — Claude (Opus)
+
+The class fix Codex asked for: one authority per pane, reconciled by **lineage** (`Pane::origin`, kept in every
+saved record as `origin`: the first pane id of a chain of restarts, sleeps, wakes and retries). Start-up
+(`autosave::restore_at_start`) reads the sleeper record, the awake layout file and the single retry file
+`unrestored.json`, and `reconcile_sleepers` gives each lineage to the highest owner (sleeper unless its wake
+committed, then the awake layout, then the retry file) before anything starts; it then writes the sleeper
+record, the autosave and the retry file in that order and only then drops the source. Replaying after a
+crash between any two of these finds the overlap and resolves it the same way.
+- **1:** commits run once: `f` returns a `Change` computed from the live layout with ids from the live
+  counter, that change is written and exactly it is published. A failed folder sync after the rename counts
+  as written: no compensating write.
+- **3:** a malformed `restore.json` no longer removes the autosave; failed sources are kept under unique names.
+- **4:** survivors are guarded by lineage (a live pane of the sleeper's lineage blocks its wake), which also
+  covers a partial wake's remainder and does not depend on a record write.
+- **5:** an awake copy of a workspace whose wake did not commit is dropped by lineage.
+- **6:** sends and kills count as in flight until their last byte; a sleep waits for them; woken panes join the
+  reservation when they are created. **7:** keep-awake and an agent's ask go through the reservation.
+- **8:** both restore paths schedule a saved continue. **14:** the retry file is single, rewritten after the
+  autosave, deduplicated by lineage, raises the id counter, and is dropped by a plain stop.
+- **Store:** a blocked store re-checks its slots before every write; a wake checks writability before starting
+  anything.
+Tests `c1_…`–`c14_…`, `cstore_…`, `cid_…` in `crates/orchd/tests/sleep.rs`.
+
+
+## 2026-11-22 — Sleep: Codex re-check fixes (1, 2, 3–8, 10, 11, 13, 14, store) — Claude (Opus)
+
+- **14 (ordinary restart):** a restored pane whose start fails (e.g. no durable pane id) no longer consumes the
+  layout: the failed panes go to `unrestored-*.json` (never written by the autosave or an older orchd) and are
+  tried again at every start. `restore.json` is renamed to `restore.json.restoring` (loop guard) instead of
+  unlinked, and the source (`restore.json.restoring` / `autosave.json.restoring`) goes only after the
+  sleepers taken from it are in their record, the leftovers are kept and the restored layout is in the
+  autosave; otherwise it is kept as `*.failed`.
+- **1:** sleeper changes go through `Daemon::commit`: computed on a copy, written, and only then applied to the
+  live layout; snapshots wait on a publish gate while a write is in flight; a write that failed after its
+  rename is superseded by the unchanged state.
+- **2:** a failed planned-restart save resets `stopping_soon`; reservations are admitted under the lock the stop
+  checks under.
+- **3:** a stale awake copy of a sleeper is recognised by its panes, not its id (an older orchd's reused id
+  keeps its workspace; the sleeper is renumbered); legacy sleepers keep their source until written.
+- **4:** wake-rollback survivors are kept visible and block the next wake; a shell wrapper only counts as
+  started when the agent program itself is its child.
+- **5:** a failed undo keeps the wake map in the record (the next start retries); the question sweep starts
+  after the sleepers are reconciled.
+- **6/7:** reservations hold their pane ids until the transition ends (send, kill, attach refused even after the
+  workspace left the layout); a person arriving (attach, input, layout change) stops an automatic sleep that has
+  not started to commit; questions are checked at the auto-sleep commit.
+- **8:** due usage-limit continues of woken panes are in the awake layout before the wake commits.
+- **10:** during a wake only the replacement of the agent's own pane may take its name. **11:** `task add --wake`
+  wakes the sleeper the task's label resolves to. **13:** record writes run on blocking threads.
+- **Store:** a slot that exists but is damaged or unsupported is left alone and blocks writes.
+Tests `r1_…`–`r14_…`, `rstore_…` in `crates/orchd/tests/sleep.rs`.
+
+
+## 2026-11-22 — Sleep: Codex review fixes (13 findings) — Claude (Opus)
+
+Codex's static review ("Safe to install: no", findings 1–13) checked against the code: all 13 hold; all fixed.
+- **Persistence (1–3):** sleepers have their own record, `sleeping.a.json` / `sleeping.b.json` next to the
+  socket (`sleepstore.rs`): alternating slots with a generation, tmp+fsync+rename+folder fsync, newest valid
+  slot wins, the other is kept; never deleted. Each write is of the current state under the store lock (no
+  stale overtaking). The layout files never carry sleepers (an older orchd leaves the record alone). Sleep:
+  reserve → check → move into `sleeping` → **confirmed write** → only then end the programs (failed write =
+  rolled back, nothing ended). Start-up loads the record first (the panes count as asleep at once), drops
+  every asleep workspace from a stale awake layout, finishes or undoes an interrupted wake. Plain stop waits
+  for transitions and never touches the record. Autosave writes are version-checked; `write_atomic` syncs the folder.
+- **Wake (4, 5, 9):** all or nothing (`--partial` keeps failed panes asleep as `<label>-rest`); an agent must
+  still be up after a grace (in a shell wrapper: as the shell's child); a missing folder fails the pane (no
+  home fallback). Order: start → write old→new map → move tasks and bus names → write awake layout →
+  mark committed → drop the sleeper; a crash before "committed" moves owners back at the next start. Agents
+  resume only a verified session id, else their picker (Claude `--resume`, Codex `resume`); a saved command
+  line is never replayed.
+- **Transitions (6, 7, 13):** per-workspace reservation (layout ops, send, kill, task dispatch, nudges refused
+  or skipped; the global task gate is only touched briefly); the commit checks the pane set is unchanged;
+  panes end in parallel; SIGKILL survivors stay visible in `<label>-stuck` and block the wake. Auto-sleep
+  re-samples at the commit (input, screen, clients, focus, exemption, setting, bus status) and aborts on any
+  change or failed read; a bus status "working" also blocks a manual sleep.
+- **8:** a due usage-limit continue keeps a workspace awake for auto-sleep; the continue rechecks the live
+  auto-continue setting before typing and goes into the layout snapshot (`continue_at`) to survive a restart.
+- **10:** a sleeping agent's explicit bus name is reserved (`name_reserved`); wake refuses on a live holder.
+- **11:** ids resolve before labels across awake and sleeping workspaces.
+- **12:** no pane without a durable id from the counter (no in-memory fallback).
+Failure injection: `ORCHD_FAULT` (`fault.rs`). Tests `f1_…`–`f13_…` in `crates/orchd/tests/sleep.rs`.
+
+
+## 2026-11-22 — Sleep follow-ups: wake on request, Codex picker, auto-sleep — Claude (Opus)
+
+Murat's answers: "1 yes 2. yes 3. with request, 4. yes". (1) plain `stop-daemon` keeps sleeping workspaces
+(unchanged). (2) Wake never uses `codex resume --last`: an unidentified Codex comes back at its picker (restart
+unchanged). (3) `orch msg --wake` / MCP `send_message` `wake` / `orch task add --wake` wake the addressed
+workspace; refused for `all`; default off. (4) `orch auto-sleep <duration>|off` (kv `auto_sleep_ms`, off by
+default) and `orch ws keep-awake` (kv `keep_awake:<ws id>`): `crates/orchd/src/autosleep.rs` tracks per
+workspace the panes' screen hashes, inputs written, attached clients, working agents and the raised workspace;
+idle for the whole period → a normal (unforced) sleep with a timeline entry; refused → a new period; created,
+woken, setting changed or orchd started → a new period. Watch: `auto_sleep_ms`, `keep_awake` (additive). Tests
+in `crates/orchd/tests/sleep.rs` (9 now). Not installed; not tried with real agents, a real TUI or Kabuk.
+
+
+## 2026-11-22 — Workspaces sleep and wake — Claude (Opus, standing in for Codex)
+
+Murat: "we should be able to close and reopen the workspaces for efficiency". `orch ws sleep <ws>` keeps the
+workspace's layout (ids, tabs, splits, sizes, labels) and each pane's `restore.json` record in the layout itself
+(`Session::sleeping`, so `restore.json` / `autosave.json` carry it), writes the autosave at once, then ends its
+programs. `orch ws wake <ws>` starts them again through the restart code (`restore::spawn_saved`, shared with
+`restore_layout`), puts the workspace back at its old place, moves the agents' bus names to the new panes and
+tells an agent what it missed once it is at its prompt. Refused with `ws_busy` / exit 15 while an agent works,
+waits on a dialog or a question, runs a task, or a program runs that can't be resumed (`--force`, `--dry-run`).
+Mail, queued/running tasks and open questions wait (no expiry while asleep); a limited agent is continued after
+its reset once awake; nothing wakes by itself. Survives restart, crash and a plain `stop-daemon` (which now
+keeps an autosave with only the sleeping workspaces). TUI: `S`, `☾ sleep workspace…` and sleeping rows (Enter
+wakes) in the `w` list; a refusal turns into a forced confirmation. Watch: additive top-level `sleeping`
+(kabuk-contract-v2.md, fixture regenerated). Tests: `crates/orchd/tests/sleep.rs` (5, fake agents) + TUI/watch
+unit tests. Not installed; not tried with a real Claude/Codex resume or Kabuk.
+
 ## 2026-11-17 — P7: the layout survives an unplanned stop — Claude (Opus, standing in for Codex)
 
 orchd now keeps `autosave.json` (restore.json format, 0600, atomic) next to its socket: 2 s after a layout

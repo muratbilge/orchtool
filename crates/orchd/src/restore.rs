@@ -48,33 +48,8 @@ pub struct Saved {
     pub panes: HashMap<String, SavedPane>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SavedPane {
-    pub argv: Vec<String>,
-    pub cwd: String,
-    pub rows: u16,
-    pub cols: u16,
-    #[serde(default)]
-    pub name: Option<String>,
-    /// The agent seen in the pane (claude / codex), also when it was started inside a shell.
-    #[serde(default)]
-    pub agent: Option<String>,
-    /// Its name on the bus: the restarted agent takes it again (unread mail, open questions).
-    #[serde(default)]
-    pub bus_name: Option<String>,
-    /// Positive screen detection at save time; old snapshots never opt into automatic input.
-    #[serde(default)]
-    pub was_working: bool,
-    #[serde(default)]
-    pub session_id: Option<String>,
-    /// Actual agent argv, including an agent launched interactively inside a shell.
-    #[serde(default)]
-    pub agent_argv: Option<Vec<String>>,
-    /// A Codex pane without a known conversation that was the only Codex pane in its folder:
-    /// `codex resume --last` (per folder) can only mean this one, so nobody has to pick.
-    #[serde(default)]
-    pub sole_codex_in_cwd: bool,
-}
+/// Defined in orch-proto: a sleeping workspace in the layout carries the same record.
+pub use orch_proto::layout::SavedPane;
 
 fn should_continue(agent: Option<&str>, status: Detected, asking: bool) -> bool {
     matches!(agent, Some("claude" | "codex")) && status == Detected::Working && !asking
@@ -405,6 +380,7 @@ impl Daemon {
     /// (their tab / workspace collapses if nothing is left). Returns how many came back.
     pub fn restore_layout(self: &Arc<Self>, mut saved: Saved, source: Source) -> usize {
         mark_sole_codex(&mut saved.panes);
+        self.skip_asleep(&mut saved);
         let mut ids: HashMap<String, String> = HashMap::new();
         let mut resumed = 0;
         let mut pending = Vec::new();
@@ -416,7 +392,7 @@ impl Daemon {
                         failed.push(old);
                         continue;
                     };
-                    let (argv, extra) = restart_spec(sp);
+                    let (argv, extra, note) = self.restart_for(&old, sp);
                     // orchd's own environment, plus the agent's bus name.
                     let env = (!extra.is_empty()).then(|| {
                         orch_proto::env::full_env()
@@ -438,7 +414,12 @@ impl Daemon {
                         .or_else(|_| self.new_pane(req(None)));
                     match pane {
                         Ok(p) => {
-                            if matches!(sp.agent.as_deref(), Some("claude" | "codex")) {
+                            if let Some(n) = &note {
+                                p.show(n);
+                            }
+                            if note.is_none()
+                                && matches!(sp.agent.as_deref(), Some("claude" | "codex"))
+                            {
                                 resumed += 1;
                                 if sp.was_working {
                                     let name = sp

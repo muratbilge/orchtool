@@ -53,6 +53,7 @@ async fn add(c: &mut Conn, text: &str, after: Option<i64>) -> i64 {
         text: text.into(),
         created_by: "test".into(),
         after,
+        wake: false,
     })
     .await
     .unwrap()["id"]

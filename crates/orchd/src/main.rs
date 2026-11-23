@@ -67,6 +67,11 @@ async fn main() -> anyhow::Result<()> {
 
     let bus = Arc::new(Bus::open(&db)?);
     let daemon = Daemon::new(scrollback, Arc::clone(&bus));
+    // Sleeping workspaces (their own record, which the restore below does not touch): loaded
+    // before anything runs, so their panes count as asleep from the start; reconciled with
+    // what the restore brought back right after it.
+    daemon.sleep_store.set_dir(dir.clone());
+    let sleepers = daemon.load_sleepers();
     start_nudger(Arc::clone(&daemon));
     orchd::ui::start_detector(Arc::clone(&daemon));
     orchd::limits::start(Arc::clone(&daemon));
@@ -82,6 +87,7 @@ async fn main() -> anyhow::Result<()> {
     let _ = daemon.restore_path.set(dir.join("restore.json"));
     daemon.autosave.set_path(dir.join(orchd::autosave::FILE));
     orchd::autosave::restore_at_start(&daemon, &dir);
+    daemon.install_sleepers(sleepers);
     orchd::autosave::start(Arc::clone(&daemon));
     orchd::tasks::start(Arc::clone(&daemon));
     let server = tokio::spawn(serve(listener, Arc::clone(&daemon)));

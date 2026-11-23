@@ -79,6 +79,9 @@ enum Closing {
     Workspace(String),
     /// Stop orchd (every pane dies) and come back on a fresh one (the installed version).
     Daemon,
+    /// Put a workspace to sleep (id); with the reason when orchd refused it as busy and
+    /// the confirmation forces it.
+    Sleep(String, Option<String>),
 }
 
 /// The action rows of the workspace list.
@@ -89,6 +92,7 @@ enum WsAction {
     NewAgent,
     CloseTab,
     CloseWorkspace,
+    SleepWorkspace,
     RestartDaemon,
 }
 
@@ -163,6 +167,9 @@ struct App {
     prefix: u8,
     quit: bool,
     started_ws: bool,
+    /// The workspace a sleep / wake request was sent for (its reply needs it).
+    sleep_req: Option<String>,
+    wake_req: Option<String>,
     outer_modes: String,
     /// Bytes of an incomplete key / paste carried over to the next read.
     pending: Vec<u8>,
@@ -467,6 +474,8 @@ impl App {
             prefix: prefix_byte(),
             quit: false,
             started_ws: false,
+            sleep_req: None,
+            wake_req: None,
             outer_modes: String::new(),
             pending: Vec::new(),
             hold_input: None,
@@ -983,6 +992,21 @@ impl App {
                         self.show_workspace(ws);
                     }
                 }
+                if what == "wake" {
+                    if let Some(id) = self.wake_req.take() {
+                        if self.session.workspace(&id).is_some() {
+                            self.show_workspace(id);
+                        }
+                    }
+                    self.flash("awake: agents resume");
+                }
+                if what == "sleep" && v["slept"] == true {
+                    self.sleep_req = None;
+                    self.flash(format!(
+                        "asleep: {} (wake it from the w list)",
+                        v["plan"]["label"].as_str().unwrap_or_default()
+                    ));
+                }
                 if what == "answer" {
                     if v["won"] == false {
                         self.flash("already answered elsewhere");
@@ -995,6 +1019,22 @@ impl App {
                 if what == "restart" {
                     // orchd stays up: its going away is no longer expected.
                     self.restarting = false;
+                }
+                // Refused as busy: offer to force it, saying what would be interrupted.
+                if what == "sleep" && e.contains("--force") {
+                    if let Some(id) = self.sleep_req.take() {
+                        let reason = e
+                            .lines()
+                            .skip(1)
+                            .map(str::trim)
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        self.mode = Mode::Prompt(
+                            Prompt::ConfirmClose(Closing::Sleep(id, Some(reason))),
+                            String::new(),
+                        );
+                        return;
+                    }
                 }
                 self.flash(format!("{what}: {e}"))
             }
@@ -1020,7 +1060,10 @@ impl App {
         {
             self.ui("show", UiOp::Raise { pane });
         }
-        if self.session.workspaces.is_empty() && !self.started_ws {
+        if self.session.workspaces.is_empty() && !self.session.sleeping.is_empty() {
+            // Everything sleeps: offer the list (wake one there) instead of a new shell.
+            self.mode = Mode::Workspaces(0);
+        } else if self.session.workspaces.is_empty() && !self.started_ws {
             // First start: a workspace with a shell in this directory.
             self.started_ws = true;
             let mut spawn = self.spawn_here(Vec::new());
@@ -1435,8 +1478,9 @@ impl App {
         }
         match self.mode {
             Mode::Workspaces(cur) => {
-                // Workspaces, a blank row, then the action rows (scrolled to keep `cur` shown).
-                let n = self.session.workspaces.len();
+                // Workspaces, the sleeping ones, a blank row, then the action rows (scrolled to
+                // keep `cur` shown).
+                let n = self.session.workspaces.len() + self.session.sleeping.len();
                 let row = row + self.workspaces_offset(cur);
                 let sel = match row {
                     r if r < n => Some(r),
@@ -1578,6 +1622,14 @@ impl App {
                     .unwrap_or(0);
                 self.mode = Mode::Workspaces(cur);
             }
+            b"S" => {
+                if let Some(id) = self.current_ws().map(|w| w.id.clone()) {
+                    self.mode = Mode::Prompt(
+                        Prompt::ConfirmClose(Closing::Sleep(id, None)),
+                        String::new(),
+                    );
+                }
+            }
             b"N" => {
                 self.mode = Mode::Prompt(
                     Prompt::NewWorkspace,
@@ -1699,7 +1751,7 @@ impl App {
                 }
             }
             Mode::Workspaces(sel) => {
-                let n = self.session.workspaces.len();
+                let n = self.session.workspaces.len() + self.session.sleeping.len();
                 if esc {
                     Mode::Normal
                 } else if enter {
@@ -1758,6 +1810,7 @@ impl App {
                                     to: to.into(),
                                     text: body.trim().into(),
                                     thread: None,
+                                    wake: false,
                                 }),
                             );
                             Mode::Comms(String::new())
@@ -2314,7 +2367,10 @@ impl App {
     }
 
     fn workspaces_popup(&self) -> (Rect, Rect) {
-        let rows = self.session.workspaces.len() + 1 + self.ws_actions().len();
+        let rows = self.session.workspaces.len()
+            + self.session.sleeping.len()
+            + 1
+            + self.ws_actions().len();
         self.popup_rect(60, (rows as u16 + 2).max(6))
     }
 
@@ -2336,7 +2392,7 @@ impl App {
     /// taller than the screen (rows: workspaces, a blank row, the action rows).
     fn workspaces_offset(&self, sel: usize) -> usize {
         let (_, inner) = self.workspaces_popup();
-        let n = self.session.workspaces.len();
+        let n = self.session.workspaces.len() + self.session.sleeping.len();
         let row = if sel < n { sel } else { sel + 1 };
         (row + 1).saturating_sub(inner.height as usize)
     }
@@ -2361,7 +2417,7 @@ impl App {
     fn help_text(&self) -> String {
         let p = prefix_name(self.prefix);
         if self.size.0 < 72 {
-            return format!("Prefix: {p}, then a key\n↑/↓ or wheel: scroll\nEsc or tap: close\n\nw  workspaces / close\nc  new shell tab\nA  new agent tab\na  questions for you\nm  messages\nn/p  next/previous tab\n1-9  select tab\nv  split right\ns  split down\nh/j/k/l  move focus\nz  zoom pane\nx  close pane\n&  close tab\nN  new workspace\n( / )  next workspace\n$  rename workspace\n,  rename tab\nH/J/K/L  resize split\nb  toggle sidebar\nt  take control\nd  detach (keep running)\n{p} {p}  send prefix");
+            return format!("Prefix: {p}, then a key\n↑/↓ or wheel: scroll\nEsc or tap: close\n\nw  workspaces / close\nc  new shell tab\nA  new agent tab\na  questions for you\nm  messages\nn/p  next/previous tab\n1-9  select tab\nv  split right\ns  split down\nh/j/k/l  move focus\nz  zoom pane\nx  close pane\n&  close tab\nN  new workspace\n( / )  next workspace\n$  rename workspace\nS  sleep workspace\n,  rename tab\nH/J/K/L  resize split\nb  toggle sidebar\nt  take control\nd  detach (keep running)\n{p} {p}  send prefix");
         }
         format!(
             "All commands: {p} then the key.\n\n\
@@ -2373,6 +2429,7 @@ impl App {
              n / p  next / previous tab      1-9 go to tab\n\
              w      workspaces               ( / )  previous / next workspace\n\
              N      new workspace (cwd)      $   rename workspace   ,  rename tab\n\
+             S      sleep workspace (agents end, resume on wake; wake from the w list)\n\
              a      needs you: questions + blocked agents\n\
              m      messages (timeline, write @agent text)\n\
              b      sidebar                  t   take control of the pane\n\
@@ -2459,8 +2516,27 @@ impl App {
                 ])
             })
             .collect();
-        let n = self.session.workspaces.len();
+        let awake = self.session.workspaces.len();
         let mut lines = lines;
+        for (j, s) in self.session.sleeping.iter().enumerate() {
+            let style = if awake + j == sel {
+                Style::default().bg(Color::Blue).fg(Color::White)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            let agents = s.agents().count();
+            lines.push(Line::from(vec![
+                Span::styled(" ☾ ", Style::default().fg(Color::Cyan)),
+                Span::styled(
+                    format!(
+                        "  {:<20} asleep · {} agent(s) · Enter wakes  {}",
+                        s.workspace.label, agents, s.workspace.cwd
+                    ),
+                    style,
+                ),
+            ]));
+        }
+        let n = awake + self.session.sleeping.len();
         lines.push(Line::from(""));
         for (i, (label, _)) in self.ws_actions().iter().enumerate() {
             let style = if sel == n + i {
@@ -2489,6 +2565,10 @@ impl App {
             if let Some(t) = w.tabs.get(w.active_tab) {
                 v.push((format!("× close tab {}…", t.label), WsAction::CloseTab));
             }
+            v.push((
+                format!("☾ sleep workspace {}…", w.label),
+                WsAction::SleepWorkspace,
+            ));
             v.push((
                 format!("× close workspace {}…", w.label),
                 WsAction::CloseWorkspace,
@@ -2530,6 +2610,27 @@ impl App {
                 ),
                 None => "That workspace is gone already.".into(),
             },
+            Closing::Sleep(ws, None) => match self.session.workspace(ws) {
+                Some(w) => {
+                    let panes: Vec<String> = w.tabs.iter().flat_map(|t| t.root.panes()).collect();
+                    let agents = panes
+                        .iter()
+                        .filter(|p| self.panes.get(*p).is_some_and(|i| i.agent.is_some()))
+                        .count();
+                    format!(
+                        "Put workspace {} to sleep?\nIts {} pane(s) end ({agents} agent(s) resume on wake;\nshells come back fresh). Wake it from this list.",
+                        w.label,
+                        panes.len()
+                    )
+                }
+                None => "That workspace is gone already.".into(),
+            },
+            Closing::Sleep(ws, Some(reason)) => format!(
+                "{} is busy:\n{reason}\nSleep anyway? Busy work is interrupted.",
+                self.session
+                    .workspace(ws)
+                    .map_or(ws.as_str(), |w| w.label.as_str())
+            ),
             Closing::Daemon => format!(
                 "Restart orchd (the installed version)?\nWorkspaces and tabs come back; the {} running\nprogram(s) start again in their folders\n(claude / codex continue their last chat).",
                 self.panes.len()
@@ -2560,6 +2661,18 @@ impl App {
             }
             Closing::Workspace(workspace) => {
                 self.ui("close workspace", UiOp::CloseWorkspace { workspace })
+            }
+            Closing::Sleep(workspace, reason) => {
+                self.sleep_req = Some(workspace.clone());
+                self.flash("putting it to sleep…");
+                self.ui(
+                    "sleep",
+                    UiOp::SleepWorkspace {
+                        workspace,
+                        force: reason.is_some(),
+                        dry_run: false,
+                    },
+                );
             }
             Closing::Daemon => {
                 self.restarting = true;
@@ -2614,9 +2727,20 @@ impl App {
 
     /// Runs a workspace-list row: a workspace, or one of [`Self::ws_actions`] below them.
     fn workspace_row(&mut self, sel: usize) -> Mode {
-        let n = self.session.workspaces.len();
+        let awake = self.session.workspaces.len();
+        let n = awake + self.session.sleeping.len();
         if let Some(id) = self.session.workspaces.get(sel).map(|w| w.id.clone()) {
             self.show_workspace(id);
+            return Mode::Normal;
+        }
+        if let Some(id) = sel
+            .checked_sub(awake)
+            .and_then(|j| self.session.sleeping.get(j))
+            .map(|s| s.workspace.id.clone())
+        {
+            self.flash("waking…");
+            self.wake_req = Some(id.clone());
+            self.ui("wake", UiOp::WakeWorkspace { workspace: id });
             return Mode::Normal;
         }
         let action = sel
@@ -2644,6 +2768,13 @@ impl App {
                             .map(|t| t.id.clone())
                             .unwrap_or_default(),
                     )),
+                    String::new(),
+                ),
+                None => Mode::Normal,
+            },
+            Some(WsAction::SleepWorkspace) => match self.current_ws() {
+                Some(w) => Mode::Prompt(
+                    Prompt::ConfirmClose(Closing::Sleep(w.id.clone(), None)),
                     String::new(),
                 ),
                 None => Mode::Normal,
@@ -2774,10 +2905,10 @@ impl App {
             Prompt::RenameTab => ("rename tab", "name:".to_string()),
             Prompt::RenameWorkspace => ("rename workspace", "name:".to_string()),
             Prompt::ConfirmClose(c) => (
-                if matches!(c, Closing::Daemon) {
-                    "restart"
-                } else {
-                    "close"
+                match c {
+                    Closing::Daemon => "restart",
+                    Closing::Sleep(..) => "sleep",
+                    _ => "close",
                 },
                 self.closing_text(c),
             ),
@@ -3116,6 +3247,79 @@ mod tests {
         assert!(!app.handle(Msg::Keys(vec![0xe7])).unwrap());
         assert!(!app.handle(Msg::Keys(vec![0x95, 0x8c])).unwrap());
         assert!(app.held.ends_with("界".as_bytes()));
+    }
+
+    fn one_tab(id: &str, label: &str, pane: &str) -> orch_proto::layout::Workspace {
+        orch_proto::layout::Workspace {
+            id: id.into(),
+            label: label.into(),
+            cwd: "/tmp".into(),
+            tabs: vec![orch_proto::layout::Tab {
+                id: format!("t-{id}"),
+                label: "1".into(),
+                root: orch_proto::layout::Node::leaf(pane),
+                focus: pane.into(),
+                zoomed: false,
+            }],
+            active_tab: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn sleeping_workspaces_are_listed_wake_from_the_list_and_a_refusal_offers_force() {
+        let mut app = test_app();
+        app.session.workspaces.push(one_tab("w1", "main", "p1"));
+        app.session.sleeping.push(orch_proto::layout::Sleeping {
+            workspace: one_tab("w2", "docs", "p7"),
+            position: 1,
+            slept_ms: 0,
+            panes: Default::default(),
+            wake: None,
+        });
+        app.ws_id = Some("w1".into());
+        assert!(app
+            .ws_actions()
+            .iter()
+            .any(|(l, a)| matches!(a, WsAction::SleepWorkspace) && l.contains("main")));
+        // Rows: main, docs (asleep), a blank row, the actions.
+        let (_, inner) = app.workspaces_popup();
+        assert!(inner.height as usize >= 3 + app.ws_actions().len());
+        assert!(matches!(app.workspace_row(1), Mode::Normal));
+        assert_eq!(
+            app.wake_req.as_deref(),
+            Some("w2"),
+            "Enter on a sleeping row wakes it"
+        );
+        // The first action row comes after both workspaces.
+        assert!(matches!(
+            app.workspace_row(2),
+            Mode::Prompt(Prompt::NewWorkspace, _)
+        ));
+        // orchd refused the sleep as busy: the confirmation comes back as a forced one.
+        app.sleep_req = Some("w1".into());
+        app.reply(
+            "sleep",
+            Err("main is busy, nothing was done (--force puts it to sleep anyway):\n  a (p1) is working".into()),
+        );
+        let Mode::Prompt(Prompt::ConfirmClose(c @ Closing::Sleep(id, Some(reason))), _) = &app.mode
+        else {
+            panic!("no forced confirmation")
+        };
+        assert_eq!(id, "w1");
+        assert!(reason.contains("is working"));
+        assert!(app.closing_text(c).contains("Sleep anyway"));
+        // Everything asleep at start: the list, not a new workspace.
+        let mut app = test_app();
+        app.session.sleeping.push(orch_proto::layout::Sleeping {
+            workspace: one_tab("w2", "docs", "p7"),
+            position: 0,
+            slept_ms: 0,
+            panes: Default::default(),
+            wake: None,
+        });
+        app.pick_start_workspace();
+        assert!(matches!(app.mode, Mode::Workspaces(0)));
+        assert!(!app.started_ws);
     }
 
     #[test]
