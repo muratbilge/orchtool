@@ -60,6 +60,10 @@ Built in Rust (stable) by Claude Code and Codex with Murat Bilge steering, for o
   passed as arguments, so nothing of the saved text is run, whatever your shell. The saved command line appears
   only in that pane: the daemon log, the sleep plan and `orch ws wake` name the pane, the agent kind and the
   reason (a command line can carry credentials). The wake still succeeds.
+  A sleeping workspace's recovery arguments (each pane's saved command line and the agent's discovered command
+  line) stay in orchd's own sleeper record (`sleeping.a.json`/`sleeping.b.json`, 0600). Clients (session replies,
+  `ws sleep`/`ws wake` and dry-run replies, the event stream, `orch watch`, the MCP tools) get the sleeper's
+  workspace, layout, position, folder, and per pane its name, agent kind, bus name and flags, without them.
   Known limits: the program word is used as written (as main's restart does); a bare `codex`/`claude` is found
   on the shell's PATH at that time, which is not checked against the program that ran before. Variables set
   interactively in a shell pane (or by orch's spawn environment) are not seen; main's restart drops them too.

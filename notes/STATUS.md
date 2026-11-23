@@ -1,5 +1,14 @@
 # Status
 
+## 2026-11-23 — Sleep: eleventh check (no recovery arguments to clients) — Claude (Opus)
+
+- `SleptPane` serializes without `argv` / `agent_argv` by default (hand-written `Serialize` in orch-proto);
+  only the daemon's sleeper-record write runs inside `layout::with_recovery_args`. No client sends a session to
+  orchd, so every outward path (replies, events, snapshot, MCP, `orch watch`) is covered by the default. The
+  autosave's copy of the sleepers is the public form too (start-up takes them from the sleeper record).
+- A busy plan note names the program's base name only.
+Test `m1_recovery_arguments_never_reach_a_client`.
+
 ## 2026-11-22 — Sleep: tenth check (wrapper variables, relative programs, note script, logs) — Claude (Opus)
 
 - `agent_start::rebuild` refuses (note) a shell pane whose command line sets a variable or can't be read, also
